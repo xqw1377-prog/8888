@@ -83,6 +83,9 @@ class Ledger:
         key = (event.venue, event.external_id)
         if key in self._by_external:
             raise ConflictError("post_journal 收到已存在事件，应走 append_event 幂等路径")
+        self._assert_share_ok(event)
+        if self._store is not None and not self._loading:
+            self._store.append(event)
         if event.event_type in (LedgerEventType.TRANSFER_IN, LedgerEventType.TRANSFER_OUT):
             self._apply_share_mutation(event)
         for line in event.lines:
@@ -90,10 +93,21 @@ class Ledger:
             self._books.balances[bal_key] = self._books.balances.get(bal_key, Decimal("0")) + line.signed
         self._events.append(event)
         self._by_external[key] = event
-        if self._store is not None and not self._loading:
-            self._store.append(event)
         if not self._loading and not self._has_open_position():
             self._refresh_nav(unrealized=Decimal("0"))
+
+    def _assert_share_ok(self, event: LedgerEvent) -> None:
+        if event.event_type not in (LedgerEventType.TRANSFER_IN, LedgerEventType.TRANSFER_OUT):
+            return
+        amount = sum(line.debit - line.credit for line in event.lines if line.bucket == AccountBucket.WALLET)
+        if self._books.shares == 0:
+            if amount <= 0:
+                raise UnitValidationError("空账本不能先出金")
+            return
+        if amount < 0:
+            nav = self._books.last_unit_nav if self._books.last_unit_nav > 0 else Decimal("1")
+            if self._books.shares - (-amount) / nav < 0:
+                raise LedgerImbalanceError("份额不能为负")
 
     def transfer_in(
         self,
@@ -693,6 +707,8 @@ class LedgerStore:
     def __init__(self, path: str) -> None:
         self._conn = sqlite3.connect(path, timeout=30, isolation_level=None, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=FULL")
+        self.fail_appends = 0
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ledger_events (
@@ -717,6 +733,9 @@ class LedgerStore:
         )
 
     def append(self, event: LedgerEvent) -> None:
+        if self.fail_appends:
+            self.fail_appends -= 1
+            raise LedgerImbalanceError("账本磁盘提交失败，内存保持原样")
         lines = [
             {
                 "asset": line.asset,

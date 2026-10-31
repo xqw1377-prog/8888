@@ -38,6 +38,36 @@ class ConsoleState:
     paused: bool = False
     reconciliations: list[str] = field(default_factory=list)
 
+    @classmethod
+    def from_ledger(cls, ledger, *, occupancy=None, mode: str = "SIMULATION") -> "ConsoleState":
+        positions = []
+        for pos in ledger.positions():
+            if pos.qty <= 0:
+                continue
+            positions.append({"symbol": pos.symbol, "qty": format(pos.qty, "f"), "freshness": "KNOWN"})
+        fills = [
+            {"origin": "SIMULATION", "symbol": event.symbol or ""}
+            for event in ledger.events()
+            if event.event_type.value == "FILL"
+        ]
+        equity = format(ledger.cash_equity(), "f") if ledger.events() else None
+        blockers: list[str] = []
+        system_state = "RECONCILING"
+        version = 1
+        if occupancy is not None:
+            blockers = [blocker.reason_code for blocker in occupancy.blockers]
+            system_state = occupancy.system_state.value
+            version = occupancy.account_state_version
+        return cls(
+            mode=mode,
+            equity=equity,
+            positions=positions,
+            blockers=blockers,
+            version=version,
+            fills=fills,
+            system_state=system_state,
+        )
+
 
 class ConsoleApp:
     def __init__(self, token: str, state: Optional[ConsoleState] = None) -> None:

@@ -620,3 +620,42 @@ def test_replay_posts_available_funding_and_exit_slippage_separately() -> None:
     assert sum(line.debit for line in slips[0].lines if line.bucket == AccountBucket.FEE) == notional * D("0.0005")
     assert sum(line.debit for line in exit_fees[0].lines if line.bucket == AccountBucket.FEE) == notional * D("0.0005")
     assert all(not event.external_id.startswith("slip-entry:") for event in ledger.events())
+
+
+def test_funding_visible_after_exit_is_booked_without_backdating() -> None:
+    bars = breakout_series(130)
+    breach_at = t_close(130) + timedelta(hours=1)
+    settled_at = t_close(130) + timedelta(minutes=30)
+    visible_at = t_close(130) + timedelta(hours=2)
+    marks = [mark(i, format(bars[i].close, "f")) for i in range(len(bars))]
+    marks.append(
+        MarkSample(
+            venue="SIM",
+            symbol="BTCUSDT",
+            event_time=breach_at,
+            received_at=breach_at,
+            available_at=breach_at,
+            mark_price=D("110"),
+            index_price=D("110"),
+            source_id="entry-breach",
+        )
+    )
+    ledger = Ledger("acct-late-funding")
+    ledger.transfer_in(amount=D("10000"), event_time=ORIGIN, received_at=ORIGIN, external_id="dep")
+    result = replay_t1(
+        ledger=ledger,
+        symbol="BTCUSDT",
+        candles=bars,
+        marks=marks,
+        config=ReplayConfig(params=T1Params()),
+        venue="SIM",
+        fundings=[_settlement("set-after-exit", settled_at, visible_at, "-0.5")],
+    )
+    assert result.grade == DataGrade.SIGNAL_RESEARCH_ONLY
+    assert result.funding_posted == 1
+    funding = next(event for event in ledger.events() if event.event_type == LedgerEventType.FUNDING)
+    assert funding.event_time == visible_at
+    assert funding.event_time > breach_at
+    assert funding.metadata["payment"] == "-0.5"
+    closed = next(event for event in ledger.events() if event.metadata.get("note") == "reduce")
+    assert closed.metadata["price"] == "110"

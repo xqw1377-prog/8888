@@ -3,6 +3,9 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from cts.console.app import ConsoleApp, ConsoleState
+from cts.ledger.journal import Ledger
+from cts.money import D
+from tests.test_ledger import TS
 
 
 def _json(port: int, path: str, *, token: str | None = None, body: dict | None = None, key: str | None = None, cookie: str | None = None):
@@ -101,3 +104,12 @@ def test_console_separates_pause_flatten_and_hides_missing_evidence() -> None:
         assert "暂无证据" in missing
     finally:
         app.shutdown()
+
+
+def test_console_reads_ledger_equity() -> None:
+    ledger = Ledger("acct")
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep")
+    state = ConsoleState.from_ledger(ledger)
+    assert state.equity == "10000"
+    assert state.mode == "SIMULATION"
+    assert state.positions == []

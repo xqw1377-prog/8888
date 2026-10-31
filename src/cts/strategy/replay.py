@@ -190,6 +190,8 @@ def replay_t1(
         position = None
         pending = None
         exits += 1
+        close_hold(booked)
+        book_late_funding(decision_as_of)
 
     def book_exit_costs(notional: Decimal, booked: datetime, seen: datetime, tag: str) -> None:
         fee = notional * config.fee_rate
@@ -247,7 +249,54 @@ def replay_t1(
             posted_funding.add(item.settlement_id)
             funding_posted += 1
 
+    holds: list[dict[str, datetime | None]] = []
+    decision_as_of = candles[0].event_time if candles else epoch
+
+    def open_hold(entry: datetime) -> None:
+        holds.append({"entry": entry, "exit": None})
+
+    def close_hold(exit_at: datetime) -> None:
+        if holds and holds[-1]["exit"] is None:
+            holds[-1]["exit"] = exit_at
+
+    def book_late_funding(as_of: datetime) -> None:
+        nonlocal funding_posted
+        for hold in holds:
+            exit_at = hold["exit"]
+            entry = hold["entry"]
+            if exit_at is None or entry is None:
+                continue
+            due = [
+                item
+                for item in fundings
+                if item.symbol == symbol
+                and item.settlement_id not in posted_funding
+                and item.payment != 0
+                and entry < item.event_time <= exit_at
+                and item.available_at > exit_at
+                and item.available_at <= as_of
+            ]
+            due.sort(key=lambda item: (item.available_at, item.event_time, item.settlement_id))
+            for item in due:
+                if item.settlement_id in posted_funding:
+                    continue
+                booked = stamp(item.available_at)
+                seen = observe(booked)
+                ledger.post_funding(
+                    payment=item.payment,
+                    event_time=booked,
+                    received_at=seen,
+                    external_id=f"funding:{symbol}:{item.settlement_id}",
+                    venue=venue,
+                    symbol=symbol,
+                    from_isolated=True,
+                )
+                posted_funding.add(item.settlement_id)
+                funding_posted += 1
+
     for i, bar in enumerate(closed):
+        decision_as_of = bar.available_at
+        book_late_funding(bar.available_at)
         hist = closed[: i + 1]
         sample = latest_mark(marks, bar.available_at, symbol)
         m = sample.mark_price if sample is not None else None
@@ -287,6 +336,8 @@ def replay_t1(
                 notional = position.qty * exit_price * config.multiplier
                 book_exit_costs(notional, booked, seen, f"{symbol}:{booked.isoformat()}:TREND")
                 last_exit = booked
+                close_hold(booked)
+                book_late_funding(bar.available_at)
                 position = None
                 pending = None
                 exits += 1
@@ -357,6 +408,7 @@ def replay_t1(
                         params=config.params,
                         entry_time=opened,
                     )
+                    open_hold(position.entry_event_time)
                     fills += 1
                     pending = None
                     breached = next_available_stop(position, marks, consumed_marks, bar.available_at)

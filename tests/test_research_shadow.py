@@ -47,6 +47,41 @@ def test_breakeven_stop_only_tightens_after_two_r() -> None:
     assert kept == D("110")
 
 
+def test_e1_filter_runs_after_warmup_and_e2_uses_quotes_when_present() -> None:
+    from datetime import timedelta
+
+    from cts.clock import UTC
+    from cts.research.experiments import BookQuote, e1_allows, ema200, evaluate_e2, run_e3_stops
+
+    closes = [D("100")] * 1000
+    closes[-1] = D("130")
+    ema = ema200(closes)
+    assert ema is not None
+    assert e1_allows(Side.LONG, D("130"), ema) is True
+    assert e1_allows(Side.LONG, D("90"), ema) is False
+    signal_at = datetime(2024, 1, 1, tzinfo=UTC)
+    missing = evaluate_e2(signal_at, [])
+    assert missing.status == "NOT_TESTABLE"
+    late_quote = BookQuote(
+        event_time=signal_at + timedelta(seconds=120),
+        available_at=signal_at + timedelta(seconds=120),
+        bid=D("100"),
+        ask=D("100.05"),
+    )
+    compared = evaluate_e2(signal_at, [late_quote])
+    assert compared.status == "RAN"
+    assert "60秒可成交=False" in compared.reason
+    assert "300秒可成交=True" in compared.reason
+    path = run_e3_stops(
+        side=Side.LONG,
+        entry=D("100"),
+        initial_stop=D("90"),
+        marks=[D("110"), D("120"), D("130")],
+        cost_per_unit=D("1"),
+    )
+    assert path == [D("90"), D("101"), D("101")]
+
+
 def test_shadow_records_unfillable_signal_without_live_orders() -> None:
     session = ShadowSession()
     session.observe(breakout_series(130))
@@ -62,6 +97,7 @@ def test_local_drill_does_not_approve_micro_live() -> None:
     assert report["conclusion"] == "本地故障注入不能替代生产执行证据"
     layers = {item["id"]: item for item in report["items"]}
     assert layers["LIVE_HOLD"]["result"] == "PASS"
+    assert layers["LEDGER_DURABILITY"]["result"] == "PASS"
     assert layers["VENUE_TEST"]["result"] == "UNVERIFIED"
     assert layers["MICRO_LIVE_OBSERVATION"]["layer"] == "UNVERIFIED"
     assert datetime.now(UTC).tzinfo is not None

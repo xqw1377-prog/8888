@@ -413,6 +413,21 @@ def test_reopen_restores_position_funding_and_rejects_changed_content(tmp_path) 
     assert reopened.position("BTCUSDT").qty == D("0")
 
 
+def test_disk_failure_does_not_change_memory(tmp_path) -> None:
+    path = tmp_path / "ledger.db"
+    ledger = Ledger("acct-1", path=str(path))
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
+    assert ledger._store is not None
+    ledger._store.fail_appends = 1
+    with pytest.raises(LedgerImbalanceError):
+        ledger.transfer_in(amount=D("1"), event_time=TS, received_at=TS, external_id="dep-2")
+    assert ledger.cash_equity() == D("10000")
+    assert len(ledger.events()) == 1
+    reopened = Ledger("acct-1", path=str(path))
+    assert reopened.cash_equity() == D("10000")
+    assert len(reopened.events()) == 1
+
+
 def test_funding_reserve_fixture_r_is_2_4_and_paid_does_not_shrink_future_window() -> None:
     points = tuple(
         SettlementPoint(at=TS.replace(hour=i % 24), rate=D("0.001"), mark_price=D("100"))
