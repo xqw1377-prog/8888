@@ -181,6 +181,7 @@ def test_console_pages_cover_limits_books_and_recovery() -> None:
         assert "报告" in page and "设置" in page and "收紧额度" in page and "发起只读对账" in page
         assert report["confidence"] == "暂无证据"
         assert refreshed["settings"]["micro_live"] == "UNVERIFIED"
+        assert refreshed["settings"]["venue"] == "币安 USDT 本位合约"
     finally:
         app.shutdown()
 

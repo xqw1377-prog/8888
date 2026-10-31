@@ -316,6 +316,7 @@ class ConsoleApp:
 def _settings(mode: str) -> dict[str, str]:
     return {
         "connection": "模拟器" if mode == "SIMULATION" else "未连接",
+        "venue": "币安 USDT 本位合约",
         "credentials": "未配置",
         "alerts": "未接通",
         "version": __version__,
@@ -806,6 +807,7 @@ function paint(data) {
   document.getElementById("ledger-body").innerHTML = (data.positions.length ? data.positions : [{symbol:"—", qty:"暂无证据"}]).map(item => `<li>${esc(item.symbol)} ${esc(item.qty)}</li>`).join("");
   cells("settings-body", [
     ["连接健康", data.settings.connection],
+    ["交易场所", data.settings.venue],
     ["凭据", data.settings.credentials],
     ["告警", data.settings.alerts],
     ["版本", data.settings.version],

@@ -6,6 +6,8 @@ dist/
 build/
 .venv/
 venv/
+.env
+.env.*
 .DS_Store
 *.db
 *.db-journal

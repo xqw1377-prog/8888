@@ -9,6 +9,7 @@ from cts.errors import CtsError
 from cts.execution.live import (
     LIVE_GRANT_STATEMENT,
     MAINNET_BASE,
+    TESTNET_BASE,
     LiveExchangeAdapter,
     LiveGrant,
     LiveSession,
@@ -110,6 +111,9 @@ def test_authorized_limit_order_is_signed_without_exposing_the_secret() -> None:
     transport = RecordingTransport(healthy())
     session = LiveSession(grant(), VenueCredentials("key-id", SECRET), transport, now=NOW)
     assert session.base_url == MAINNET_BASE
+    demo = LiveSession(grant(network="TESTNET"), VenueCredentials("key-id", SECRET), RecordingTransport(healthy()), now=NOW)
+    assert demo.base_url == TESTNET_BASE
+    assert demo.base_url == "https://demo-fapi.binance.com"
     assert SECRET not in repr(session)
     body = session.submit(
         symbol="BTCUSDT",
@@ -158,6 +162,14 @@ def test_env_credentials_are_not_read_when_absent(monkeypatch: pytest.MonkeyPatc
     with pytest.raises(CtsError) as err:
         credentials_from_env()
     assert err.value.reason_code == "CREDENTIALS_MISSING"
+
+
+def test_other_venues_are_refused_before_any_request() -> None:
+    transport = RecordingTransport(healthy())
+    with pytest.raises(CtsError) as err:
+        LiveSession(grant(venue="OTHER"), VenueCredentials("key-id", SECRET), transport, now=NOW)
+    assert err.value.reason_code == "LIVE_VENUE_UNVERIFIED"
+    assert transport.calls == []
 
 
 def test_blank_credentials_are_rejected() -> None:

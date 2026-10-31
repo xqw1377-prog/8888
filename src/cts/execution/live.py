@@ -1,4 +1,4 @@
-"""候选交易所私有接口。进程默认 HOLD，不向交易所发送请求。
+"""实盘只走币安 USDT 本位合约。进程默认 HOLD，不向交易所发送请求。
 
 实盘发送只走 LiveSession，并且要同时具备本进程授权、限额、凭据和账户模式核对。
 凭据不写入源码，也不出现在日志文本里。
@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import ssl
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -23,9 +24,10 @@ from cts.ledger.models import Side
 from cts.money import D
 
 
-LIVE_GRANT_STATEMENT = "授权本进程在限额内发送 BTC/ETH USDT 逐仓单向实盘单"
+LIVE_VENUE = "BINANCE_USDT_M"
+LIVE_GRANT_STATEMENT = "授权本进程在限额内向币安发送 BTC/ETH USDT 逐仓单向实盘单"
 ALLOWED_SYMBOLS = ("BTCUSDT", "ETHUSDT")
-TESTNET_BASE = "https://testnet.binancefuture.com"
+TESTNET_BASE = "https://demo-fapi.binance.com"
 MAINNET_BASE = "https://fapi.binance.com"
 
 Transport = Callable[[str, str, str, dict[str, str]], dict | list]
@@ -77,6 +79,7 @@ class LiveGrant:
     max_notional: Decimal
     expires_at: datetime
     symbols: tuple[str, ...] = ALLOWED_SYMBOLS
+    venue: str = LIVE_VENUE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_notional", D(self.max_notional))
@@ -185,17 +188,31 @@ def credentials_from_env() -> VenueCredentials:
 
 
 def urllib_transport(base_url: str) -> Transport:
+    context = _ssl_context()
+
     def request(method: str, path: str, query: str, headers: dict[str, str]) -> dict:
         req = Request(f"{base_url}{path}?{query}", method=method, headers=headers)
-        with urlopen(req, timeout=10) as response:
+        with urlopen(req, timeout=10, context=context) as response:
             return json.loads(response.read().decode())
 
     return request
 
 
+def _ssl_context() -> ssl.SSLContext:
+    paths = ssl.get_default_verify_paths()
+    if paths.cafile and os.path.exists(paths.cafile):
+        return ssl.create_default_context()
+    system_bundle = "/etc/ssl/cert.pem"
+    if os.path.exists(system_bundle):
+        return ssl.create_default_context(cafile=system_bundle)
+    return ssl.create_default_context()
+
+
 def _admit_grant(grant: LiveGrant, now: datetime) -> LiveGrant:
     if LIVE_TRADING_AUTHORIZATION != "HOLD":
         raise CtsError("实盘授权常量不是 HOLD，拒绝使用未复核的进程开关", reason_code="LIVE_VENUE_UNVERIFIED")
+    if grant.venue != LIVE_VENUE:
+        raise CtsError("交易只走币安 USDT 本位合约，未发送请求", reason_code="LIVE_VENUE_UNVERIFIED")
     if not grant.granted_by or grant.statement != LIVE_GRANT_STATEMENT:
         raise CtsError("缺少本进程实盘授权，未发送请求", reason_code="LIVE_TRADING_HOLD")
     if grant.network not in ("TESTNET", "MAINNET"):
