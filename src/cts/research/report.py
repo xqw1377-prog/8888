@@ -35,6 +35,9 @@ class ResearchReport:
     rule_snapshot_id: str
     data_grade: str
     known_limits: tuple[str, ...]
+    rolling_performance: str
+    concentration: str
+    curve_points: tuple[str, ...]
 
 
 def build_e0_report(
@@ -101,6 +104,9 @@ def build_e0_report(
         rule_snapshot_id="UNREGISTERED",
         data_grade=DataGrade.SIGNAL_RESEARCH_ONLY.value,
         known_limits=limits,
+        rolling_performance=_rolling(daily),
+        concentration=_concentration(ledger),
+        curve_points=tuple(format(point, "f") for _, point in curve),
     )
 
 
@@ -182,6 +188,33 @@ def _conclude(*, net: Decimal, test_trades: int, low: Optional[Decimal], high: O
     if high < 0 or net <= 0:
         return "样本外未显示优势"
     return "样本外区间下界大于零，仍不是未来盈利保证"
+
+
+def _rolling(daily: list[Decimal]) -> str:
+    if len(daily) < 2:
+        return "样本不足"
+    window = daily[-5:]
+    total = sum(window, Decimal("0"))
+    return f"近{len(window)}段变化合计 {format(total, 'f')}"
+
+
+def _concentration(ledger: Ledger) -> str:
+    notionals: dict[str, Decimal] = {}
+    for event in ledger.events():
+        if event.event_type.value != "FILL":
+            continue
+        qty = D(event.metadata.get("qty") or "0")
+        price = D(event.metadata.get("price") or "0")
+        symbol = event.symbol or "UNKNOWN"
+        notionals[symbol] = notionals.get(symbol, Decimal("0")) + abs(qty * price)
+    total = sum(notionals.values(), Decimal("0"))
+    if total <= 0:
+        return "暂无证据"
+    parts = [
+        f"{symbol} {format(value / total, 'f')}"
+        for symbol, value in sorted(notionals.items(), key=lambda item: item[1], reverse=True)
+    ]
+    return "；".join(parts)
 
 
 def _btc_hold(candles: Sequence[Candle], *, fee_rate: Decimal) -> Decimal:

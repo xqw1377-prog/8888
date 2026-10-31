@@ -59,24 +59,7 @@ class ConsoleState:
                 continue
             positions.append({"symbol": pos.symbol, "qty": format(pos.qty, "f"), "freshness": "KNOWN"})
             gross += pos.qty * pos.avg_price * pos.multiplier
-        fills = [
-            {"origin": "SIMULATION", "symbol": event.symbol or "", "id": event.external_id}
-            for event in events
-            if event.event_type.value == "FILL"
-        ]
-        traces = {
-            event.external_id: {
-                "id": event.external_id,
-                "kind": event.event_type.value,
-                "symbol": event.symbol or "",
-                "time": event.event_time.isoformat(),
-                "note": event.metadata.get("note", ""),
-                "price": event.metadata.get("price", ""),
-                "payment": event.metadata.get("payment", ""),
-                "origin": "SIMULATION",
-            }
-            for event in events
-        }
+        fills, traces = _trade_chains(events)
         present = bool(events)
         equity = ledger.cash_equity() if present else None
         transfers = -ledger.balance(AccountBucket.EXTERNAL) if present else D("0")
@@ -138,13 +121,7 @@ class ConsoleState:
                 "realized": format(-ledger.balance(AccountBucket.REALIZED_PNL), "f") if present else "暂无证据",
                 "gap": "未接交易所，差异暂无证据" if present else "暂无证据",
             },
-            report={
-                "conclusion": "证据不足" if present else "暂无证据",
-                "cash_benchmark": "0" if present else "暂无证据",
-                "btc_hold_benchmark": "暂无证据",
-                "fees": format(ledger.balance(AccountBucket.FEE), "f") if present else "暂无证据",
-                "funding": format(-ledger.balance(AccountBucket.FUNDING), "f") if present else "暂无证据",
-            },
+            report=_ledger_report(events, fees=ledger.balance(AccountBucket.FEE) if present else None, funding=-ledger.balance(AccountBucket.FUNDING) if present else None, drawdown=drawdown),
             settings=_settings(mode),
             curve=curve,
         )
@@ -343,6 +320,138 @@ def _settings(mode: str) -> dict[str, str]:
         "alerts": "未接通",
         "version": __version__,
         "approval": "实盘 HOLD",
+        "venue_test": "UNVERIFIED",
+        "alert_delivery": "UNVERIFIED",
+        "production_protection": "UNVERIFIED",
+        "micro_live": "UNVERIFIED",
+    }
+
+
+def _exit_reason(external_id: str) -> str:
+    if ":STOP:" in external_id or external_id.endswith(":STOP"):
+        return "STOP"
+    if ":TREND" in external_id:
+        return "TREND"
+    return ""
+
+
+def _trade_chains(events) -> tuple[list[dict[str, str]], dict[str, dict[str, str]]]:
+    chains: dict[str, dict[str, str]] = {}
+    active: dict[str, str] = {}
+    funding_sum: dict[str, Decimal] = {}
+
+    def seed(event) -> dict[str, str]:
+        meta = event.metadata
+        reason = meta.get("exit_reason") or _exit_reason(event.external_id) or "暂无证据"
+        return {
+            "id": event.external_id,
+            "symbol": event.symbol or "",
+            "origin": "SIMULATION",
+            "time": event.event_time.isoformat(),
+            "signal": meta.get("signal_time") or "暂无证据",
+            "risk": meta.get("risk_decision") or "暂无证据",
+            "order": event.external_id,
+            "fill": f"{meta.get('side', '')} {meta.get('qty', '')} @ {meta.get('price', '')}".strip(),
+            "protection": meta.get("protection") or "暂无证据",
+            "exit_reason": reason if meta.get("note") == "reduce" else "暂无证据",
+            "direction": meta.get("direction") or meta.get("side") or "暂无证据",
+            "funding": "暂无证据",
+            "liq_distance": meta.get("liq_distance") or "暂无证据",
+        }
+
+    for event in events:
+        kind = event.event_type.value
+        symbol = event.symbol or ""
+        if kind == "FILL" and event.metadata.get("note") == "open":
+            chains[event.external_id] = seed(event)
+            active[symbol] = event.external_id
+            funding_sum[event.external_id] = D("0")
+        elif kind == "FILL" and event.metadata.get("note") == "reduce":
+            chain_id = active.get(symbol)
+            reason = event.metadata.get("exit_reason") or _exit_reason(event.external_id) or "暂无证据"
+            if chain_id in chains:
+                chains[chain_id]["exit_reason"] = reason
+                chains[chain_id]["fill"] += f"；退出 {event.metadata.get('price', '')} @ {event.event_time.isoformat()}"
+            else:
+                chains[event.external_id] = seed(event)
+        elif kind == "FUNDING":
+            chain_id = active.get(symbol)
+            payment = event.metadata.get("payment")
+            if chain_id in chains and payment:
+                funding_sum[chain_id] = funding_sum.get(chain_id, D("0")) + D(payment)
+                chains[chain_id]["funding"] = format(funding_sum[chain_id], "f")
+    fills = [
+        {"origin": chain["origin"], "symbol": chain["symbol"], "id": chain["id"]}
+        for chain in chains.values()
+    ]
+    return fills, chains
+
+
+def _ledger_report(events, *, fees, funding, drawdown: str) -> dict[str, str]:
+    present = bool(events)
+    notionals: dict[str, Decimal] = {}
+    for event in events:
+        if event.event_type.value != "FILL":
+            continue
+        qty = D(event.metadata.get("qty") or "0")
+        price = D(event.metadata.get("price") or "0")
+        symbol = event.symbol or "UNKNOWN"
+        notionals[symbol] = notionals.get(symbol, D("0")) + abs(qty * price)
+    total = sum(notionals.values(), D("0"))
+    if total > 0:
+        concentration = "；".join(
+            f"{symbol} {format(value / total, 'f')}"
+            for symbol, value in sorted(notionals.items(), key=lambda item: item[1], reverse=True)
+        )
+    else:
+        concentration = "暂无证据"
+    dates = {event.event_time.date() for event in events if event.event_type.value not in ("TRANSFER_IN", "TRANSFER_OUT")}
+    return {
+        "conclusion": "证据不足" if present else "暂无证据",
+        "cash_benchmark": "0" if present else "暂无证据",
+        "btc_hold_benchmark": "暂无证据",
+        "fees": format(fees, "f") if fees is not None else "暂无证据",
+        "funding": format(funding, "f") if funding is not None else "暂无证据",
+        "confidence": "暂无证据",
+        "rolling": "样本不足" if len(dates) < 2 else f"账本覆盖 {len(dates)} 个日期，完整滚动见研究报告",
+        "concentration": concentration,
+        "max_drawdown": drawdown,
+        "data_grade": "SIGNAL_RESEARCH_ONLY" if present else "暂无证据",
+    }
+
+
+def apply_research_report(state: ConsoleState, report) -> None:
+    if report.confidence_low is None or report.confidence_high is None:
+        confidence = "暂无证据"
+    else:
+        confidence = f"{report.confidence_low} ~ {report.confidence_high}"
+    state.report = {
+        "conclusion": report.conclusion,
+        "cash_benchmark": report.cash_benchmark,
+        "btc_hold_benchmark": report.btc_hold_benchmark,
+        "fees": report.fees,
+        "funding": report.funding,
+        "confidence": confidence,
+        "rolling": report.rolling_performance,
+        "concentration": report.concentration,
+        "max_drawdown": report.max_drawdown,
+        "data_grade": report.data_grade,
+    }
+    state.curve = list(report.curve_points)
+
+
+def _report_defaults() -> dict[str, str]:
+    return {
+        "conclusion": "暂无证据",
+        "cash_benchmark": "暂无证据",
+        "btc_hold_benchmark": "暂无证据",
+        "fees": "暂无证据",
+        "funding": "暂无证据",
+        "confidence": "暂无证据",
+        "rolling": "暂无证据",
+        "concentration": "暂无证据",
+        "max_drawdown": "暂无证据",
+        "data_grade": "暂无证据",
     }
 
 
@@ -353,16 +462,7 @@ def _filled(values: dict[str, str], defaults: dict[str, str]) -> dict[str, str]:
 
 
 def _report_export(state: ConsoleState) -> dict:
-    report = _filled(
-        state.report,
-        {
-            "conclusion": "暂无证据",
-            "cash_benchmark": "暂无证据",
-            "btc_hold_benchmark": "暂无证据",
-            "fees": "暂无证据",
-            "funding": "暂无证据",
-        },
-    )
+    report = _filled(state.report, _report_defaults())
     return {
         "live_authorization": LIVE_TRADING_AUTHORIZATION,
         "conclusion": report["conclusion"],
@@ -370,6 +470,11 @@ def _report_export(state: ConsoleState) -> dict:
         "btc_hold_benchmark": report["btc_hold_benchmark"],
         "fees": report["fees"],
         "funding": report["funding"],
+        "confidence": report["confidence"],
+        "rolling": report["rolling"],
+        "concentration": report["concentration"],
+        "max_drawdown": report["max_drawdown"],
+        "data_grade": report["data_grade"],
         "curve": state.curve,
         "message_zh": "导出的是本地研究记录，不是未来盈利保证",
     }
@@ -411,16 +516,7 @@ def overview_payload(state: ConsoleState) -> dict:
             "gap": "暂无证据",
         },
     )
-    report = _filled(
-        state.report,
-        {
-            "conclusion": "暂无证据",
-            "cash_benchmark": "暂无证据",
-            "btc_hold_benchmark": "暂无证据",
-            "fees": "暂无证据",
-            "funding": "暂无证据",
-        },
-    )
+    report = _filled(state.report, _report_defaults())
     return {
         "mode": state.mode,
         "live_authorization": LIVE_TRADING_AUTHORIZATION,
@@ -662,7 +758,11 @@ function paint(data) {
     ["费用", data.report.fees],
     ["资金费", data.report.funding],
     ["现金基准", data.report.cash_benchmark],
-    ["持有基准", data.report.btc_hold_benchmark]
+    ["持有基准", data.report.btc_hold_benchmark],
+    ["置信区间", data.report.confidence],
+    ["滚动表现", data.report.rolling],
+    ["集中度", data.report.concentration],
+    ["最大回撤", data.report.max_drawdown]
   ]);
   const origin = { BACKTEST: "回测", SIMULATION: "模拟", LIVE: "实盘" };
   const fills = [...data.backtest_fills, ...data.simulation_fills, ...data.live_fills];
@@ -673,9 +773,18 @@ function paint(data) {
   }).join("");
   document.querySelectorAll("[data-trace]").forEach(button => button.addEventListener("click", () => {
     const trace = (data.traces || []).find(item => item.id === button.dataset.trace);
-    document.getElementById("trace-detail").textContent = trace
-      ? `${trace.kind} ${trace.symbol} ${trace.time} 价格 ${trace.price || "暂无证据"} 资金费 ${trace.payment || "暂无证据"} ${trace.note || ""}`.trim()
-      : "暂无证据";
+    const chain = trace ? [
+      ["信号", trace.signal],
+      ["风控决定", trace.risk],
+      ["订单", trace.order],
+      ["成交", trace.fill],
+      ["保护单", trace.protection],
+      ["退出原因", trace.exit_reason],
+      ["方向", trace.direction],
+      ["资金费", trace.funding],
+      ["强平距离", trace.liq_distance]
+    ].map(([label, value]) => `${label} ${value || "暂无证据"}`).join("；") : "暂无证据";
+    document.getElementById("trace-detail").textContent = chain;
   }));
   cells("risk-limits", [
     ["单笔额度", data.metrics.per_trade_risk],
@@ -700,7 +809,11 @@ function paint(data) {
     ["凭据", data.settings.credentials],
     ["告警", data.settings.alerts],
     ["版本", data.settings.version],
-    ["实盘授权", data.live_authorization]
+    ["实盘授权", data.live_authorization],
+    ["交易所测试", data.settings.venue_test],
+    ["告警投递", data.settings.alert_delivery],
+    ["生产保护单", data.settings.production_protection],
+    ["微实盘", data.settings.micro_live]
   ]);
   document.getElementById("approvals").innerHTML = (data.approvals.length ? data.approvals : ["暂无证据"]).map(item => `<li>${esc(item)}</li>`).join("");
   Object.assign(initial, data);

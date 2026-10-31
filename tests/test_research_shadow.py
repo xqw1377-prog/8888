@@ -9,6 +9,8 @@ from cts.ledger.models import Side
 from cts.money import D
 from cts.ops.drill import run_local_drill
 from cts.research.experiments import ExperimentRegistry, breakeven_stop
+from cts.console.app import ConsoleState, apply_research_report
+from cts.ledger.journal import Ledger
 from cts.research.report import build_e0_report, register_first_round
 from cts.shadow.session import ShadowSession
 from tests.helpers import breakout_series
@@ -24,6 +26,16 @@ def test_e0_report_can_say_evidence_is_insufficient() -> None:
     assert report.rule_snapshot_id == "UNREGISTERED"
     assert report.cash_benchmark == "0"
     assert report.known_limits[-1] == "本报告不授予实盘权限"
+    assert report.rolling_performance
+    assert report.concentration
+    assert report.curve_points
+    ledger = Ledger("research-view")
+    state = ConsoleState.from_ledger(ledger)
+    apply_research_report(state, report)
+    assert state.report["data_grade"] == "SIGNAL_RESEARCH_ONLY"
+    assert "策略已验证" not in state.report["conclusion"]
+    assert state.report["rolling"] == report.rolling_performance
+    assert state.report["concentration"] == report.concentration
 
 
 def test_registered_experiments_stop_at_twelve_and_e2_is_not_testable() -> None:

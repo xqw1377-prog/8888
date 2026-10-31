@@ -2,7 +2,8 @@ import json
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from cts.console.app import ConsoleApp, ConsoleState
+from cts.console.app import ConsoleApp, ConsoleState, apply_research_report
+from cts.ledger.models import Side
 from cts.ledger.journal import Ledger
 from cts.money import D
 from tests.test_ledger import TS
@@ -178,5 +179,64 @@ def test_console_pages_cover_limits_books_and_recovery() -> None:
         assert report["live_authorization"] == "HOLD"
         status, _, page = _json(port, "/", token="secret")
         assert "报告" in page and "设置" in page and "收紧额度" in page and "发起只读对账" in page
+        assert report["confidence"] == "暂无证据"
+        assert refreshed["settings"]["micro_live"] == "UNVERIFIED"
     finally:
         app.shutdown()
+
+
+def test_trade_chain_names_each_link_or_says_evidence_is_missing() -> None:
+    ledger = Ledger("acct")
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep")
+    ledger.apply_fill(
+        symbol="BTCUSDT",
+        side=Side.LONG,
+        qty=D("1"),
+        price=D("100"),
+        multiplier=D("1"),
+        event_time=TS,
+        received_at=TS,
+        external_id="entry:BTCUSDT:1",
+        venue="SIM",
+        venue_trade_id="t1",
+        annotations={
+            "signal_time": TS.isoformat(),
+            "risk_decision": "已按权益和止损距离定仓",
+            "direction": "LONG",
+            "protection": "研究止损 90，无交易所保护单证据",
+            "liq_distance": "本地公式 0.2，不是交易所读回",
+        },
+    )
+    ledger.apply_fill(
+        symbol="BTCUSDT",
+        side=Side.SHORT,
+        qty=D("1"),
+        price=D("110"),
+        multiplier=D("1"),
+        event_time=TS,
+        received_at=TS,
+        external_id="exit:BTCUSDT:1:STOP:m",
+        venue="SIM",
+        venue_trade_id="t2",
+        reduce_only=True,
+        annotations={"exit_reason": "STOP", "direction": "LONG"},
+    )
+    ledger.post_funding(
+        payment=D("-0.5"),
+        event_time=TS,
+        received_at=TS,
+        external_id="funding:BTCUSDT:1",
+        venue="SIM",
+        symbol="BTCUSDT",
+    )
+    state = ConsoleState.from_ledger(ledger)
+    trace = state.traces["entry:BTCUSDT:1"]
+    assert trace["signal"] == TS.isoformat()
+    assert trace["risk"] == "已按权益和止损距离定仓"
+    assert trace["protection"] == "研究止损 90，无交易所保护单证据"
+    assert trace["exit_reason"] == "STOP"
+    assert trace["direction"] == "LONG"
+    assert trace["funding"] == "-0.5"
+    assert "不是交易所读回" in trace["liq_distance"]
+    assert state.report["concentration"].startswith("BTCUSDT")
+    assert state.report["data_grade"] == "SIGNAL_RESEARCH_ONLY"

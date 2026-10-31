@@ -10,6 +10,7 @@ from typing import Optional, Sequence
 from cts.clock import UTC
 from cts.data.models import Candle, DataGrade, FundingSettlement, MarkSample
 from cts.errors import LookaheadError, UnitValidationError
+from cts.execution.liq import model_liq_price
 from cts.ledger.journal import Ledger
 from cts.ledger.models import Side
 from cts.money import D
@@ -183,6 +184,7 @@ def replay_t1(
             price_source="MARK",
             quote_grade=classify_quote(breached.event_time, breached.available_at, booked),
             price_event_time=breached.event_time,
+            annotations={"exit_reason": "STOP", "direction": held.side.value},
         )
         notional = held.qty * breached.mark_price * config.multiplier
         book_exit_costs(notional, booked, seen, f"{symbol}:{booked.isoformat()}:{breached.source_id}")
@@ -332,6 +334,7 @@ def replay_t1(
                     price_source="CLOSE",
                     quote_grade=classify_quote(bar.event_time, bar.available_at, booked),
                     price_event_time=bar.event_time,
+                    annotations={"exit_reason": "TREND", "direction": position.side.value},
                 )
                 notional = position.qty * exit_price * config.multiplier
                 book_exit_costs(notional, booked, seen, f"{symbol}:{booked.isoformat()}:TREND")
@@ -384,6 +387,21 @@ def replay_t1(
                         price_source="NEXT_OPEN",
                         quote_grade=classify_quote(bar_open_time(bar), bar.available_at, opened),
                         price_event_time=bar_open_time(bar),
+                        annotations={
+                            "signal_time": pending.event_time.isoformat(),
+                            "risk_decision": "已按权益和止损距离定仓",
+                            "direction": pending.side.value,
+                            "protection": f"研究止损 {format(stop, 'f')}，无交易所保护单证据",
+                            "liq_distance": _liq_distance(
+                                side=pending.side,
+                                price=fill_px,
+                                qty=sized.qty,
+                                margin=sized.notional / config.leverage,
+                                mark=m or fill_px,
+                                multiplier=config.multiplier,
+                                fee_rate=config.fee_rate,
+                            ),
+                        },
                     )
                     ledger.lock_margin(
                         amount=sized.notional / config.leverage,
@@ -442,3 +460,30 @@ def replay_t1(
         grade=DataGrade.SIGNAL_RESEARCH_ONLY,
         funding_posted=funding_posted,
     )
+
+
+def _liq_distance(
+    *,
+    side: Side,
+    price: Decimal,
+    qty: Decimal,
+    margin: Decimal,
+    mark: Decimal,
+    multiplier: Decimal,
+    fee_rate: Decimal,
+) -> str:
+    if margin <= 0 or mark <= 0:
+        return "暂无证据"
+    try:
+        liq = model_liq_price(
+            side=side,
+            avg_price=price,
+            qty=qty,
+            multiplier=multiplier,
+            isolated_margin=margin,
+            mmr=Decimal("0.005"),
+            fee_rate=fee_rate,
+        )
+    except (ValueError, ArithmeticError):
+        return "暂无证据"
+    return f"本地公式 {format(abs(mark - liq) / mark, 'f')}，不是交易所读回"

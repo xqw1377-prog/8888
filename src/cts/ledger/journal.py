@@ -273,6 +273,7 @@ class Ledger:
         quote_grade: str = "",
         price_event_time: Optional[datetime] = None,
         event_type: LedgerEventType = LedgerEventType.FILL,
+        annotations: Optional[dict[str, str]] = None,
     ) -> tuple[LedgerEvent, Decimal]:
         key = (venue, external_id)
         qty = require_positive(D(qty), "qty")
@@ -287,6 +288,10 @@ class Ledger:
                 prior = existing.metadata.get(meta_key, "")
                 if meta_value and prior and prior != meta_value:
                     raise ConflictError(f"重复流水价格来源冲突: {key}")
+            for meta_key, meta_value in (annotations or {}).items():
+                prior = existing.metadata.get(meta_key, "")
+                if meta_value and prior and prior != meta_value:
+                    raise ConflictError(f"重复流水链路冲突: {key}")
             return existing, D(existing.metadata.get("realized", "0"))
 
         realized = Decimal("0")
@@ -368,6 +373,7 @@ class Ledger:
                 **({"price_source": price_source} if price_source else {}),
                 **({"quote_grade": quote_grade} if quote_grade else {}),
                 **({"price_event_time": price_event_time.isoformat()} if price_event_time is not None else {}),
+                **{key: value for key, value in (annotations or {}).items() if value},
             },
         )
         try:
