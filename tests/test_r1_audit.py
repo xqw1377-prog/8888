@@ -320,10 +320,15 @@ def test_entry_bar_stop_before_close_exits() -> None:
     fills = [event for event in ledger.events() if event.event_type == LedgerEventType.FILL]
     opened = next(event for event in fills if event.metadata.get("note") == "open")
     closed = next(event for event in fills if event.metadata.get("note") == "reduce")
+    assert result.grade == DataGrade.SIGNAL_RESEARCH_ONLY
     assert opened.event_time == t_close(130) + timedelta(seconds=1)
     assert opened.event_time > t_close(130)
+    assert opened.metadata["price_source"] == "NEXT_OPEN"
+    assert opened.metadata["quote_grade"] == "RESEARCH_APPROXIMATE"
     assert closed.event_time == breach_at
     assert closed.metadata["price"] == "110"
+    assert closed.metadata["price_source"] == "MARK"
+    assert closed.metadata["quote_grade"] == "EXECUTABLE_QUOTE"
     assert opened.event_time < closed.event_time < t_close(131)
     assert all(fills[i].event_time <= fills[i + 1].event_time for i in range(len(fills) - 1))
 
@@ -439,12 +444,77 @@ def test_late_mark_cannot_backdate_exit() -> None:
         venue="SIM",
     )
     fills = [event for event in ledger.events() if event.event_type == LedgerEventType.FILL]
+    opened = next(event for event in fills if event.metadata.get("note") == "open")
+    closed = next(event for event in fills if event.metadata.get("note") == "reduce")
+    assert result.fills == 1
+    assert result.exits == 1
+    assert result.grade == DataGrade.SIGNAL_RESEARCH_ONLY
+    assert opened.event_time == t_close(130) + timedelta(seconds=1)
+    assert opened.metadata["quote_grade"] == "RESEARCH_APPROXIMATE"
+    assert closed.event_time == visible
+    assert closed.event_time > breach_at
+    assert closed.metadata["price"] == "110"
+    assert closed.metadata["price_source"] == "MARK"
+    assert closed.metadata["quote_grade"] == "RESEARCH_APPROXIMATE"
+    assert all(event.event_time <= event.received_at for event in fills)
+    assert all(fills[i].event_time <= fills[i + 1].event_time for i in range(len(fills) - 1))
+
+
+def test_one_millisecond_mark_delay_still_stops() -> None:
+    bars = breakout_series(130)
+    breach_at = t_close(130) + timedelta(hours=1)
+    visible = breach_at + timedelta(milliseconds=1)
+    marks = [mark(i, format(bars[i].close, "f")) for i in range(len(bars))]
+    marks.append(
+        MarkSample(
+            venue="SIM",
+            symbol="BTCUSDT",
+            event_time=breach_at,
+            received_at=visible,
+            available_at=visible,
+            mark_price=D("110"),
+            index_price=D("110"),
+            source_id="delay-1ms",
+        )
+    )
+    ledger = Ledger("acct-delay-1ms")
+    ledger.transfer_in(amount=D("10000"), event_time=ORIGIN, received_at=ORIGIN, external_id="dep")
+    result = replay_t1(
+        ledger=ledger,
+        symbol="BTCUSDT",
+        candles=bars,
+        marks=marks,
+        config=ReplayConfig(params=T1Params()),
+        venue="SIM",
+    )
+    fills = [event for event in ledger.events() if event.event_type == LedgerEventType.FILL]
+    closed = next(event for event in fills if event.metadata.get("note") == "reduce")
+    assert result.exits == 1
+    assert result.grade == DataGrade.SIGNAL_RESEARCH_ONLY
+    assert closed.event_time == visible
+    assert closed.metadata["price"] == "110"
+    assert closed.metadata["price_source"] == "MARK"
+    assert closed.metadata["quote_grade"] == "RESEARCH_APPROXIMATE"
+
+
+def test_stop_uses_mark_not_close() -> None:
+    bars = breakout_series(130)
+    bars.append(candle(132, open_="118", high="118", low="90", close="100"))
+    marks = [mark(i, "118") for i in range(len(bars))]
+    ledger = Ledger("acct-mark-stop")
+    ledger.transfer_in(amount=D("10000"), event_time=ORIGIN, received_at=ORIGIN, external_id="dep")
+    result = replay_t1(
+        ledger=ledger,
+        symbol="BTCUSDT",
+        candles=bars,
+        marks=marks,
+        config=ReplayConfig(params=T1Params()),
+        venue="SIM",
+    )
     assert result.fills == 1
     assert result.exits == 0
-    assert fills[0].metadata.get("note") == "open"
-    assert fills[0].event_time == t_close(130) + timedelta(seconds=1)
-    assert all(event.metadata.get("price") != "110" for event in fills)
-    assert all(event.event_time <= event.received_at for event in fills)
+    assert result.grade == DataGrade.SIGNAL_RESEARCH_ONLY
+    assert all("STOP" not in event.external_id for event in ledger.events())
 
 
 def test_evidence_cannot_clear_a_later_fault_instance(tmp_path) -> None:

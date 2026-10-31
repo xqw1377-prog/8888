@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Optional, Sequence
 
 from cts.clock import UTC
-from cts.data.models import Candle, MarkSample
+from cts.data.models import Candle, DataGrade, MarkSample
 from cts.errors import LookaheadError, UnitValidationError
 from cts.ledger.journal import Ledger
 from cts.ledger.models import Side
@@ -45,6 +45,7 @@ class ReplayResult:
     fills: int
     exits: int
     skipped_no_fill: int
+    grade: DataGrade = DataGrade.SIGNAL_RESEARCH_ONLY
 
 
 def bar_open_time(bar: Candle) -> datetime:
@@ -74,9 +75,15 @@ def causal_entry_time(signal: SignalIntent, bar: Candle) -> datetime:
     return max(bar_open_time(bar), signal.available_at)
 
 
-def mark_can_fill(mk: MarkSample) -> bool:
-    """标记价只能在它自己的事件时间成交，且当时必须已经可得。晚到价格不能挪到以后使用。"""
-    return mk.available_at <= mk.event_time
+EXECUTABLE_QUOTE = "EXECUTABLE_QUOTE"
+RESEARCH_APPROXIMATE = "RESEARCH_APPROXIMATE"
+
+
+def classify_quote(price_time: datetime, price_available: datetime, fill_time: datetime) -> str:
+    """可执行报价必须与成交时刻是同一笔价格证据。对不上的只能作为研究近似。"""
+    if price_time == fill_time and price_available <= fill_time:
+        return EXECUTABLE_QUOTE
+    return RESEARCH_APPROXIMATE
 
 
 def _mark_key(mk: MarkSample) -> tuple:
@@ -90,7 +97,6 @@ def next_available_stop(position: OpenPosition, marks: Sequence[MarkSample], con
         if mk.symbol == position.symbol
         and _mark_key(mk) not in consumed
         and mk.available_at <= as_of
-        and mark_can_fill(mk)
         and mk.event_time > position.entry_event_time
     ]
     visible.sort(key=lambda mk: (mk.event_time, mk.available_at))
@@ -101,11 +107,18 @@ def next_available_stop(position: OpenPosition, marks: Sequence[MarkSample], con
     return None
 
 
-def mark_at(marks: Sequence[MarkSample], as_of: datetime, symbol: str) -> Optional[Decimal]:
-    eligible = [m for m in marks if m.symbol == symbol and m.available_at <= as_of and mark_can_fill(m)]
+def latest_mark(marks: Sequence[MarkSample], as_of: datetime, symbol: str) -> Optional[MarkSample]:
+    eligible = [m for m in marks if m.symbol == symbol and m.available_at <= as_of]
     if not eligible:
         return None
-    return max(eligible, key=lambda m: (m.event_time, m.available_at)).mark_price
+    return max(eligible, key=lambda m: (m.event_time, m.available_at))
+
+
+def mark_at(marks: Sequence[MarkSample], as_of: datetime, symbol: str) -> Optional[Decimal]:
+    sample = latest_mark(marks, as_of, symbol)
+    if sample is None:
+        return None
+    return sample.mark_price
 
 
 def replay_t1(
@@ -149,9 +162,7 @@ def replay_t1(
 
     def book_stop(held: OpenPosition, breached: MarkSample) -> None:
         nonlocal exits, last_exit, position, pending
-        if not mark_can_fill(breached):
-            raise LookaheadError("晚到标记价不能作为新成交的价格")
-        booked = stamp(breached.event_time)
+        booked = stamp(executable_time(held.entry_event_time, breached.available_at))
         seen = observe(booked)
         ledger.apply_fill(
             symbol=symbol,
@@ -165,6 +176,9 @@ def replay_t1(
             venue=venue,
             venue_trade_id=f"exit-{fills}-{exits}",
             reduce_only=True,
+            price_source="MARK",
+            quote_grade=classify_quote(breached.event_time, breached.available_at, booked),
+            price_event_time=breached.event_time,
         )
         notional = held.qty * breached.mark_price * config.multiplier
         ledger.post_fee(
@@ -182,15 +196,20 @@ def replay_t1(
 
     for i, bar in enumerate(closed):
         hist = closed[: i + 1]
-        m = mark_at(marks, bar.available_at, symbol)
+        sample = latest_mark(marks, bar.available_at, symbol)
+        m = sample.mark_price if sample is not None else None
         if position is not None:
             breached = next_available_stop(position, marks, consumed_marks, bar.available_at)
             if breached is not None:
                 book_stop(position, breached)
                 continue
         if position is not None:
-            position, decision = evaluate_exit(position, hist, mark_price=bar.close, params=config.params)
-            if decision is not None:
+            mark_for_stop = m if sample is not None and sample.event_time > position.entry_event_time else None
+            position, decision = evaluate_exit(position, hist, mark_price=mark_for_stop, params=config.params)
+            if decision is not None and decision.reason == "STOP" and sample is not None:
+                book_stop(position, sample)
+                continue
+            if decision is not None and decision.reason == "TREND":
                 booked = stamp(executable_time(position.entry_event_time, bar.available_at))
                 seen = observe(booked)
                 exit_price = bar.close
@@ -206,6 +225,9 @@ def replay_t1(
                     venue=venue,
                     venue_trade_id=f"exit-{fills}-{exits}",
                     reduce_only=True,
+                    price_source="CLOSE",
+                    quote_grade=classify_quote(bar.event_time, bar.available_at, booked),
+                    price_event_time=bar.event_time,
                 )
                 notional = position.qty * exit_price * config.multiplier
                 ledger.post_fee(
@@ -260,6 +282,9 @@ def replay_t1(
                         external_id=f"entry:{symbol}:{pending.event_time.isoformat()}",
                         venue=venue,
                         venue_trade_id=f"entry-{fills}",
+                        price_source="NEXT_OPEN",
+                        quote_grade=classify_quote(bar_open_time(bar), bar.available_at, opened),
+                        price_event_time=bar_open_time(bar),
                     )
                     ledger.lock_margin(
                         amount=sized.notional / config.leverage,
@@ -303,4 +328,10 @@ def replay_t1(
                 signals.append(intent)
                 pending = intent
 
-    return ReplayResult(signals=signals, fills=fills, exits=exits, skipped_no_fill=skipped)
+    return ReplayResult(
+        signals=signals,
+        fills=fills,
+        exits=exits,
+        skipped_no_fill=skipped,
+        grade=DataGrade.SIGNAL_RESEARCH_ONLY,
+    )

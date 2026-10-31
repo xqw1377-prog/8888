@@ -146,7 +146,7 @@ def evaluate_exit(
     position: OpenPosition,
     candles: Sequence[Candle],
     *,
-    mark_price: Decimal,
+    mark_price: Optional[Decimal],
     params: T1Params,
 ) -> tuple[OpenPosition, Optional[ExitDecision]]:
     if not candles or not all(c.is_closed for c in candles):
@@ -164,19 +164,20 @@ def evaluate_exit(
     updated = replace(position, extreme=extreme)
     updated = replace(updated, stop=trail_stop(updated, candles, params))
 
-    mark = D(mark_price)
-    if position.side == Side.LONG and mark <= updated.stop:
+    mark = D(mark_price) if mark_price is not None else None
+    if mark is not None and position.side == Side.LONG and mark <= updated.stop:
         return updated, ExitDecision("STOP", updated.side, updated.stop, Decimal("0"), mark, current.close)
-    if position.side == Side.SHORT and mark >= updated.stop:
+    if mark is not None and position.side == Side.SHORT and mark >= updated.stop:
         return updated, ExitDecision("STOP", updated.side, updated.stop, Decimal("0"), mark, current.close)
 
     if len(prior) >= params.exit_lookback:
         d20 = window_low(prior[-params.exit_lookback :])
         u20 = window_high(prior[-params.exit_lookback :])
+        recorded_mark = mark if mark is not None else current.close
         if position.side == Side.LONG and current.close < d20:
-            return updated, ExitDecision("TREND", updated.side, updated.stop, d20, mark, current.close)
+            return updated, ExitDecision("TREND", updated.side, updated.stop, d20, recorded_mark, current.close)
         if position.side == Side.SHORT and current.close > u20:
-            return updated, ExitDecision("TREND", updated.side, updated.stop, u20, mark, current.close)
+            return updated, ExitDecision("TREND", updated.side, updated.stop, u20, recorded_mark, current.close)
     return updated, None
 
 
