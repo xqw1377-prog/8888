@@ -113,3 +113,70 @@ def test_console_reads_ledger_equity() -> None:
     assert state.equity == "10000"
     assert state.mode == "SIMULATION"
     assert state.positions == []
+    assert state.books["wallet"] == "10000"
+    assert state.metrics["gross_leverage"] == "0"
+    assert state.metrics["drawdown"] == "0"
+    assert state.metrics["net_pnl"] == "0"
+    assert state.report["conclusion"] == "证据不足"
+    assert state.settings["approval"] == "实盘 HOLD"
+
+
+def test_console_pages_cover_limits_books_and_recovery() -> None:
+    ledger = Ledger("acct")
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep")
+    app = ConsoleApp("secret", ConsoleState.from_ledger(ledger))
+    port = app.serve()
+    try:
+        status, _, raw = _json(port, "/v1/overview", token="secret")
+        body = json.loads(raw)
+        assert status == 200
+        assert body["metrics"]["data_freshness"] == "行情 NOT_CHECKED"
+        assert body["books"]["wallet"] == "10000"
+        assert body["books"]["gap"] == "未接交易所，差异暂无证据"
+        assert body["last_reconcile_at"] == "暂无证据"
+        assert body["live_authorization"] == "HOLD"
+        status, _, tighten = _json(
+            port,
+            "/v1/control/tighten",
+            token="secret",
+            body={"expected_version": body["version"]},
+            key="tighten-1",
+        )
+        tightened = json.loads(tighten)
+        assert status == 200
+        assert tightened["risk_coefficient"] == "0.5"
+        assert "PROPOSED" in tightened["message_zh"]
+        status, _, resumed = _json(
+            port,
+            "/v1/control/resume-request",
+            token="secret",
+            body={"expected_version": tightened["version"]},
+            key="resume-dash",
+        )
+        resume_body = json.loads(resumed)
+        assert status == 200
+        assert resume_body["ok"] is False
+        assert resume_body["system_state"] == "RECONCILING"
+        status, _, overview = _json(port, "/v1/overview", token="secret")
+        refreshed = json.loads(overview)
+        assert refreshed["system_state"] == "RECONCILING"
+        assert refreshed["approvals"] == ["恢复申请已记录，未批准"]
+        assert refreshed["risk_coefficient"] == "0.5"
+        status, _, recon = _json(
+            port,
+            "/v1/reconciliation-runs",
+            token="secret",
+            body={"expected_version": refreshed["version"]},
+            key="recon-dash",
+        )
+        assert status == 200
+        assert "未修改交易所余额" in recon
+        status, _, exported = _json(port, "/v1/report/export", token="secret")
+        report = json.loads(exported)
+        assert status == 200
+        assert report["conclusion"] == "证据不足"
+        assert report["live_authorization"] == "HOLD"
+        status, _, page = _json(port, "/", token="secret")
+        assert "报告" in page and "设置" in page and "收紧额度" in page and "发起只读对账" in page
+    finally:
+        app.shutdown()
