@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -319,9 +320,11 @@ def test_entry_bar_stop_before_close_exits() -> None:
     fills = [event for event in ledger.events() if event.event_type == LedgerEventType.FILL]
     opened = next(event for event in fills if event.metadata.get("note") == "open")
     closed = next(event for event in fills if event.metadata.get("note") == "reduce")
-    assert opened.event_time == t_close(130)
-    assert opened.event_time < closed.event_time == breach_at
-    assert closed.event_time < t_close(131)
+    assert opened.event_time == t_close(130) + timedelta(seconds=1)
+    assert opened.event_time > t_close(130)
+    assert closed.event_time == breach_at
+    assert closed.metadata["price"] == "110"
+    assert opened.event_time < closed.event_time < t_close(131)
     assert all(fills[i].event_time <= fills[i + 1].event_time for i in range(len(fills) - 1))
 
 
@@ -436,12 +439,43 @@ def test_late_mark_cannot_backdate_exit() -> None:
         venue="SIM",
     )
     fills = [event for event in ledger.events() if event.event_type == LedgerEventType.FILL]
-    opened = next(event for event in fills if event.metadata.get("note") == "open")
-    closed = next(event for event in fills if event.metadata.get("note") == "reduce")
     assert result.fills == 1
-    assert result.exits == 1
-    assert opened.event_time == t_close(130)
-    assert closed.event_time >= visible
-    assert closed.event_time > breach_at
-    assert all(fills[i].event_time <= fills[i + 1].event_time for i in range(len(fills) - 1))
+    assert result.exits == 0
+    assert fills[0].metadata.get("note") == "open"
+    assert fills[0].event_time == t_close(130) + timedelta(seconds=1)
+    assert all(event.metadata.get("price") != "110" for event in fills)
     assert all(event.event_time <= event.received_at for event in fills)
+
+
+def test_evidence_cannot_clear_a_later_fault_instance(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    engine.register_recovery_approver("owner", now=NOW)
+    early = engine.record_resolution_evidence("DAILY_LOSS", statement="before-fault", recorded_by="owner", now=NOW)
+    later = NOW + timedelta(hours=1)
+    engine.add_blocker("DAILY_LOSS", SystemState.PAUSED, now=later)
+    with pytest.raises(NewRiskBlockedError) as err:
+        engine.clear_blocker("DAILY_LOSS", resolution_evidence_id=early, now=later)
+    assert err.value.reason_code == "RESOLUTION_EVIDENCE_INVALID"
+    assert {b.reason_code for b in engine.occupancy().blockers} == {"DAILY_LOSS"}
+    engine.add_blocker("DRAWDOWN_6", SystemState.PAUSED, now=NOW)
+    first = engine.record_resolution_evidence("DRAWDOWN_6", statement="instance-1", recorded_by="owner", now=NOW)
+    second = engine.record_resolution_evidence("DRAWDOWN_6", statement="instance-1b", recorded_by="owner", now=NOW)
+    engine.clear_blocker("DRAWDOWN_6", resolution_evidence_id=second, now=NOW)
+    engine.add_blocker("DRAWDOWN_6", SystemState.PAUSED, now=later)
+    with pytest.raises(NewRiskBlockedError) as err:
+        engine.clear_blocker("DRAWDOWN_6", resolution_evidence_id=first, now=later)
+    assert err.value.reason_code == "RESOLUTION_EVIDENCE_INVALID"
+    assert "DRAWDOWN_6" in {b.reason_code for b in engine.occupancy().blockers}
+
+
+def test_forged_snapshot_time_cannot_renew_approval(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    old = NOW - timedelta(days=100)
+    engine.add_blocker("DAILY_LOSS", SystemState.PAUSED, now=old)
+    engine.clear_blocker("DAILY_LOSS", resolution_evidence_id=bound_evidence(engine, "DAILY_LOSS", now=old), now=old)
+    snap = engine.create_recovery_snapshot(now=old)
+    forged = replace(snap, created_at=NOW)
+    with pytest.raises(RecoveryStaleError) as err:
+        engine.approve_recovery(forged, approved_by="owner", now=NOW)
+    assert err.value.reason_code == "RECOVERY_APPROVAL_EXPIRED"
+    assert engine.occupancy().system_state == SystemState.PAUSED

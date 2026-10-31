@@ -97,6 +97,29 @@ CREATE TABLE IF NOT EXISTS blockers (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_active_blocker
     ON blockers(account_id, reason_code) WHERE cleared_at IS NULL;
+CREATE TABLE IF NOT EXISTS recovery_snapshots (
+    account_id TEXT NOT NULL,
+    snapshot_version INTEGER NOT NULL,
+    blocker_set_version INTEGER NOT NULL,
+    risk_version INTEGER NOT NULL,
+    account_state_version INTEGER NOT NULL,
+    equity_version INTEGER NOT NULL,
+    config_hash TEXT NOT NULL,
+    blocker_ids TEXT NOT NULL,
+    system_state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    health_check_id TEXT NOT NULL,
+    PRIMARY KEY (account_id, snapshot_version)
+);
+CREATE TABLE IF NOT EXISTS health_checks (
+    check_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    snapshot_version INTEGER NOT NULL,
+    checked_at TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    result TEXT NOT NULL,
+    detail TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS recovery_approvals (
     approval_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL,
@@ -113,6 +136,7 @@ CREATE TABLE IF NOT EXISTS recovery_approvals (
 CREATE TABLE IF NOT EXISTS resolution_evidence (
     evidence_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL,
+    blocker_id TEXT NOT NULL,
     reason_code TEXT NOT NULL,
     statement TEXT NOT NULL,
     artifact_hash TEXT NOT NULL,
@@ -387,6 +411,7 @@ class RiskStore:
         *,
         evidence_id: str,
         account_id: str,
+        blocker_id: str,
         reason_code: str,
         statement: str,
         artifact_hash: str,
@@ -396,11 +421,22 @@ class RiskStore:
         conn.execute(
             """
             INSERT INTO resolution_evidence(
-                evidence_id, account_id, reason_code, statement, artifact_hash, recorded_by, recorded_at
-            ) VALUES (?,?,?,?,?,?,?)
+                evidence_id, account_id, blocker_id, reason_code, statement, artifact_hash, recorded_by, recorded_at
+            ) VALUES (?,?,?,?,?,?,?,?)
             """,
-            (evidence_id, account_id, reason_code, statement, artifact_hash, recorded_by, _iso(now)),
+            (evidence_id, account_id, blocker_id, reason_code, statement, artifact_hash, recorded_by, _iso(now)),
         )
+
+    def _load_recovery_snapshot(self, conn: sqlite3.Connection, account_id: str, snapshot_version: int):
+        return conn.execute(
+            """
+            SELECT s.*, h.checked_at AS health_checked_at, h.result AS health_result, h.scope AS health_scope
+            FROM recovery_snapshots s
+            JOIN health_checks h ON h.check_id = s.health_check_id
+            WHERE s.account_id=? AND s.snapshot_version=?
+            """,
+            (account_id, snapshot_version),
+        ).fetchone()
 
     def _evidence_row(self, conn: sqlite3.Connection, evidence_id: str):
         return conn.execute("SELECT * FROM resolution_evidence WHERE evidence_id=?", (evidence_id,)).fetchone()

@@ -69,6 +69,16 @@ def executable_time(entry_time: datetime, available_at: datetime) -> datetime:
     return max(entry_time, available_at)
 
 
+def causal_entry_time(signal: SignalIntent, bar: Candle) -> datetime:
+    """开仓不得早于信号可得，也不得早于下一根开盘。"""
+    return max(bar_open_time(bar), signal.available_at)
+
+
+def mark_can_fill(mk: MarkSample) -> bool:
+    """标记价只能在它自己的事件时间成交，且当时必须已经可得。晚到价格不能挪到以后使用。"""
+    return mk.available_at <= mk.event_time
+
+
 def _mark_key(mk: MarkSample) -> tuple:
     return (mk.symbol, mk.source_id, mk.event_time.isoformat(), format(mk.mark_price, "f"), mk.available_at.isoformat())
 
@@ -80,6 +90,7 @@ def next_available_stop(position: OpenPosition, marks: Sequence[MarkSample], con
         if mk.symbol == position.symbol
         and _mark_key(mk) not in consumed
         and mk.available_at <= as_of
+        and mark_can_fill(mk)
         and mk.event_time > position.entry_event_time
     ]
     visible.sort(key=lambda mk: (mk.event_time, mk.available_at))
@@ -91,7 +102,7 @@ def next_available_stop(position: OpenPosition, marks: Sequence[MarkSample], con
 
 
 def mark_at(marks: Sequence[MarkSample], as_of: datetime, symbol: str) -> Optional[Decimal]:
-    eligible = [m for m in marks if m.symbol == symbol and m.available_at <= as_of]
+    eligible = [m for m in marks if m.symbol == symbol and m.available_at <= as_of and mark_can_fill(m)]
     if not eligible:
         return None
     return max(eligible, key=lambda m: (m.event_time, m.available_at)).mark_price
@@ -138,7 +149,9 @@ def replay_t1(
 
     def book_stop(held: OpenPosition, breached: MarkSample) -> None:
         nonlocal exits, last_exit, position, pending
-        booked = stamp(executable_time(held.entry_event_time, breached.available_at))
+        if not mark_can_fill(breached):
+            raise LookaheadError("晚到标记价不能作为新成交的价格")
+        booked = stamp(breached.event_time)
         seen = observe(booked)
         ledger.apply_fill(
             symbol=symbol,
@@ -175,12 +188,12 @@ def replay_t1(
             if breached is not None:
                 book_stop(position, breached)
                 continue
-        if position is not None and m is not None:
-            position, decision = evaluate_exit(position, hist, mark_price=m, params=config.params)
+        if position is not None:
+            position, decision = evaluate_exit(position, hist, mark_price=bar.close, params=config.params)
             if decision is not None:
                 booked = stamp(executable_time(position.entry_event_time, bar.available_at))
                 seen = observe(booked)
-                exit_price = m if decision.reason == "STOP" else bar.close
+                exit_price = bar.close
                 ledger.apply_fill(
                     symbol=symbol,
                     side=Side.LONG if position.side == Side.SHORT else Side.SHORT,
@@ -234,7 +247,7 @@ def replay_t1(
                     skipped += 1
                     pending = None
                 else:
-                    opened = stamp(bar_open_time(bar))
+                    opened = stamp(causal_entry_time(pending, bar))
                     observed = observe(bar.available_at)
                     ledger.apply_fill(
                         symbol=symbol,

@@ -54,6 +54,12 @@ def _within_freshness(origin: datetime, now: datetime) -> bool:
     return timedelta(0) <= age <= RECOVERY_FRESHNESS_TTL
 
 
+def _blocker_ids(raw: str) -> tuple[str, ...]:
+    if not raw:
+        return ()
+    return tuple(part for part in raw.split(",") if part)
+
+
 class RiskEngine:
     def __init__(self, store: RiskStore, account_id: str) -> None:
         self.store = store
@@ -258,22 +264,26 @@ class RiskEngine:
         recorder = recorded_by.strip()
         if not reason or not body or not recorder:
             raise NewRiskBlockedError("解决证据缺少原因、内容或记录人", reason_code="RESOLUTION_EVIDENCE_REQUIRED")
-        evidence_id = sha256_hex(
-            {
-                "account_id": self.account_id,
-                "reason_code": reason,
-                "statement": body,
-                "recorded_by": recorder,
-                "recorded_at": ts.isoformat(),
-            }
-        )
         with self.store.txn() as conn:
             if not self.store._approver_exists(conn, self.account_id, recorder):
                 raise NewRiskBlockedError("证据记录人未登记", reason_code="RECOVERY_APPROVER_UNKNOWN")
+            active = [b for b in self.store.active_blockers(conn, self.account_id) if b.reason_code == reason and ts >= b.created_at]
+            blocker_id = active[0].blocker_id if active else ""
+            evidence_id = sha256_hex(
+                {
+                    "account_id": self.account_id,
+                    "blocker_id": blocker_id,
+                    "reason_code": reason,
+                    "statement": body,
+                    "recorded_by": recorder,
+                    "recorded_at": ts.isoformat(),
+                }
+            )
             self.store._insert_evidence(
                 conn,
                 evidence_id=evidence_id,
                 account_id=self.account_id,
+                blocker_id=blocker_id,
                 reason_code=reason,
                 statement=body,
                 artifact_hash=evidence_id,
@@ -283,15 +293,31 @@ class RiskEngine:
             self.store._trace(conn, self.account_id, ts, "RECORD_EVIDENCE", {"reason_code": reason, "evidence_id": evidence_id})
         return evidence_id
 
+    def _authoritative_snapshot(self, conn, snapshot_version: int, now: datetime):
+        stored = self.store._load_recovery_snapshot(conn, self.account_id, snapshot_version)
+        if stored is None or stored["health_result"] != "PASS" or stored["health_checked_at"] != stored["created_at"]:
+            raise RecoveryStaleError("恢复快照或健康检查不存在", reason_code="RECOVERY_SNAPSHOT_STALE")
+        created_at = datetime.fromisoformat(stored["created_at"])
+        if not _within_freshness(created_at, now):
+            raise RecoveryStaleError("恢复快照已超过有效期", reason_code="RECOVERY_APPROVAL_EXPIRED")
+        return stored
+
     def _require_resolution_evidence(self, conn, reason_code: str, evidence_id: str, now: datetime) -> None:
         row = self.store._evidence_row(conn, evidence_id)
         if row is None or row["account_id"] != self.account_id:
             raise NewRiskBlockedError("解决证据不存在", reason_code="RESOLUTION_EVIDENCE_INVALID")
         if row["reason_code"] != reason_code or row["consumed_at"] is not None:
             raise NewRiskBlockedError("解决证据与当前阻断不匹配或已使用", reason_code="RESOLUTION_EVIDENCE_INVALID")
+        active = [b for b in self.store.active_blockers(conn, self.account_id) if b.reason_code == reason_code]
         recorded_at = datetime.fromisoformat(row["recorded_at"])
-        if not _within_freshness(recorded_at, now):
-            raise NewRiskBlockedError("解决证据已超过有效期", reason_code="RESOLUTION_EVIDENCE_INVALID")
+        if (
+            not active
+            or not row["blocker_id"]
+            or row["blocker_id"] != active[0].blocker_id
+            or recorded_at < active[0].created_at
+            or not _within_freshness(recorded_at, now)
+        ):
+            raise NewRiskBlockedError("解决证据未绑定当前故障实例", reason_code="RESOLUTION_EVIDENCE_INVALID")
 
     def reserve(self, requests: Sequence[ReserveRequest], *, now: Optional[datetime] = None) -> list[Reservation]:
         ts = now or utc_now()
@@ -600,6 +626,45 @@ class RiskEngine:
                 system_state=view.system_state,
                 created_at=ts,
             )
+            check_id = uuid4().hex
+            detail = json.dumps(
+                {
+                    "config_hash": snap.config_hash,
+                    "risk_version": snap.risk_version,
+                    "equity_version": snap.equity_version,
+                    "blocker_ids": list(snap.blocker_ids),
+                    "market_data": "NOT_CHECKED",
+                },
+                sort_keys=True,
+            )
+            conn.execute(
+                """
+                INSERT INTO health_checks(check_id, account_id, snapshot_version, checked_at, scope, result, detail)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (check_id, self.account_id, snap.snapshot_version, ts.isoformat(), "LOCAL_RECOVERY", "PASS", detail),
+            )
+            conn.execute(
+                """
+                INSERT INTO recovery_snapshots(
+                    account_id, snapshot_version, blocker_set_version, risk_version, account_state_version,
+                    equity_version, config_hash, blocker_ids, system_state, created_at, health_check_id
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    self.account_id,
+                    snap.snapshot_version,
+                    snap.blocker_set_version,
+                    snap.risk_version,
+                    snap.account_state_version,
+                    snap.equity_version,
+                    snap.config_hash,
+                    ",".join(snap.blocker_ids),
+                    snap.system_state.value,
+                    ts.isoformat(),
+                    check_id,
+                ),
+            )
             self.store._trace(
                 conn,
                 self.account_id,
@@ -618,13 +683,12 @@ class RiskEngine:
         approver = approved_by.strip()
         if not approver:
             raise NewRiskBlockedError("恢复审批缺少批准人", reason_code="RECOVERY_APPROVAL_REQUIRED")
-        if not _within_freshness(snapshot.created_at, ts):
-            raise RecoveryStaleError("恢复快照已超过有效期", reason_code="RECOVERY_APPROVAL_EXPIRED")
         approval_id = uuid4().hex
         expires_at = ts + RECOVERY_FRESHNESS_TTL
         with self.store.txn() as conn:
             if not self.store._approver_exists(conn, self.account_id, approver):
                 raise NewRiskBlockedError("批准人未登记", reason_code="RECOVERY_APPROVER_UNKNOWN")
+            stored = self._authoritative_snapshot(conn, snapshot.snapshot_version, ts)
             row = self.store.load_account(conn, self.account_id)
             blockers = self.store.active_blockers(conn, self.account_id)
             if any(b.severity == SystemState.FAULT for b in blockers):
@@ -633,12 +697,12 @@ class RiskEngine:
                 raise NewRiskBlockedError("仍有未解决阻断，不能审批恢复", reason_code="BLOCKER_UNRESOLVED")
             current_ids = tuple(b.blocker_id for b in blockers)
             if (
-                row["snapshot_version"] != snapshot.snapshot_version
-                or row["blocker_set_version"] != snapshot.blocker_set_version
-                or row["risk_version"] != snapshot.risk_version
-                or row["config_hash"] != snapshot.config_hash
-                or row["equity_version"] != snapshot.equity_version
-                or current_ids != snapshot.blocker_ids
+                row["snapshot_version"] != stored["snapshot_version"]
+                or row["blocker_set_version"] != stored["blocker_set_version"]
+                or row["risk_version"] != stored["risk_version"]
+                or row["config_hash"] != stored["config_hash"]
+                or row["equity_version"] != stored["equity_version"]
+                or current_ids != _blocker_ids(stored["blocker_ids"])
             ):
                 raise RecoveryStaleError("审批时快照已失效")
             conn.execute(
@@ -651,12 +715,12 @@ class RiskEngine:
                 (
                     approval_id,
                     self.account_id,
-                    snapshot.snapshot_version,
-                    snapshot.blocker_set_version,
-                    snapshot.risk_version,
-                    snapshot.equity_version,
-                    snapshot.config_hash,
-                    ",".join(snapshot.blocker_ids),
+                    stored["snapshot_version"],
+                    stored["blocker_set_version"],
+                    stored["risk_version"],
+                    stored["equity_version"],
+                    stored["config_hash"],
+                    stored["blocker_ids"],
                     approver,
                     ts.isoformat(),
                     expires_at.isoformat(),
@@ -693,13 +757,18 @@ class RiskEngine:
             row = self.store.load_account(conn, self.account_id)
             blockers = self.store.active_blockers(conn, self.account_id)
             current_ids = tuple(b.blocker_id for b in blockers)
+            stored = self.store._load_recovery_snapshot(conn, self.account_id, snapshot.snapshot_version)
+            if stored is None or stored["health_result"] != "PASS" or stored["health_checked_at"] != stored["created_at"]:
+                raise _RecoveryAbort("RECOVERY_SNAPSHOT_STALE", "恢复快照或健康检查不存在")
+            created_at = datetime.fromisoformat(stored["created_at"])
+            stored_ids = _blocker_ids(stored["blocker_ids"])
             stale = (
-                row["snapshot_version"] != snapshot.snapshot_version
-                or row["blocker_set_version"] != snapshot.blocker_set_version
-                or row["risk_version"] != snapshot.risk_version
-                or row["config_hash"] != snapshot.config_hash
-                or row["equity_version"] != snapshot.equity_version
-                or current_ids != snapshot.blocker_ids
+                row["snapshot_version"] != stored["snapshot_version"]
+                or row["blocker_set_version"] != stored["blocker_set_version"]
+                or row["risk_version"] != stored["risk_version"]
+                or row["config_hash"] != stored["config_hash"]
+                or row["equity_version"] != stored["equity_version"]
+                or current_ids != stored_ids
             )
             payload = json.dumps(
                 {
@@ -721,12 +790,12 @@ class RiskEngine:
             if approval is None:
                 raise _RecoveryAbort("RECOVERY_APPROVAL_REQUIRED", "恢复审批不存在")
             if (
-                approval["snapshot_version"] != snapshot.snapshot_version
-                or approval["blocker_set_version"] != snapshot.blocker_set_version
-                or approval["risk_version"] != snapshot.risk_version
-                or approval["config_hash"] != snapshot.config_hash
-                or approval["equity_version"] != snapshot.equity_version
-                or approval["blocker_ids"] != ",".join(snapshot.blocker_ids)
+                approval["snapshot_version"] != stored["snapshot_version"]
+                or approval["blocker_set_version"] != stored["blocker_set_version"]
+                or approval["risk_version"] != stored["risk_version"]
+                or approval["config_hash"] != stored["config_hash"]
+                or approval["equity_version"] != stored["equity_version"]
+                or approval["blocker_ids"] != stored["blocker_ids"]
             ):
                 raise _RecoveryAbort("RECOVERY_APPROVAL_MISMATCH", "审批与快照版本不一致")
             if stale or blockers:
@@ -734,7 +803,7 @@ class RiskEngine:
                     raise _RecoveryAbort("BLOCKER_UNRESOLVED", "活动阻断尚未用解决证据清除，不能恢复")
                 raise _RecoveryAbort("RECOVERY_SNAPSHOT_STALE", "审批快照已失效，恢复失败")
             expires_at = datetime.fromisoformat(approval["expires_at"])
-            if ts > expires_at or not _within_freshness(snapshot.created_at, ts):
+            if ts > expires_at or not _within_freshness(created_at, ts):
                 raise _RecoveryAbort("RECOVERY_APPROVAL_EXPIRED", "恢复审批已超过有效期")
             conn.execute(
                 "UPDATE account_state SET recovery_in_progress=0, pause_latched=0 WHERE account_id=?",
