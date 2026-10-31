@@ -241,30 +241,32 @@ class Ledger:
         credit_isolated: bool = True,
     ) -> tuple[LedgerEvent, Decimal]:
         key = (venue, external_id)
-        existing = self._by_external.get(key)
-        if existing is not None:
-            return existing, D(existing.metadata.get("realized", "0"))
-
         qty = require_positive(D(qty), "qty")
         price = require_positive(D(price), "price")
         multiplier = require_positive(D(multiplier), "multiplier")
         pos = self.position(symbol, multiplier=multiplier)
+        existing = self._by_external.get(key)
+        if existing is not None:
+            if existing.metadata.get("qty") != format(qty, "f") or existing.metadata.get("price") != format(price, "f") or existing.metadata.get("side") != side.value:
+                raise ConflictError(f"重复流水内容冲突: {key}")
+            return existing, D(existing.metadata.get("realized", "0"))
+
         realized = Decimal("0")
         note = "open"
+        new_side = side
+        new_qty = qty
+        new_avg = price
+        new_realized_cum = pos.realized_pnl_cum
 
         if pos.qty == 0:
             if reduce_only:
                 raise UnitValidationError("reduceOnly 成交但当前无仓")
-            pos.side = side
-            pos.qty = qty
-            pos.avg_price = price
-            pos.multiplier = multiplier
         elif pos.side == side:
             if not allow_add:
                 raise UnitValidationError("T1 不加仓；如为外部成交需单独入账")
             new_qty = pos.qty + qty
-            pos.avg_price = (pos.qty * pos.avg_price + qty * price) / new_qty
-            pos.qty = new_qty
+            new_avg = (pos.qty * pos.avg_price + qty * price) / new_qty
+            new_side = pos.side
             note = "add"
         else:
             if qty > pos.qty:
@@ -272,32 +274,39 @@ class Ledger:
             delta = price - pos.avg_price
             signed = delta if pos.side == Side.LONG else -delta
             realized = signed * qty * pos.multiplier
-            pos.qty -= qty
-            pos.realized_pnl_cum += realized
+            new_qty = pos.qty - qty
+            new_avg = pos.avg_price if new_qty else Decimal("0")
+            new_side = pos.side if new_qty else None
+            new_realized_cum = pos.realized_pnl_cum + realized
             note = "reduce"
-            if pos.qty == 0:
-                pos.side = None
-                pos.avg_price = Decimal("0")
-        pos.version += 1
 
         lines: tuple[JournalLine, ...] = tuple()
+        next_isolated = pos.isolated_margin
         if realized != 0:
             target = AccountBucket.ISOLATED_MARGIN if credit_isolated else AccountBucket.WALLET
             if realized > 0:
                 lines = _lines(self.asset, target, AccountBucket.REALIZED_PNL, realized, "realized_pnl")
             else:
                 loss = -realized
-                available = self.balance(target)
-                if available < loss and target == AccountBucket.ISOLATED_MARGIN:
+                available = pos.isolated_margin if credit_isolated else self.balance(target)
+                if credit_isolated and available < loss:
                     raise LedgerImbalanceError("已实现亏损超过逐仓保证金，禁止自动追加")
-                if available < loss:
+                if not credit_isolated and self.balance(target) < loss:
                     raise LedgerImbalanceError("已实现亏损超过钱包余额")
                 lines = _lines(self.asset, AccountBucket.REALIZED_PNL, target, loss, "realized_pnl")
             if credit_isolated:
-                pos.isolated_margin += realized
-                if pos.isolated_margin < 0:
+                next_isolated = pos.isolated_margin + realized
+                if next_isolated < 0:
                     raise LedgerImbalanceError("逐仓保证金不能为负")
 
+        snapshot = _capture_position(pos)
+        pos.side = new_side
+        pos.qty = new_qty
+        pos.avg_price = new_avg
+        pos.multiplier = multiplier
+        pos.realized_pnl_cum = new_realized_cum
+        pos.isolated_margin = next_isolated
+        pos.version += 1
         event = LedgerEvent(
             event_id=uuid4().hex,
             account_id=self.account_id,
@@ -320,7 +329,12 @@ class Ledger:
                 "note": note,
             },
         )
-        return self.append_event(event), realized
+        try:
+            stored = self.append_event(event)
+        except Exception:
+            _restore_position(pos, snapshot)
+            raise
+        return stored, realized
 
     def post_fee(
         self,
@@ -334,12 +348,16 @@ class Ledger:
         from_isolated: bool = False,
     ) -> LedgerEvent:
         amount = require_positive(D(amount), "amount")
+        src = AccountBucket.ISOLATED_MARGIN if from_isolated else AccountBucket.WALLET
+        lines = _lines(self.asset, AccountBucket.FEE, src, amount, "fee")
         existing = self._by_external.get((venue, external_id))
         if existing is not None:
+            _require_same_lines(existing, LedgerEventType.FEE, lines)
             return existing
-        src = AccountBucket.ISOLATED_MARGIN if from_isolated else AccountBucket.WALLET
         if self.balance(src) < amount:
             raise LedgerImbalanceError("手续费扣款账户余额不足")
+        if from_isolated and symbol and self.position(symbol).isolated_margin < amount:
+            raise LedgerImbalanceError("手续费扣除后逐仓保证金为负")
         event = self.append_event(
             LedgerEvent(
                 event_id=uuid4().hex,
@@ -352,14 +370,12 @@ class Ledger:
                 external_id=external_id,
                 source="venue",
                 symbol=symbol,
-                lines=_lines(self.asset, AccountBucket.FEE, src, amount, "fee"),
+                lines=lines,
             )
         )
         if from_isolated and symbol:
             pos = self.position(symbol)
             pos.isolated_margin -= amount
-            if pos.isolated_margin < 0:
-                raise LedgerImbalanceError("手续费扣除后逐仓保证金为负")
             pos.version += 1
         return event
 
@@ -377,16 +393,22 @@ class Ledger:
         payment = D(payment)
         if payment == 0:
             raise UnitValidationError("资金费金额不能为 0")
-        existing = self._by_external.get((venue, external_id))
-        if existing is not None:
-            return existing
         src = AccountBucket.ISOLATED_MARGIN if from_isolated else AccountBucket.WALLET
         if payment > 0:
             lines = _lines(self.asset, src, AccountBucket.FUNDING, payment, "funding_receive")
         else:
-            if self.balance(src) < -payment:
-                raise LedgerImbalanceError("资金费扣款账户余额不足")
             lines = _lines(self.asset, AccountBucket.FUNDING, src, -payment, "funding_pay")
+        existing = self._by_external.get((venue, external_id))
+        if existing is not None:
+            _require_same_lines(existing, LedgerEventType.FUNDING, lines)
+            if existing.metadata.get("payment") != format(payment, "f") or existing.symbol != symbol:
+                raise ConflictError(f"重复资金费内容冲突: {(venue, external_id)}")
+            return existing
+        pos = self.position(symbol)
+        if payment < 0 and self.balance(src) < -payment:
+            raise LedgerImbalanceError("资金费扣款账户余额不足")
+        if from_isolated and pos.isolated_margin + payment < 0:
+            raise LedgerImbalanceError("资金费扣除后逐仓保证金为负，保持阻断")
         event = self.append_event(
             LedgerEvent(
                 event_id=uuid4().hex,
@@ -403,12 +425,9 @@ class Ledger:
                 metadata={"payment": format(payment, "f"), "from_isolated": str(from_isolated)},
             )
         )
-        pos = self.position(symbol)
         pos.funding_cum += payment
         if from_isolated:
             pos.isolated_margin += payment
-            if pos.isolated_margin < 0:
-                raise LedgerImbalanceError("资金费扣除后逐仓保证金为负，保持阻断")
             pos.version += 1
         return event
 
@@ -636,6 +655,37 @@ class Ledger:
         self._books.last_unit_nav = (self.cash_equity() + unrealized) / self._books.shares
         if self._books.last_unit_nav > self._books.high_water_mark:
             self._books.high_water_mark = self._books.last_unit_nav
+
+
+def _capture_position(pos: PositionState) -> tuple:
+    return (
+        pos.side,
+        pos.qty,
+        pos.avg_price,
+        pos.multiplier,
+        pos.isolated_margin,
+        pos.realized_pnl_cum,
+        pos.funding_cum,
+        pos.version,
+    )
+
+
+def _restore_position(pos: PositionState, snapshot: tuple) -> None:
+    (
+        pos.side,
+        pos.qty,
+        pos.avg_price,
+        pos.multiplier,
+        pos.isolated_margin,
+        pos.realized_pnl_cum,
+        pos.funding_cum,
+        pos.version,
+    ) = snapshot
+
+
+def _require_same_lines(existing: LedgerEvent, event_type: LedgerEventType, lines: tuple[JournalLine, ...]) -> None:
+    if existing.event_type != event_type or existing.lines != lines:
+        raise ConflictError(f"重复流水内容冲突: {(existing.venue, existing.external_id)}")
 
 
 def _restore_position_from_fill(ledger: Ledger, event: LedgerEvent) -> None:

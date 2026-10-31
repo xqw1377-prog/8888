@@ -103,7 +103,7 @@ def test_dataset_report_has_stable_hash() -> None:
     b = validate_dataset(dataset, generated_at=ORIGIN)
     assert a.report_checksum == b.report_checksum
     assert a.dataset_checksum == dataset.checksum
-    assert a.grade == DataGrade.LIQUIDATION_REPLAY_VALIDATED
+    assert a.grade == DataGrade.EXECUTION_PNL_VALIDATED
     assert a.accepted is True
 
 

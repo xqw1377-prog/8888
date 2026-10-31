@@ -118,6 +118,13 @@ def evaluate_signal(
     )
 
 
+def stop_breached(position: OpenPosition, mark_price: Decimal) -> bool:
+    mark = D(mark_price)
+    if position.side == Side.LONG:
+        return mark <= position.stop
+    return mark >= position.stop
+
+
 def initial_stop(side: Side, fill_price: Decimal, signal_atr: Decimal, params: T1Params) -> Decimal:
     offset = D(params.stop_multiple) * D(signal_atr)
     if side == Side.LONG:
@@ -146,7 +153,7 @@ def evaluate_exit(
         return position, None
     current = candles[-1]
     prior = candles[:-1]
-    since_entry = [c for c in candles if c.event_time >= position.entry_event_time]
+    since_entry = [c for c in candles if c.event_time > position.entry_event_time]
     if since_entry:
         if position.side == Side.LONG:
             extreme = max(position.extreme, max(c.high for c in since_entry))

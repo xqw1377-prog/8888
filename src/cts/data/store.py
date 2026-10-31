@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Iterable, Optional, Protocol, TypeVar
 
+from cts.checksum import sha256_hex
 from cts.clock import require_utc
 from cts.errors import ConflictError, LookaheadError
 
@@ -25,11 +26,14 @@ class DataStore:
 
     def put(self, record: T) -> T:
         key = record.identity()
+        digest = _content_digest(record)
+        if digest != record.checksum:
+            raise ConflictError("checksum 与内容不一致，不能用旧校验和包装新内容")
         existing = self._records.get(key)
         if existing is None:
             self._records[key] = record
             return record
-        if existing.checksum != record.checksum:
+        if _content_digest(existing) != digest:
             raise ConflictError(
                 f"同标识异容冲突: {key}",
                 reason_code="IDEMPOTENCY_CONFLICT",
@@ -58,3 +62,13 @@ class DataStore:
                 f"研究不得使用 as_of={cutoff.isoformat()} 时尚不可得的数据 "
                 f"available_at={record.available_at.isoformat()}"
             )
+
+
+def _content_digest(record: Identified) -> str:
+    payload = getattr(record, "payload", None)
+    if callable(payload):
+        return sha256_hex(payload())
+    compute = getattr(record, "compute_checksum", None)
+    if callable(compute):
+        return compute()
+    return record.checksum

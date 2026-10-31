@@ -10,7 +10,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 from cts.checksum import sha256_hex
 from cts.clock import require_utc
-from cts.errors import UnitValidationError
+from cts.errors import ConflictError, UnitValidationError
 from cts.money import D, require_non_negative, require_positive
 
 
@@ -19,6 +19,14 @@ SCHEMA_VERSION = "0.3.3"
 
 def _ts(value: datetime, name: str) -> datetime:
     return require_utc(value, name)
+
+
+def _bind_checksum(obj: object, expected: str) -> None:
+    supplied = getattr(obj, "checksum", "")
+    if supplied and supplied != expected:
+        raise ConflictError("checksum 与内容不一致，不能用旧校验和包装新内容")
+    if supplied != expected:
+        object.__setattr__(obj, "checksum", expected)
 
 
 class DataGrade(str, Enum):
@@ -66,8 +74,7 @@ class Candle:
         object.__setattr__(self, "close", D(self.close))
         object.__setattr__(self, "volume", D(self.volume))
         self.validate_units()
-        if not self.checksum:
-            object.__setattr__(self, "checksum", sha256_hex(self.payload()))
+        _bind_checksum(self, sha256_hex(self.payload()))
 
     def identity(self) -> tuple[Any, ...]:
         return (self.venue, self.symbol, self.interval, self.event_time, self.source_id)
@@ -123,8 +130,7 @@ class MarkSample:
         if self.index_price is not None:
             object.__setattr__(self, "index_price", D(self.index_price))
         self.validate_units()
-        if not self.checksum:
-            object.__setattr__(self, "checksum", sha256_hex(self.payload()))
+        _bind_checksum(self, sha256_hex(self.payload()))
 
     def identity(self) -> tuple[Any, ...]:
         return (self.venue, self.symbol, "mark", self.event_time, self.source_id)
@@ -169,8 +175,7 @@ class FundingSettlement:
         if self.interval_minutes is not None:
             object.__setattr__(self, "interval_minutes", D(self.interval_minutes))
         self.validate_units()
-        if not self.checksum:
-            object.__setattr__(self, "checksum", sha256_hex(self.payload()))
+        _bind_checksum(self, sha256_hex(self.payload()))
 
     def identity(self) -> tuple[Any, ...]:
         return (self.venue, self.symbol, "funding", self.settlement_id, self.source_id)
@@ -221,8 +226,7 @@ class RiskTierSnapshot:
             object.__setattr__(self, "effective_to", _ts(self.effective_to, "effective_to"))
         object.__setattr__(self, "raw_fields", dict(self.raw_fields))
         self.validate_units()
-        if not self.checksum:
-            object.__setattr__(self, "checksum", sha256_hex(self.payload()))
+        _bind_checksum(self, sha256_hex(self.payload()))
 
     def identity(self) -> tuple[Any, ...]:
         return (self.venue, self.symbol, "tier", self.tier_index, self.effective_from, self.source_id)
@@ -300,8 +304,7 @@ class InstrumentRule:
         if self.effective_to is not None:
             object.__setattr__(self, "effective_to", _ts(self.effective_to, "effective_to"))
         self.validate_units()
-        if not self.checksum:
-            object.__setattr__(self, "checksum", sha256_hex(self.payload()))
+        _bind_checksum(self, sha256_hex(self.payload()))
 
     def identity(self) -> tuple[Any, ...]:
         return (self.venue, self.symbol, "rule", self.rule_snapshot_id, self.source_id)
@@ -370,8 +373,7 @@ class MarketDataset:
         object.__setattr__(self, "risk_tiers", tuple(self.risk_tiers))
         if self.end < self.start:
             raise UnitValidationError("数据集 end 不能早于 start")
-        if not self.checksum:
-            object.__setattr__(self, "checksum", self.compute_checksum())
+        _bind_checksum(self, self.compute_checksum())
 
     def compute_checksum(self) -> str:
         return sha256_hex(

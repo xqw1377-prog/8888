@@ -1,0 +1,265 @@
+"""R1：对照独立审计的最小复现。通过这些测试也不等于签发 PASS。"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+
+import pytest
+
+from cts.data.models import DataGrade, MarkSample
+from cts.data.store import DataStore
+from cts.errors import ConflictError, LedgerImbalanceError, NewRiskBlockedError, RecoveryStaleError
+from cts.ledger.journal import Ledger
+from cts.ledger.models import Side
+from cts.money import D
+from cts.risk.models import SystemState
+from cts.strategy.replay import ReplayConfig, replay_t1
+from cts.strategy.t1 import T1Params, apply_fill_to_state, evaluate_exit, evaluate_signal
+from tests.helpers import ORIGIN, breakout_series, candle, mark, t_close
+from tests.test_ledger import TS, funded
+from tests.test_risk_p004a import NOW, make_engine, req
+
+
+def test_close_rejects_without_zeroing_position() -> None:
+    ledger = funded()
+    ledger.lock_margin(amount=D("5"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-1", venue="SIM")
+    ledger.apply_fill(
+        symbol="BTCUSDT",
+        side=Side.LONG,
+        qty=D("1"),
+        price=D("100"),
+        multiplier=D("1"),
+        event_time=TS,
+        received_at=TS,
+        external_id="f1",
+        venue="SIM",
+        venue_trade_id="t1",
+    )
+    equity_before = ledger.cash_equity()
+    with pytest.raises(LedgerImbalanceError):
+        ledger.apply_fill(
+            symbol="BTCUSDT",
+            side=Side.SHORT,
+            qty=D("1"),
+            price=D("80"),
+            multiplier=D("1"),
+            event_time=TS,
+            received_at=TS,
+            external_id="f2",
+            venue="SIM",
+            venue_trade_id="t2",
+            reduce_only=True,
+        )
+    assert ledger.position("BTCUSDT").qty == D("1")
+    assert ledger.position("BTCUSDT").side == Side.LONG
+    assert ledger.cash_equity() == equity_before
+
+
+def test_funding_reject_does_not_reduce_equity() -> None:
+    ledger = funded()
+    ledger.lock_margin(amount=D("100"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-btc", venue="SIM")
+    ledger.lock_margin(amount=D("100"), symbol="ETHUSDT", event_time=TS, received_at=TS, external_id="im-eth", venue="SIM")
+    before = ledger.cash_equity()
+    with pytest.raises(LedgerImbalanceError):
+        ledger.post_funding(
+            payment=D("-150"),
+            event_time=TS,
+            received_at=TS,
+            external_id="fund-1",
+            venue="SIM",
+            symbol="BTCUSDT",
+            from_isolated=True,
+        )
+    assert ledger.cash_equity() == before
+    assert ledger.position("BTCUSDT").isolated_margin == D("100")
+    assert ledger.position("BTCUSDT").funding_cum == D("0")
+
+
+def test_changed_funding_amount_is_conflict() -> None:
+    ledger = funded()
+    ledger.lock_margin(amount=D("500"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-1", venue="SIM")
+    ledger.post_funding(
+        payment=D("-1"),
+        event_time=TS,
+        received_at=TS,
+        external_id="fund-1",
+        venue="SIM",
+        symbol="BTCUSDT",
+        from_isolated=True,
+    )
+    with pytest.raises(ConflictError):
+        ledger.post_funding(
+            payment=D("-999"),
+            event_time=TS,
+            received_at=TS,
+            external_id="fund-1",
+            venue="SIM",
+            symbol="BTCUSDT",
+            from_isolated=True,
+        )
+    assert ledger.position("BTCUSDT").funding_cum == D("-1")
+    assert ledger.cash_equity() == D("9999")
+
+
+def test_forged_checksum_does_not_hide_new_content() -> None:
+    store = DataStore()
+    original = candle(0)
+    store.put(original)
+    forged = candle(0, close="101", high="102", low="99", open_="100")
+    object.__setattr__(forged, "checksum", original.checksum)
+    with pytest.raises(ConflictError):
+        store.put(forged)
+    from dataclasses import replace
+
+    with pytest.raises(ConflictError):
+        replace(original, close=D("101"), high=D("102"), checksum=original.checksum)
+
+
+def test_candle_aligned_marks_are_not_liquidation_validated() -> None:
+    from cts.data.gaps import classify_gaps
+
+    bars = [candle(i) for i in range(4)]
+    marks = [mark(i, "100") for i in range(4)]
+    report = classify_gaps(
+        candles=bars,
+        marks=marks,
+        expected_sampling_interval=timedelta(hours=4),
+        range_start=t_close(0),
+        range_end=t_close(3),
+    )
+    assert report.grade == DataGrade.EXECUTION_PNL_VALIDATED
+    assert report.grade != DataGrade.LIQUIDATION_REPLAY_VALIDATED
+
+
+def test_fault_recovery_does_not_clear_blockers(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    engine.add_blocker("PROTECTION_OVERDUE", SystemState.FAULT, now=NOW)
+    snap = engine.create_recovery_snapshot(now=NOW)
+    with pytest.raises(NewRiskBlockedError) as err:
+        engine.apply_recovery(snap, now=NOW)
+    assert err.value.reason_code == "FAULT_REQUIRES_INVESTIGATION"
+    occ = engine.occupancy()
+    assert occ.system_state == SystemState.FAULT
+    assert {b.reason_code for b in occ.blockers} == {"PROTECTION_OVERDUE"}
+    row = engine.store._conn.execute(
+        "SELECT result, reason_code FROM recovery_attempts WHERE account_id=?",
+        ("acct-1",),
+    ).fetchone()
+    assert row["result"] == "FAILED"
+    assert row["reason_code"] == "FAULT_REQUIRES_INVESTIGATION"
+
+
+def test_stale_recovery_failure_is_persisted(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    engine.add_blocker("DAILY_LOSS", SystemState.PAUSED, now=NOW)
+    snap = engine.create_recovery_snapshot(now=NOW)
+    engine.add_blocker("UNKNOWN_ORDER", SystemState.PAUSED, now=NOW)
+    with pytest.raises(RecoveryStaleError):
+        engine.apply_recovery(snap, now=NOW)
+    row = engine.store._conn.execute(
+        "SELECT result, reason_code FROM recovery_attempts WHERE account_id=?",
+        ("acct-1",),
+    ).fetchone()
+    assert row["result"] == "FAILED"
+    assert row["reason_code"] == "RECOVERY_SNAPSHOT_STALE"
+    assert engine.occupancy().system_state == SystemState.PAUSED
+
+
+def test_unknown_since_is_not_reset_and_cancel_cannot_release(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    reserved = engine.reserve([req("BTCUSDT", "sig-unknown")], now=NOW)[0]
+    first = engine.mark_unknown(reserved.reservation_id, now=NOW)
+    later = NOW + timedelta(minutes=5)
+    second = engine.mark_unknown(reserved.reservation_id, now=later)
+    assert second.unknown_since == first.unknown_since == NOW
+    pending = engine.occupancy().pending_risk
+    engine.request_cancel(reserved.reservation_id, now=later)
+    kept = next(r for r in engine.occupancy().reservations if r.reservation_id == reserved.reservation_id)
+    assert kept.status.value == "UNKNOWN"
+    with pytest.raises(NewRiskBlockedError):
+        engine.confirm_cancel(reserved.reservation_id, D("0"), now=later)
+    assert engine.occupancy().pending_risk == pending
+
+
+def test_late_cumulative_fill_after_release_updates_occupancy(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    reserved = engine.reserve([req("BTCUSDT", "sig-late")], now=NOW)[0]
+    engine.confirm_cancel(reserved.reservation_id, reserved.qty * D("0.4"), now=NOW)
+    assert engine.occupancy().positions[0].qty == reserved.qty * D("0.4")
+    engine.confirm_cancel(reserved.reservation_id, reserved.qty * D("0.6"), now=NOW)
+    occ = engine.occupancy()
+    assert occ.positions[0].qty == reserved.qty * D("0.6")
+    assert occ.position_risk == reserved.risk_amount * D("0.6")
+    assert occ.pending_risk == D("0")
+
+
+def test_joint_scale_does_not_reject_the_batch(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    engine.sync_position(
+        symbol="BTCUSDT",
+        side=Side.LONG,
+        qty=D("1"),
+        notional=D("100"),
+        risk_amount=D("30"),
+        isolated_margin=D("50"),
+        now=NOW,
+    )
+    created = engine.reserve([req("BTCUSDT", "sig-btc"), req("ETHUSDT", "sig-eth")], now=NOW)
+    assert len(created) == 2
+    total_new = sum((row.risk_amount for row in created), start=D("0"))
+    assert total_new <= D("10.0000001")
+    assert all(row.risk_amount < D("10") for row in created)
+    assert engine.occupancy().total_risk <= D("40.0000001")
+
+
+def test_paused_recovery_still_reaches_running(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    engine.add_blocker("DAILY_LOSS", SystemState.PAUSED, now=NOW)
+    snap = engine.create_recovery_snapshot(now=NOW)
+    applied = engine.apply_recovery(snap, now=NOW)
+    assert applied.result == "APPLIED"
+    assert engine.occupancy().system_state == SystemState.RUNNING
+    assert engine.occupancy().blockers == ()
+
+
+def test_intrabar_stop_is_not_ignored_after_recovery() -> None:
+    bars = breakout_series(130)
+    bars.append(candle(132, open_="118", high="119", low="117", close="118"))
+    marks = [mark(i, format(bars[i].close, "f")) for i in range(len(bars) - 1)]
+    breach_at = t_close(131) + timedelta(hours=1)
+    marks.append(
+        MarkSample(
+            venue="SIM",
+            symbol="BTCUSDT",
+            event_time=breach_at,
+            received_at=breach_at,
+            available_at=breach_at,
+            mark_price=D("110"),
+            index_price=D("110"),
+            source_id="breach",
+        )
+    )
+    marks.append(mark(132, "118"))
+    ledger = Ledger("acct-replay")
+    ledger.transfer_in(amount=D("10000"), event_time=ORIGIN, received_at=ORIGIN, external_id="dep")
+    result = replay_t1(
+        ledger=ledger,
+        symbol="BTCUSDT",
+        candles=bars,
+        marks=marks,
+        config=ReplayConfig(params=T1Params()),
+        venue="SIM",
+    )
+    assert result.fills == 1
+    assert result.exits == 1
+
+
+def test_trail_does_not_use_signal_bar_extreme() -> None:
+    bars = breakout_series(130)
+    signal = evaluate_signal(bars[:-1], params=T1Params(), has_position=False, has_pending_entry=False)
+    assert signal is not None
+    pos = apply_fill_to_state(signal=signal, fill_price=signal.close, qty=D("1"), params=T1Params())
+    updated, _ = evaluate_exit(pos, bars[:-1], mark_price=signal.close, params=T1Params())
+    assert updated.extreme == signal.close
+    assert updated.stop == pos.stop
+    assert signal.entry_band < bars[-2].high

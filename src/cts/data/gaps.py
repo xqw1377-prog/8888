@@ -109,20 +109,20 @@ def classify_gaps(
     if len(candle_times) >= 2:
         actual_granularity = int((candle_times[1] - candle_times[0]).total_seconds())
 
-    grade = DataGrade.LIQUIDATION_REPLAY_VALIDATED
+    # 与 K 线同粒度的标记价不能证明止损和强平先后。本函数不签发强平回放已验证。
+    grade = DataGrade.EXECUTION_PNL_VALIDATED
     if missing or not closed:
         grade = DataGrade.SIGNAL_RESEARCH_ONLY
         notes.append("成交价缺口存在时不得把缺失区间插值为可交易 K 线")
     if mark_missing or not marks:
         if mark_required_for_liq:
             notes.append("标记价缺失时不能验收强平安全")
-            if grade == DataGrade.LIQUIDATION_REPLAY_VALIDATED:
-                grade = DataGrade.EXECUTION_PNL_VALIDATED
-        if overlap:
+        if overlap or not marks:
             grade = DataGrade.SIGNAL_RESEARCH_ONLY
-            notes.append("与敞口重叠的未解决标记价缺口阻断止损/强平路径验收")
-    if not marks and mark_required_for_liq:
-        grade = DataGrade.SIGNAL_RESEARCH_ONLY
+            if overlap:
+                notes.append("与敞口重叠的未解决标记价缺口阻断止损/强平路径验收")
+    else:
+        notes.append("标记价未细到可判定止损与强平先后，不签发强平回放已验证")
 
     return GapReport(
         expected_sampling_interval=expected_sampling_interval,

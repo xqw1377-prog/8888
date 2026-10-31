@@ -41,6 +41,12 @@ from cts.risk.store import RiskStore
 from cts.strategy.sizing import SizedPosition, size_position
 
 
+class _RecoveryAbort(Exception):
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
 class RiskEngine:
     def __init__(self, store: RiskStore, account_id: str) -> None:
         self.store = store
@@ -225,9 +231,11 @@ class RiskEngine:
                     raise StaleDataError("风险版本已变，必须重算预留")
             sized = self._size_batch(requests, view, bundle)
             created: list[Reservation] = []
+            skipped: list[str] = []
             for req, item in zip(requests, sized):
                 if item is None:
-                    raise RiskLimitError(f"{req.symbol} 无法在当前额度下分配")
+                    skipped.append(req.signal_key)
+                    continue
                 existing = conn.execute(
                     "SELECT reservation_id, status FROM reservations WHERE account_id=? AND signal_key=?",
                     (self.account_id, req.signal_key),
@@ -264,6 +272,8 @@ class RiskEngine:
                     ),
                 )
                 created.append(self.store.get_reservation(conn, reservation_id))
+            if not created:
+                raise RiskLimitError("共同缩放后没有可分配数量")
             risk_version = self.store._bump_risk(conn, self.account_id)
             self.store._trace(
                 conn,
@@ -276,6 +286,7 @@ class RiskEngine:
                     "symbols": ",".join(r.symbol for r in created),
                     "pending_risk": format(sum((r.risk_amount for r in created), start=D("0")), "f"),
                     "risk_version": str(risk_version),
+                    "unallocated": ",".join(skipped),
                 },
             )
             return created
@@ -343,10 +354,16 @@ class RiskEngine:
         ts = now or utc_now()
         with self.store.txn() as conn:
             res = self.store.get_reservation(conn, reservation_id)
+            if res.status == ReservationStatus.UNKNOWN:
+                return res
             if res.status in (ReservationStatus.RELEASED, ReservationStatus.FILLED):
                 return res
             conn.execute(
-                "UPDATE reservations SET status=?, unknown_since=? WHERE reservation_id=?",
+                """
+                UPDATE reservations
+                SET status=?, unknown_since=COALESCE(unknown_since, ?)
+                WHERE reservation_id=?
+                """,
                 (ReservationStatus.UNKNOWN.value, ts.isoformat(), reservation_id),
             )
             self.store._insert_blocker(
@@ -376,6 +393,9 @@ class RiskEngine:
         ts = now or utc_now()
         with self.store.txn() as conn:
             res = self.store.get_reservation(conn, reservation_id)
+            if res.status == ReservationStatus.UNKNOWN or res.unknown_since is not None:
+                self.store._trace(conn, self.account_id, ts, "CANCEL_BLOCKED_UNKNOWN", {"reservation_id": reservation_id})
+                return res
             if res.status in (ReservationStatus.RELEASED, ReservationStatus.FILLED):
                 return res
             conn.execute(
@@ -396,10 +416,8 @@ class RiskEngine:
         venue_filled = D(venue_cumulative_filled)
         with self.store.txn() as conn:
             res = self.store.get_reservation(conn, reservation_id)
-            if res.status == ReservationStatus.UNKNOWN:
+            if res.status == ReservationStatus.UNKNOWN or res.unknown_since is not None:
                 raise NewRiskBlockedError("UNKNOWN 预留不能因撤单确认直接释放")
-            if res.status == ReservationStatus.RELEASED:
-                return res
             previous = self._filled_qty(conn, reservation_id)
             conn.execute(
                 "UPDATE reservations SET venue_cumulative_filled=? WHERE reservation_id=?",
@@ -512,6 +530,20 @@ class RiskEngine:
     def apply_recovery(self, snapshot: RecoverySnapshot, *, now: Optional[datetime] = None) -> RecoveryAttempt:
         ts = now or utc_now()
         attempt_id = uuid4().hex
+        try:
+            return self._apply_recovery_txn(snapshot, attempt_id, ts)
+        except _RecoveryAbort as exc:
+            self._persist_failed_recovery(attempt_id, snapshot, ts, exc.reason_code)
+            if exc.reason_code == "RECOVERY_SNAPSHOT_STALE":
+                raise RecoveryStaleError(str(exc)) from None
+            raise NewRiskBlockedError(str(exc), reason_code=exc.reason_code) from None
+
+    def _apply_recovery_txn(
+        self,
+        snapshot: RecoverySnapshot,
+        attempt_id: str,
+        ts: datetime,
+    ) -> RecoveryAttempt:
         with self.store.txn() as conn:
             row = self.store.load_account(conn, self.account_id)
             blockers = self.store.active_blockers(conn, self.account_id)
@@ -533,26 +565,10 @@ class RiskEngine:
                 },
                 sort_keys=True,
             )
+            if any(blocker.severity == SystemState.FAULT for blocker in blockers):
+                raise _RecoveryAbort("FAULT_REQUIRES_INVESTIGATION", "FAULT 不能通过恢复快照直接解除")
             if stale:
-                conn.execute(
-                    """
-                    INSERT INTO recovery_attempts(attempt_id, account_id, snapshot_json, created_at, applied_at, result, reason_code)
-                    VALUES (?,?,?,?,?,?,?)
-                    """,
-                    (
-                        attempt_id,
-                        self.account_id,
-                        payload,
-                        ts.isoformat(),
-                        ts.isoformat(),
-                        "FAILED",
-                        "RECOVERY_SNAPSHOT_STALE",
-                    ),
-                )
-                conn.execute("UPDATE account_state SET recovery_in_progress=0 WHERE account_id=?", (self.account_id,))
-                self.store._recompute_state(conn, self.account_id)
-                self.store._trace(conn, self.account_id, ts, "RECOVERY_STALE", {"attempt_id": attempt_id})
-                raise RecoveryStaleError("审批快照已失效，恢复失败")
+                raise _RecoveryAbort("RECOVERY_SNAPSHOT_STALE", "审批快照已失效，恢复失败")
             for blocker in blockers:
                 self.store._clear_blocker(conn, self.account_id, blocker.reason_code, ts)
             conn.execute("UPDATE account_state SET recovery_in_progress=0 WHERE account_id=?", (self.account_id,))
@@ -566,6 +582,32 @@ class RiskEngine:
             )
             self.store._trace(conn, self.account_id, ts, "RECOVERY_APPLIED", {"state": state.value, "attempt_id": attempt_id})
             return RecoveryAttempt(attempt_id=attempt_id, snapshot=snapshot, result="APPLIED", reason_code=None)
+
+    def _persist_failed_recovery(
+        self,
+        attempt_id: str,
+        snapshot: RecoverySnapshot,
+        ts: datetime,
+        reason_code: str,
+    ) -> None:
+        payload = json.dumps(
+            {
+                "snapshot_version": snapshot.snapshot_version,
+                "blocker_set_version": snapshot.blocker_set_version,
+                "risk_version": snapshot.risk_version,
+                "config_hash": snapshot.config_hash,
+            },
+            sort_keys=True,
+        )
+        with self.store.txn() as conn:
+            conn.execute(
+                """
+                INSERT INTO recovery_attempts(attempt_id, account_id, snapshot_json, created_at, applied_at, result, reason_code)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (attempt_id, self.account_id, payload, ts.isoformat(), ts.isoformat(), "FAILED", reason_code),
+            )
+            self.store._trace(conn, self.account_id, ts, "RECOVERY_FAILED", {"attempt_id": attempt_id, "reason_code": reason_code})
 
     def _admit_new_risk(self, view: OccupancyView, bundle: ParameterBundle, mode: RuntimeMode) -> None:
         admit_parameters(mode, bundle, view.config_hash)
@@ -593,50 +635,76 @@ class RiskEngine:
         for res in view.reservations:
             symbol_used[res.symbol] = symbol_used.get(res.symbol, D("0")) + res.pending_notional
         remaining_margin = view.equity * bundle.decimal("margin_budget_pct") - used_margin
+        leverage = bundle.decimal("leverage")
         draft: list[Optional[SizedPosition]] = []
         for req in requests:
-            item = size_position(
-                side=req.side,
-                equity=view.equity,
-                entry_price=req.entry_price,
-                stop_price=req.stop_price,
-                multiplier=req.multiplier,
-                lot_size=req.lot_size,
-                per_symbol_risk_pct=bundle.decimal("per_symbol_risk_pct") * coefficient,
-                portfolio_risk_pct=bundle.decimal("portfolio_risk_pct") * coefficient,
-                used_portfolio_risk=used_risk,
-                per_symbol_notional_pct=bundle.decimal("per_symbol_notional_pct"),
-                used_symbol_notional=symbol_used.get(req.symbol, D("0")),
-                total_abs_notional_pct=bundle.decimal("total_abs_notional_pct"),
-                used_abs_notional=used_abs,
-                leverage=bundle.decimal("leverage"),
-                remaining_margin_budget=max(remaining_margin, D("0")),
-                fee_rate_one_way=req.fee_rate_one_way,
-                stress_slippage=req.stress_slippage,
-                funding_reserve_ratio=req.funding_reserve_ratio,
+            draft.append(
+                size_position(
+                    side=req.side,
+                    equity=view.equity,
+                    entry_price=req.entry_price,
+                    stop_price=req.stop_price,
+                    multiplier=req.multiplier,
+                    lot_size=req.lot_size,
+                    per_symbol_risk_pct=bundle.decimal("per_symbol_risk_pct") * coefficient,
+                    portfolio_risk_pct=bundle.decimal("portfolio_risk_pct") * coefficient,
+                    used_portfolio_risk=used_risk,
+                    per_symbol_notional_pct=bundle.decimal("per_symbol_notional_pct"),
+                    used_symbol_notional=symbol_used.get(req.symbol, D("0")),
+                    total_abs_notional_pct=bundle.decimal("total_abs_notional_pct"),
+                    used_abs_notional=used_abs,
+                    leverage=leverage,
+                    remaining_margin_budget=max(remaining_margin, D("0")),
+                    fee_rate_one_way=req.fee_rate_one_way,
+                    stress_slippage=req.stress_slippage,
+                    funding_reserve_ratio=req.funding_reserve_ratio,
+                )
             )
-            draft.append(item)
-            if item is not None:
-                used_risk += item.risk_amount
-                used_abs += item.notional
-                used_margin += item.notional / bundle.decimal("leverage")
-                symbol_used[req.symbol] = symbol_used.get(req.symbol, D("0")) + item.notional
-                remaining_margin = view.equity * bundle.decimal("margin_budget_pct") - used_margin
-
-        live = [x for x in draft if x is not None]
+        live = [(req, item) for req, item in zip(requests, draft) if item is not None]
         if len(live) <= 1:
             return draft
-        portfolio_cap = view.equity * bundle.decimal("portfolio_risk_pct") * coefficient
-        remaining_for_new = portfolio_cap - view.total_risk
-        new_risk = sum((x.risk_amount for x in live), start=D("0"))
-        if remaining_for_new <= 0:
-            return [None for _ in draft]
-        if new_risk <= remaining_for_new:
-            return draft
-        scale = remaining_for_new / new_risk
+        portfolio_remaining = view.equity * bundle.decimal("portfolio_risk_pct") * coefficient - view.total_risk
+        notional_remaining = view.equity * bundle.decimal("total_abs_notional_pct") - view.total_abs_notional
+        new_risk = sum((item.risk_amount for _, item in live), start=D("0"))
+        new_notional = sum((item.notional for _, item in live), start=D("0"))
+        new_margin = sum((item.notional / leverage for _, item in live), start=D("0"))
+        scales = [D("1")]
+        if new_risk > portfolio_remaining:
+            if portfolio_remaining <= 0:
+                return [None for _ in requests]
+            scales.append(portfolio_remaining / new_risk)
+        if new_notional > notional_remaining:
+            if notional_remaining <= 0:
+                return [None for _ in requests]
+            scales.append(notional_remaining / new_notional)
+        if new_margin > remaining_margin:
+            if remaining_margin <= 0:
+                return [None for _ in requests]
+            scales.append(remaining_margin / new_margin)
+        symbol_scale: dict[str, Decimal] = {}
+        grouped: dict[str, list[SizedPosition]] = {}
+        for req, item in live:
+            grouped.setdefault(req.symbol, []).append(item)
+        for symbol, items in grouped.items():
+            cap = view.equity * bundle.decimal("per_symbol_notional_pct") - symbol_used.get(symbol, D("0"))
+            group_notional = sum((item.notional for item in items), start=D("0"))
+            if group_notional <= 0:
+                symbol_scale[symbol] = D("1")
+            elif cap <= 0:
+                symbol_scale[symbol] = D("0")
+            else:
+                symbol_scale[symbol] = min(D("1"), cap / group_notional)
+        global_scale = min(scales)
         scaled: list[Optional[SizedPosition]] = []
         for req, item in zip(requests, draft):
             if item is None:
+                scaled.append(None)
+                continue
+            scale = min(global_scale, symbol_scale.get(req.symbol, D("1")))
+            if scale >= 1:
+                scaled.append(item)
+                continue
+            if scale <= 0:
                 scaled.append(None)
                 continue
             qty = floor_to_lot(item.qty * scale, req.lot_size)

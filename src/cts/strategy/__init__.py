@@ -6,6 +6,7 @@ from cts.strategy.t1 import (
     apply_fill_to_state,
     evaluate_exit,
     evaluate_signal,
+    stop_breached,
 )
 
 __all__ = [

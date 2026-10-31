@@ -20,6 +20,7 @@ from cts.strategy.t1 import (
     evaluate_exit,
     evaluate_signal,
     next_open_fill_price,
+    stop_breached,
 )
 
 
@@ -73,6 +74,45 @@ def replay_t1(
     for i, bar in enumerate(closed):
         hist = closed[: i + 1]
         m = mark_at(marks, bar.available_at, symbol)
+        if position is not None and i > 0:
+            prev_time = closed[i - 1].event_time
+            intra = sorted(
+                (
+                    mk
+                    for mk in marks
+                    if mk.symbol == symbol and prev_time < mk.event_time <= bar.event_time
+                ),
+                key=lambda mk: (mk.event_time, mk.available_at),
+            )
+            breached = next((mk for mk in intra if stop_breached(position, mk.mark_price)), None)
+            if breached is not None:
+                ledger.apply_fill(
+                    symbol=symbol,
+                    side=Side.LONG if position.side == Side.SHORT else Side.SHORT,
+                    qty=position.qty,
+                    price=breached.mark_price,
+                    multiplier=config.multiplier,
+                    event_time=breached.event_time,
+                    received_at=breached.available_at,
+                    external_id=f"exit:{symbol}:{breached.event_time.isoformat()}:STOP",
+                    venue=venue,
+                    venue_trade_id=f"exit-{fills}-{exits}",
+                    reduce_only=True,
+                )
+                notional = position.qty * breached.mark_price * config.multiplier
+                ledger.post_fee(
+                    amount=notional * config.fee_rate,
+                    event_time=breached.event_time,
+                    received_at=breached.available_at,
+                    external_id=f"fee-exit:{symbol}:{breached.event_time.isoformat()}",
+                    venue=venue,
+                    symbol=symbol,
+                )
+                last_exit = breached.event_time
+                position = None
+                pending = None
+                exits += 1
+                continue
         if position is not None and m is not None:
             position, decision = evaluate_exit(position, hist, mark_price=m, params=config.params)
             if decision is not None:
