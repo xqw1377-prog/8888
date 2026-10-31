@@ -156,9 +156,9 @@ def evaluate_exit(
     since_entry = [c for c in candles if c.event_time > position.entry_event_time]
     if since_entry:
         if position.side == Side.LONG:
-            extreme = max(position.extreme, max(c.high for c in since_entry))
+            extreme = max(position.extreme, max(c.close for c in since_entry))
         else:
-            extreme = min(position.extreme, min(c.low for c in since_entry))
+            extreme = min(position.extreme, min(c.close for c in since_entry))
     else:
         extreme = position.extreme
     updated = replace(position, extreme=extreme)

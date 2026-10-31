@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS account_state (
     high_water_mark TEXT NOT NULL,
     unit_nav TEXT NOT NULL,
     daily_nav_open TEXT NOT NULL,
-    mode TEXT NOT NULL
+    mode TEXT NOT NULL,
+    pause_latched INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS positions (
     account_id TEXT NOT NULL,
@@ -91,10 +92,23 @@ CREATE TABLE IF NOT EXISTS blockers (
     severity TEXT NOT NULL,
     created_at TEXT NOT NULL,
     cleared_at TEXT,
-    details TEXT NOT NULL
+    details TEXT NOT NULL,
+    resolution_evidence_id TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_active_blocker
     ON blockers(account_id, reason_code) WHERE cleared_at IS NULL;
+CREATE TABLE IF NOT EXISTS recovery_approvals (
+    approval_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    snapshot_version INTEGER NOT NULL,
+    blocker_set_version INTEGER NOT NULL,
+    risk_version INTEGER NOT NULL,
+    equity_version INTEGER NOT NULL,
+    config_hash TEXT NOT NULL,
+    blocker_ids TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS recovery_attempts (
     attempt_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL,
@@ -326,19 +340,28 @@ class RiskStore:
             """,
             (bid, account_id, reason_code, severity.value, _iso(now), None, details),
         )
+        if severity in (SystemState.PAUSED, SystemState.FAULT):
+            conn.execute("UPDATE account_state SET pause_latched=1 WHERE account_id=?", (account_id,))
         conn.execute(
             "UPDATE account_state SET blocker_set_version=blocker_set_version+1, account_state_version=account_state_version+1 WHERE account_id=?",
             (account_id,),
         )
         return bid
 
-    def _clear_blocker(self, conn: sqlite3.Connection, account_id: str, reason_code: str, now: datetime) -> bool:
+    def _clear_blocker(
+        self,
+        conn: sqlite3.Connection,
+        account_id: str,
+        reason_code: str,
+        now: datetime,
+        evidence_id: str,
+    ) -> bool:
         cur = conn.execute(
             """
-            UPDATE blockers SET cleared_at=?
+            UPDATE blockers SET cleared_at=?, resolution_evidence_id=?
             WHERE account_id=? AND reason_code=? AND cleared_at IS NULL
             """,
-            (_iso(now), account_id, reason_code),
+            (_iso(now), evidence_id, account_id, reason_code),
         )
         if cur.rowcount:
             conn.execute(
@@ -357,6 +380,8 @@ class RiskStore:
         for blocker in blockers:
             if STATE_SEVERITY[blocker.severity] > STATE_SEVERITY[state]:
                 state = blocker.severity
+        if row["pause_latched"] and STATE_SEVERITY[state] < STATE_SEVERITY[SystemState.PAUSED]:
+            state = SystemState.PAUSED
         conn.execute("UPDATE account_state SET system_state=? WHERE account_id=?", (state.value, account_id))
         return state
 

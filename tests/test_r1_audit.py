@@ -127,7 +127,8 @@ def test_candle_aligned_marks_are_not_liquidation_validated() -> None:
         range_start=t_close(0),
         range_end=t_close(3),
     )
-    assert report.grade == DataGrade.EXECUTION_PNL_VALIDATED
+    assert report.grade == DataGrade.SIGNAL_RESEARCH_ONLY
+    assert report.grade != DataGrade.EXECUTION_PNL_VALIDATED
     assert report.grade != DataGrade.LIQUIDATION_REPLAY_VALIDATED
 
 
@@ -152,10 +153,12 @@ def test_fault_recovery_does_not_clear_blockers(tmp_path) -> None:
 def test_stale_recovery_failure_is_persisted(tmp_path) -> None:
     engine = make_engine(tmp_path)
     engine.add_blocker("DAILY_LOSS", SystemState.PAUSED, now=NOW)
+    engine.clear_blocker("DAILY_LOSS", resolution_evidence_id="ev-daily", now=NOW)
     snap = engine.create_recovery_snapshot(now=NOW)
+    approval = engine.approve_recovery(snap, approved_by="owner", now=NOW)
     engine.add_blocker("UNKNOWN_ORDER", SystemState.PAUSED, now=NOW)
     with pytest.raises(RecoveryStaleError):
-        engine.apply_recovery(snap, now=NOW)
+        engine.apply_recovery(snap, approval_id=approval, now=NOW)
     row = engine.store._conn.execute(
         "SELECT result, reason_code FROM recovery_attempts WHERE account_id=?",
         ("acct-1",),
@@ -215,8 +218,18 @@ def test_joint_scale_does_not_reject_the_batch(tmp_path) -> None:
 def test_paused_recovery_still_reaches_running(tmp_path) -> None:
     engine = make_engine(tmp_path)
     engine.add_blocker("DAILY_LOSS", SystemState.PAUSED, now=NOW)
+    blocked = engine.create_recovery_snapshot(now=NOW)
+    with pytest.raises(NewRiskBlockedError) as err:
+        engine.apply_recovery(blocked, now=NOW)
+    assert err.value.reason_code == "RECOVERY_APPROVAL_REQUIRED"
+    assert engine.occupancy().system_state == SystemState.PAUSED
+    assert {b.reason_code for b in engine.occupancy().blockers} == {"DAILY_LOSS"}
+    state = engine.clear_blocker("DAILY_LOSS", resolution_evidence_id="ev-daily", now=NOW)
+    assert state == SystemState.PAUSED
+    assert engine.occupancy().blockers == ()
     snap = engine.create_recovery_snapshot(now=NOW)
-    applied = engine.apply_recovery(snap, now=NOW)
+    approval = engine.approve_recovery(snap, approved_by="owner", now=NOW)
+    applied = engine.apply_recovery(snap, approval_id=approval, now=NOW)
     assert applied.result == "APPLIED"
     assert engine.occupancy().system_state == SystemState.RUNNING
     assert engine.occupancy().blockers == ()
@@ -263,3 +276,85 @@ def test_trail_does_not_use_signal_bar_extreme() -> None:
     assert updated.extreme == signal.close
     assert updated.stop == pos.stop
     assert signal.entry_band < bars[-2].high
+
+
+def test_fill_id_quantity_conflict_is_rejected(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    reserved = engine.reserve([req("BTCUSDT", "sig-fill")], now=NOW)[0]
+    engine.apply_fill(reserved.reservation_id, reserved.qty * D("0.1"), fill_id="fill-1", now=NOW)
+    with pytest.raises(ConflictError):
+        engine.apply_fill(reserved.reservation_id, reserved.qty * D("0.9"), fill_id="fill-1", now=NOW)
+    occ = engine.occupancy()
+    assert occ.positions[0].qty == reserved.qty * D("0.1")
+
+
+def test_entry_bar_stop_before_close_exits() -> None:
+    bars = breakout_series(130)
+    breach_at = t_close(130) + timedelta(hours=1)
+    marks = [mark(i, format(bars[i].close, "f")) for i in range(len(bars))]
+    marks.append(
+        MarkSample(
+            venue="SIM",
+            symbol="BTCUSDT",
+            event_time=breach_at,
+            received_at=breach_at,
+            available_at=breach_at,
+            mark_price=D("110"),
+            index_price=D("110"),
+            source_id="entry-breach",
+        )
+    )
+    ledger = Ledger("acct-entry-stop")
+    ledger.transfer_in(amount=D("10000"), event_time=ORIGIN, received_at=ORIGIN, external_id="dep")
+    result = replay_t1(
+        ledger=ledger,
+        symbol="BTCUSDT",
+        candles=bars,
+        marks=marks,
+        config=ReplayConfig(params=T1Params()),
+        venue="SIM",
+    )
+    assert result.fills == 1
+    assert result.exits == 1
+
+
+def test_mark_is_not_used_before_available_at() -> None:
+    bars = breakout_series(130)
+    breach_at = t_close(130) + timedelta(hours=1)
+    late = t_close(131) + timedelta(hours=2)
+    marks = [mark(i, format(bars[i].close, "f")) for i in range(len(bars))]
+    marks.append(
+        MarkSample(
+            venue="SIM",
+            symbol="BTCUSDT",
+            event_time=breach_at,
+            received_at=late,
+            available_at=late,
+            mark_price=D("110"),
+            index_price=D("110"),
+            source_id="late-breach",
+        )
+    )
+    ledger = Ledger("acct-late-mark")
+    ledger.transfer_in(amount=D("10000"), event_time=ORIGIN, received_at=ORIGIN, external_id="dep")
+    result = replay_t1(
+        ledger=ledger,
+        symbol="BTCUSDT",
+        candles=bars,
+        marks=marks,
+        config=ReplayConfig(params=T1Params()),
+        venue="SIM",
+    )
+    assert result.fills == 1
+    assert result.exits == 0
+
+
+def test_trail_uses_close_not_high() -> None:
+    bars = breakout_series(130)
+    signal = evaluate_signal(bars[:-1], params=T1Params(), has_position=False, has_pending_entry=False)
+    assert signal is not None
+    pos = apply_fill_to_state(signal=signal, fill_price=signal.close, qty=D("1"), params=T1Params())
+    later = list(bars[:-1]) + [candle(200, open_=format(signal.close, "f"), high="500", low=format(signal.close, "f"), close=format(signal.close, "f"))]
+    updated, _ = evaluate_exit(pos, later, mark_price=signal.close, params=T1Params())
+    assert updated.extreme == signal.close
+    assert updated.stop == pos.stop

@@ -45,6 +45,27 @@ class ReplayResult:
     skipped_no_fill: int
 
 
+def _mark_key(mk: MarkSample) -> tuple:
+    return (mk.symbol, mk.source_id, mk.event_time.isoformat(), format(mk.mark_price, "f"), mk.available_at.isoformat())
+
+
+def next_available_stop(position: OpenPosition, marks: Sequence[MarkSample], consumed: set[tuple], as_of: datetime):
+    visible = [
+        mk
+        for mk in marks
+        if mk.symbol == position.symbol
+        and _mark_key(mk) not in consumed
+        and mk.available_at <= as_of
+        and mk.event_time > position.entry_event_time
+    ]
+    visible.sort(key=lambda mk: (mk.event_time, mk.available_at))
+    for mk in visible:
+        consumed.add(_mark_key(mk))
+        if stop_breached(position, mk.mark_price):
+            return mk
+    return None
+
+
 def mark_at(marks: Sequence[MarkSample], as_of: datetime, symbol: str) -> Optional[Decimal]:
     eligible = [m for m in marks if m.symbol == symbol and m.available_at <= as_of]
     if not eligible:
@@ -70,48 +91,44 @@ def replay_t1(
     fills = 0
     exits = 0
     skipped = 0
+    consumed_marks: set[tuple] = set()
+
+    def book_stop(held: OpenPosition, breached: MarkSample) -> None:
+        nonlocal exits, last_exit, position, pending
+        ledger.apply_fill(
+            symbol=symbol,
+            side=Side.LONG if held.side == Side.SHORT else Side.SHORT,
+            qty=held.qty,
+            price=breached.mark_price,
+            multiplier=config.multiplier,
+            event_time=breached.event_time,
+            received_at=breached.available_at,
+            external_id=f"exit:{symbol}:{breached.event_time.isoformat()}:STOP",
+            venue=venue,
+            venue_trade_id=f"exit-{fills}-{exits}",
+            reduce_only=True,
+        )
+        notional = held.qty * breached.mark_price * config.multiplier
+        ledger.post_fee(
+            amount=notional * config.fee_rate,
+            event_time=breached.event_time,
+            received_at=breached.available_at,
+            external_id=f"fee-exit:{symbol}:{breached.event_time.isoformat()}",
+            venue=venue,
+            symbol=symbol,
+        )
+        last_exit = breached.event_time
+        position = None
+        pending = None
+        exits += 1
 
     for i, bar in enumerate(closed):
         hist = closed[: i + 1]
         m = mark_at(marks, bar.available_at, symbol)
-        if position is not None and i > 0:
-            prev_time = closed[i - 1].event_time
-            intra = sorted(
-                (
-                    mk
-                    for mk in marks
-                    if mk.symbol == symbol and prev_time < mk.event_time <= bar.event_time
-                ),
-                key=lambda mk: (mk.event_time, mk.available_at),
-            )
-            breached = next((mk for mk in intra if stop_breached(position, mk.mark_price)), None)
+        if position is not None:
+            breached = next_available_stop(position, marks, consumed_marks, bar.available_at)
             if breached is not None:
-                ledger.apply_fill(
-                    symbol=symbol,
-                    side=Side.LONG if position.side == Side.SHORT else Side.SHORT,
-                    qty=position.qty,
-                    price=breached.mark_price,
-                    multiplier=config.multiplier,
-                    event_time=breached.event_time,
-                    received_at=breached.available_at,
-                    external_id=f"exit:{symbol}:{breached.event_time.isoformat()}:STOP",
-                    venue=venue,
-                    venue_trade_id=f"exit-{fills}-{exits}",
-                    reduce_only=True,
-                )
-                notional = position.qty * breached.mark_price * config.multiplier
-                ledger.post_fee(
-                    amount=notional * config.fee_rate,
-                    event_time=breached.event_time,
-                    received_at=breached.available_at,
-                    external_id=f"fee-exit:{symbol}:{breached.event_time.isoformat()}",
-                    venue=venue,
-                    symbol=symbol,
-                )
-                last_exit = breached.event_time
-                position = None
-                pending = None
-                exits += 1
+                book_stop(position, breached)
                 continue
         if position is not None and m is not None:
             position, decision = evaluate_exit(position, hist, mark_price=m, params=config.params)
@@ -200,6 +217,10 @@ def replay_t1(
                     position = apply_fill_to_state(signal=pending, fill_price=fill_px, qty=sized.qty, params=config.params)
                     fills += 1
                     pending = None
+                    breached = next_available_stop(position, marks, consumed_marks, bar.available_at)
+                    if breached is not None:
+                        book_stop(position, breached)
+                        continue
 
         if position is None and pending is None:
             intent = evaluate_signal(

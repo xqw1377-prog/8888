@@ -200,17 +200,28 @@ class RiskEngine:
             )
             return bid
 
-    def clear_blocker(self, reason_code: str, *, now: Optional[datetime] = None) -> SystemState:
+    def clear_blocker(
+        self,
+        reason_code: str,
+        *,
+        resolution_evidence_id: str = "",
+        now: Optional[datetime] = None,
+    ) -> SystemState:
         ts = now or utc_now()
+        if not resolution_evidence_id.strip():
+            raise NewRiskBlockedError("清除阻断必须提供解决证据", reason_code="RESOLUTION_EVIDENCE_REQUIRED")
         with self.store.txn() as conn:
-            self.store._clear_blocker(conn, self.account_id, reason_code, ts)
+            active = [b for b in self.store.active_blockers(conn, self.account_id) if b.reason_code == reason_code]
+            if active and active[0].severity == SystemState.FAULT:
+                raise NewRiskBlockedError("FAULT 不能通过清除阻断直接解除", reason_code="FAULT_REQUIRES_INVESTIGATION")
+            self.store._clear_blocker(conn, self.account_id, reason_code, ts, resolution_evidence_id.strip())
             state = self.store._recompute_state(conn, self.account_id)
             self.store._trace(
                 conn,
                 self.account_id,
                 ts,
                 "CLEAR_BLOCKER",
-                {"reason_code": reason_code, "state": state.value},
+                {"reason_code": reason_code, "state": state.value, "evidence_id": resolution_evidence_id.strip()},
             )
             return state
 
@@ -308,6 +319,8 @@ class RiskEngine:
             res = self.store.get_reservation(conn, reservation_id)
             existed = conn.execute("SELECT qty FROM reservation_fills WHERE fill_id=?", (fill_id,)).fetchone()
             if existed:
+                if D(existed["qty"]) != fill_qty:
+                    raise ConflictError(f"fill_id 异容: {fill_id}")
                 return res
             previous = self._filled_qty(conn, reservation_id)
             conn.execute(
@@ -527,11 +540,62 @@ class RiskEngine:
             )
             return snap
 
-    def apply_recovery(self, snapshot: RecoverySnapshot, *, now: Optional[datetime] = None) -> RecoveryAttempt:
+    def approve_recovery(self, snapshot: RecoverySnapshot, *, approved_by: str, now: Optional[datetime] = None) -> str:
+        ts = now or utc_now()
+        if not approved_by.strip():
+            raise NewRiskBlockedError("恢复审批缺少批准人", reason_code="RECOVERY_APPROVAL_REQUIRED")
+        approval_id = uuid4().hex
+        with self.store.txn() as conn:
+            row = self.store.load_account(conn, self.account_id)
+            blockers = self.store.active_blockers(conn, self.account_id)
+            if any(b.severity == SystemState.FAULT for b in blockers):
+                raise NewRiskBlockedError("FAULT 不能通过恢复审批解除", reason_code="FAULT_REQUIRES_INVESTIGATION")
+            if blockers:
+                raise NewRiskBlockedError("仍有未解决阻断，不能审批恢复", reason_code="BLOCKER_UNRESOLVED")
+            current_ids = tuple(b.blocker_id for b in blockers)
+            if (
+                row["snapshot_version"] != snapshot.snapshot_version
+                or row["blocker_set_version"] != snapshot.blocker_set_version
+                or row["risk_version"] != snapshot.risk_version
+                or row["config_hash"] != snapshot.config_hash
+                or row["equity_version"] != snapshot.equity_version
+                or current_ids != snapshot.blocker_ids
+            ):
+                raise RecoveryStaleError("审批时快照已失效")
+            conn.execute(
+                """
+                INSERT INTO recovery_approvals(
+                    approval_id, account_id, snapshot_version, blocker_set_version, risk_version,
+                    equity_version, config_hash, blocker_ids, approved_by, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    approval_id,
+                    self.account_id,
+                    snapshot.snapshot_version,
+                    snapshot.blocker_set_version,
+                    snapshot.risk_version,
+                    snapshot.equity_version,
+                    snapshot.config_hash,
+                    ",".join(snapshot.blocker_ids),
+                    approved_by.strip(),
+                    ts.isoformat(),
+                ),
+            )
+            self.store._trace(conn, self.account_id, ts, "APPROVE_RECOVERY", {"approval_id": approval_id, "approved_by": approved_by.strip()})
+        return approval_id
+
+    def apply_recovery(
+        self,
+        snapshot: RecoverySnapshot,
+        *,
+        approval_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> RecoveryAttempt:
         ts = now or utc_now()
         attempt_id = uuid4().hex
         try:
-            return self._apply_recovery_txn(snapshot, attempt_id, ts)
+            return self._apply_recovery_txn(snapshot, attempt_id, ts, approval_id)
         except _RecoveryAbort as exc:
             self._persist_failed_recovery(attempt_id, snapshot, ts, exc.reason_code)
             if exc.reason_code == "RECOVERY_SNAPSHOT_STALE":
@@ -543,6 +607,7 @@ class RiskEngine:
         snapshot: RecoverySnapshot,
         attempt_id: str,
         ts: datetime,
+        approval_id: Optional[str],
     ) -> RecoveryAttempt:
         with self.store.txn() as conn:
             row = self.store.load_account(conn, self.account_id)
@@ -567,11 +632,31 @@ class RiskEngine:
             )
             if any(blocker.severity == SystemState.FAULT for blocker in blockers):
                 raise _RecoveryAbort("FAULT_REQUIRES_INVESTIGATION", "FAULT 不能通过恢复快照直接解除")
-            if stale:
+            if not approval_id:
+                raise _RecoveryAbort("RECOVERY_APPROVAL_REQUIRED", "恢复缺少人工审批")
+            approval = conn.execute(
+                "SELECT * FROM recovery_approvals WHERE approval_id=? AND account_id=?",
+                (approval_id, self.account_id),
+            ).fetchone()
+            if approval is None:
+                raise _RecoveryAbort("RECOVERY_APPROVAL_REQUIRED", "恢复审批不存在")
+            if (
+                approval["snapshot_version"] != snapshot.snapshot_version
+                or approval["blocker_set_version"] != snapshot.blocker_set_version
+                or approval["risk_version"] != snapshot.risk_version
+                or approval["config_hash"] != snapshot.config_hash
+                or approval["equity_version"] != snapshot.equity_version
+                or approval["blocker_ids"] != ",".join(snapshot.blocker_ids)
+            ):
+                raise _RecoveryAbort("RECOVERY_APPROVAL_MISMATCH", "审批与快照版本不一致")
+            if stale or blockers:
+                if blockers and not stale:
+                    raise _RecoveryAbort("BLOCKER_UNRESOLVED", "活动阻断尚未用解决证据清除，不能恢复")
                 raise _RecoveryAbort("RECOVERY_SNAPSHOT_STALE", "审批快照已失效，恢复失败")
-            for blocker in blockers:
-                self.store._clear_blocker(conn, self.account_id, blocker.reason_code, ts)
-            conn.execute("UPDATE account_state SET recovery_in_progress=0 WHERE account_id=?", (self.account_id,))
+            conn.execute(
+                "UPDATE account_state SET recovery_in_progress=0, pause_latched=0 WHERE account_id=?",
+                (self.account_id,),
+            )
             state = self.store._recompute_state(conn, self.account_id)
             conn.execute(
                 """
