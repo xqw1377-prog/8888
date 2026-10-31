@@ -327,6 +327,92 @@ def test_realized_loss_cannot_auto_add_margin() -> None:
         )
 
 
+def test_reopen_restores_position_funding_and_rejects_changed_content(tmp_path) -> None:
+    path = tmp_path / "ledger.db"
+    ledger = Ledger("acct-1", path=str(path))
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
+    ledger.lock_margin(amount=D("500"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-1", venue="SIM")
+    ledger.apply_fill(
+        symbol="BTCUSDT",
+        side=Side.LONG,
+        qty=D("1"),
+        price=D("100"),
+        multiplier=D("1"),
+        event_time=TS,
+        received_at=TS,
+        external_id="f1",
+        venue="SIM",
+        venue_trade_id="t1",
+    )
+    ledger.post_fee(amount=D("2"), event_time=TS, received_at=TS, external_id="fee-1", venue="SIM", symbol="BTCUSDT")
+    ledger.post_funding(
+        payment=D("-0.5"),
+        event_time=TS,
+        received_at=TS,
+        external_id="fund-1",
+        venue="SIM",
+        symbol="BTCUSDT",
+        from_isolated=True,
+    )
+    later = TS.replace(hour=4)
+    ledger.apply_fill(
+        symbol="BTCUSDT",
+        side=Side.SHORT,
+        qty=D("1"),
+        price=D("110"),
+        multiplier=D("1"),
+        event_time=later,
+        received_at=later,
+        external_id="f2",
+        venue="SIM",
+        venue_trade_id="t2",
+        reduce_only=True,
+    )
+    snap = ledger.equity_snapshot(as_of=later, mark_prices={})
+    held = ledger.position("BTCUSDT")
+
+    reopened = Ledger("acct-1", path=str(path))
+    again = reopened.position("BTCUSDT")
+    assert reopened.balance(AccountBucket.WALLET) == ledger.balance(AccountBucket.WALLET)
+    assert reopened.balance(AccountBucket.ISOLATED_MARGIN) == ledger.balance(AccountBucket.ISOLATED_MARGIN)
+    assert reopened.balance(AccountBucket.FEE) == D("2")
+    assert reopened.balance(AccountBucket.FUNDING) == D("0.5")
+    assert again.qty == held.qty == D("0")
+    assert again.funding_cum == held.funding_cum == D("-0.5")
+    assert again.isolated_margin == held.isolated_margin == D("509.5")
+    assert again.realized_pnl_cum == held.realized_pnl_cum == D("10")
+    restored = reopened.equity_snapshot(as_of=later, mark_prices={})
+    assert restored.equity == snap.equity
+    assert restored.shares == snap.shares
+    assert restored.high_water_mark == snap.high_water_mark
+    reopened.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
+    reopened.post_funding(
+        payment=D("-0.5"),
+        event_time=TS,
+        received_at=TS,
+        external_id="fund-1",
+        venue="SIM",
+        symbol="BTCUSDT",
+        from_isolated=True,
+    )
+    assert reopened.cash_equity() == ledger.cash_equity()
+    assert reopened.position("BTCUSDT").funding_cum == D("-0.5")
+    with pytest.raises(ConflictError):
+        reopened.apply_fill(
+            symbol="BTCUSDT",
+            side=Side.LONG,
+            qty=D("2"),
+            price=D("100"),
+            multiplier=D("1"),
+            event_time=TS,
+            received_at=TS,
+            external_id="f1",
+            venue="SIM",
+            venue_trade_id="t1",
+        )
+    assert reopened.position("BTCUSDT").qty == D("0")
+
+
 def test_funding_reserve_fixture_r_is_2_4_and_paid_does_not_shrink_future_window() -> None:
     points = tuple(
         SettlementPoint(at=TS.replace(hour=i % 24), rate=D("0.001"), mark_price=D("100"))

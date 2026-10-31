@@ -7,11 +7,11 @@ from datetime import timedelta
 
 import pytest
 
-from cts.data.models import DataGrade, MarkSample
+from cts.data.models import DataGrade, FundingSettlement, MarkSample
 from cts.data.store import DataStore
 from cts.errors import ConflictError, LedgerImbalanceError, NewRiskBlockedError, RecoveryStaleError
 from cts.ledger.journal import Ledger
-from cts.ledger.models import LedgerEventType, Side
+from cts.ledger.models import AccountBucket, LedgerEventType, Side
 from cts.money import D
 from cts.risk.models import SystemState
 from cts.strategy.replay import ReplayConfig, replay_t1
@@ -549,3 +549,74 @@ def test_forged_snapshot_time_cannot_renew_approval(tmp_path) -> None:
         engine.approve_recovery(forged, approved_by="owner", now=NOW)
     assert err.value.reason_code == "RECOVERY_APPROVAL_EXPIRED"
     assert engine.occupancy().system_state == SystemState.PAUSED
+
+
+def _settlement(settlement_id: str, event_time, available_at, payment: str) -> FundingSettlement:
+    return FundingSettlement(
+        venue="SIM",
+        symbol="BTCUSDT",
+        event_time=event_time,
+        received_at=available_at,
+        available_at=available_at,
+        settlement_id=settlement_id,
+        funding_rate=D("0.0001"),
+        payment=D(payment),
+        interval_minutes=D("480"),
+        source_id=settlement_id,
+    )
+
+
+def test_replay_posts_available_funding_and_exit_slippage_separately() -> None:
+    bars = breakout_series(130)
+    breach_at = t_close(130) + timedelta(hours=1)
+    held_at = t_close(130) + timedelta(minutes=30)
+    marks = [mark(i, format(bars[i].close, "f")) for i in range(len(bars))]
+    marks.append(
+        MarkSample(
+            venue="SIM",
+            symbol="BTCUSDT",
+            event_time=breach_at,
+            received_at=breach_at,
+            available_at=breach_at,
+            mark_price=D("110"),
+            index_price=D("110"),
+            source_id="entry-breach",
+        )
+    )
+    fundings = [
+        _settlement("set-before", t_close(100), t_close(100), "-1"),
+        _settlement("set-held", held_at, held_at, "-0.5"),
+        _settlement("set-held", held_at, held_at, "-0.5"),
+        _settlement("set-late", breach_at + timedelta(minutes=30), bars[-1].available_at + timedelta(hours=2), "-9"),
+    ]
+    ledger = Ledger("acct-funding")
+    ledger.transfer_in(amount=D("10000"), event_time=ORIGIN, received_at=ORIGIN, external_id="dep")
+    result = replay_t1(
+        ledger=ledger,
+        symbol="BTCUSDT",
+        candles=bars,
+        marks=marks,
+        config=ReplayConfig(params=T1Params()),
+        venue="SIM",
+        fundings=fundings,
+    )
+    assert result.grade == DataGrade.SIGNAL_RESEARCH_ONLY
+    assert result.funding_posted == 1
+    funding_events = [event for event in ledger.events() if event.event_type == LedgerEventType.FUNDING]
+    assert len(funding_events) == 1
+    assert funding_events[0].metadata["payment"] == "-0.5"
+    assert funding_events[0].event_time == held_at
+    assert ledger.position("BTCUSDT").funding_cum == D("-0.5")
+    assert ledger.balance(AccountBucket.FUNDING) == D("0.5")
+    fills = [event for event in ledger.events() if event.event_type == LedgerEventType.FILL]
+    closed = next(event for event in fills if event.metadata.get("note") == "reduce")
+    assert closed.metadata["price"] == "110"
+    assert closed.metadata["price_source"] == "MARK"
+    notional = D(closed.metadata["qty"]) * D(closed.metadata["price"])
+    slips = [event for event in ledger.events() if event.external_id.startswith("slip-exit:")]
+    exit_fees = [event for event in ledger.events() if event.external_id.startswith("fee-exit:")]
+    assert len(slips) == 1
+    assert len(exit_fees) == 1
+    assert sum(line.debit for line in slips[0].lines if line.bucket == AccountBucket.FEE) == notional * D("0.0005")
+    assert sum(line.debit for line in exit_fees[0].lines if line.bucket == AccountBucket.FEE) == notional * D("0.0005")
+    assert all(not event.external_id.startswith("slip-entry:") for event in ledger.events())

@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Optional, Sequence
 
 from cts.clock import UTC
-from cts.data.models import Candle, DataGrade, MarkSample
+from cts.data.models import Candle, DataGrade, FundingSettlement, MarkSample
 from cts.errors import LookaheadError, UnitValidationError
 from cts.ledger.journal import Ledger
 from cts.ledger.models import Side
@@ -46,6 +46,7 @@ class ReplayResult:
     exits: int
     skipped_no_fill: int
     grade: DataGrade = DataGrade.SIGNAL_RESEARCH_ONLY
+    funding_posted: int = 0
 
 
 def bar_open_time(bar: Candle) -> datetime:
@@ -129,6 +130,7 @@ def replay_t1(
     marks: Sequence[MarkSample],
     config: ReplayConfig,
     venue: str,
+    fundings: Sequence[FundingSettlement] = (),
 ) -> ReplayResult:
     closed = [c for c in candles if c.is_closed and c.symbol == symbol]
     closed = sorted(closed, key=lambda c: c.event_time)
@@ -139,7 +141,9 @@ def replay_t1(
     fills = 0
     exits = 0
     skipped = 0
+    funding_posted = 0
     consumed_marks: set[tuple] = set()
+    posted_funding: set[str] = set()
     prior = ledger.events()
     epoch = datetime(1970, 1, 1, tzinfo=UTC)
     last_event_time = max((event.event_time for event in prior), default=epoch)
@@ -181,18 +185,67 @@ def replay_t1(
             price_event_time=breached.event_time,
         )
         notional = held.qty * breached.mark_price * config.multiplier
-        ledger.post_fee(
-            amount=notional * config.fee_rate,
-            event_time=booked,
-            received_at=seen,
-            external_id=f"fee-exit:{symbol}:{booked.isoformat()}:{breached.source_id}",
-            venue=venue,
-            symbol=symbol,
-        )
+        book_exit_costs(notional, booked, seen, f"{symbol}:{booked.isoformat()}:{breached.source_id}")
         last_exit = booked
         position = None
         pending = None
         exits += 1
+
+    def book_exit_costs(notional: Decimal, booked: datetime, seen: datetime, tag: str) -> None:
+        fee = notional * config.fee_rate
+        slip = notional * config.adverse_cost
+        if fee > 0:
+            ledger.post_fee(
+                amount=fee,
+                event_time=booked,
+                received_at=seen,
+                external_id=f"fee-exit:{tag}",
+                venue=venue,
+                symbol=symbol,
+            )
+        if slip > 0:
+            ledger.post_fee(
+                amount=slip,
+                event_time=booked,
+                received_at=seen,
+                external_id=f"slip-exit:{tag}",
+                venue=venue,
+                symbol=symbol,
+            )
+
+    def book_funding_until(as_of: datetime, until: Optional[datetime]) -> None:
+        nonlocal funding_posted
+        if position is None:
+            return
+        due = [
+            item
+            for item in fundings
+            if item.symbol == symbol
+            and item.settlement_id not in posted_funding
+            and item.payment != 0
+            and item.available_at <= as_of
+            and item.event_time > position.entry_event_time
+        ]
+        due.sort(key=lambda item: (item.available_at, item.event_time, item.settlement_id))
+        for item in due:
+            if item.settlement_id in posted_funding:
+                continue
+            when = executable_time(position.entry_event_time, item.available_at)
+            if until is not None and (when > until or item.event_time > until):
+                continue
+            booked = stamp(when)
+            seen = observe(booked)
+            ledger.post_funding(
+                payment=item.payment,
+                event_time=booked,
+                received_at=seen,
+                external_id=f"funding:{symbol}:{item.settlement_id}",
+                venue=venue,
+                symbol=symbol,
+                from_isolated=True,
+            )
+            posted_funding.add(item.settlement_id)
+            funding_posted += 1
 
     for i, bar in enumerate(closed):
         hist = closed[: i + 1]
@@ -200,6 +253,8 @@ def replay_t1(
         m = sample.mark_price if sample is not None else None
         if position is not None:
             breached = next_available_stop(position, marks, consumed_marks, bar.available_at)
+            stop_time = executable_time(position.entry_event_time, breached.available_at) if breached is not None else bar.available_at
+            book_funding_until(bar.available_at, stop_time)
             if breached is not None:
                 book_stop(position, breached)
                 continue
@@ -230,14 +285,7 @@ def replay_t1(
                     price_event_time=bar.event_time,
                 )
                 notional = position.qty * exit_price * config.multiplier
-                ledger.post_fee(
-                    amount=notional * config.fee_rate,
-                    event_time=booked,
-                    received_at=seen,
-                    external_id=f"fee-exit:{symbol}:{booked.isoformat()}",
-                    venue=venue,
-                    symbol=symbol,
-                )
+                book_exit_costs(notional, booked, seen, f"{symbol}:{booked.isoformat()}:TREND")
                 last_exit = booked
                 position = None
                 pending = None
@@ -312,6 +360,12 @@ def replay_t1(
                     fills += 1
                     pending = None
                     breached = next_available_stop(position, marks, consumed_marks, bar.available_at)
+                    stop_time = (
+                        executable_time(position.entry_event_time, breached.available_at)
+                        if breached is not None
+                        else bar.available_at
+                    )
+                    book_funding_until(bar.available_at, stop_time)
                     if breached is not None:
                         book_stop(position, breached)
                         continue
@@ -334,4 +388,5 @@ def replay_t1(
         exits=exits,
         skipped_no_fill=skipped,
         grade=DataGrade.SIGNAL_RESEARCH_ONLY,
+        funding_posted=funding_posted,
     )

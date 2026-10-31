@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -43,13 +45,25 @@ class AccountBooks:
 
 
 class Ledger:
-    def __init__(self, account_id: str, asset: str = "USDT") -> None:
+    def __init__(self, account_id: str, asset: str = "USDT", path: Optional[str] = None) -> None:
         self.account_id = account_id
         self.asset = asset
         self._events: list[LedgerEvent] = []
         self._by_external: dict[tuple[str, str], LedgerEvent] = {}
         self._books = AccountBooks()
         self._positions: dict[str, PositionState] = {}
+        self._loading = False
+        self._store: Optional[LedgerStore] = LedgerStore(path) if path else None
+        if self._store is not None:
+            self._loading = True
+            try:
+                for event in self._store.load(account_id):
+                    self.post_journal(event)
+                    self._project_position(event)
+                    if not self._has_open_position():
+                        self._refresh_nav(unrealized=Decimal("0"))
+            finally:
+                self._loading = False
 
     def append_event(self, event: LedgerEvent) -> LedgerEvent:
         if event.account_id != self.account_id:
@@ -76,7 +90,9 @@ class Ledger:
             self._books.balances[bal_key] = self._books.balances.get(bal_key, Decimal("0")) + line.signed
         self._events.append(event)
         self._by_external[key] = event
-        if not self._has_open_position():
+        if self._store is not None and not self._loading:
+            self._store.append(event)
+        if not self._loading and not self._has_open_position():
             self._refresh_nav(unrealized=Decimal("0"))
 
     def transfer_in(
@@ -612,21 +628,24 @@ class Ledger:
                     reversed_event_id=event.reversed_event_id,
                 )
             )
-            if event.event_type == LedgerEventType.FILL and event.symbol:
-                _restore_position_from_fill(clone, event)
-            if event.event_type == LedgerEventType.FUNDING and event.symbol:
-                clone.position(event.symbol).funding_cum += D(event.metadata.get("payment", "0"))
-            if event.event_type == LedgerEventType.MARGIN_LOCK and event.symbol:
-                amt = sum(l.debit for l in event.lines if l.bucket == AccountBucket.ISOLATED_MARGIN)
-                clone.position(event.symbol).isolated_margin += amt
-            if event.event_type == LedgerEventType.MARGIN_RELEASE and event.symbol:
-                amt = sum(l.credit for l in event.lines if l.bucket == AccountBucket.ISOLATED_MARGIN)
-                clone.position(event.symbol).isolated_margin -= amt
-            if event.symbol and event.event_type == LedgerEventType.FUNDING and event.metadata.get("from_isolated") == "True":
-                clone.position(event.symbol).isolated_margin += D(event.metadata["payment"])
+            clone._project_position(event)
         clone._books.reserved_budget = self._books.reserved_budget
         clone._books.high_water_mark = max(clone._books.high_water_mark, self._books.high_water_mark)
         return clone
+
+    def _project_position(self, event: LedgerEvent) -> None:
+        if event.event_type == LedgerEventType.FILL and event.symbol:
+            _restore_position_from_fill(self, event)
+        if event.event_type == LedgerEventType.FUNDING and event.symbol:
+            self.position(event.symbol).funding_cum += D(event.metadata.get("payment", "0"))
+        if event.event_type == LedgerEventType.MARGIN_LOCK and event.symbol:
+            amt = sum(line.debit for line in event.lines if line.bucket == AccountBucket.ISOLATED_MARGIN)
+            self.position(event.symbol).isolated_margin += amt
+        if event.event_type == LedgerEventType.MARGIN_RELEASE and event.symbol:
+            amt = sum(line.credit for line in event.lines if line.bucket == AccountBucket.ISOLATED_MARGIN)
+            self.position(event.symbol).isolated_margin -= amt
+        if event.symbol and event.event_type == LedgerEventType.FUNDING and event.metadata.get("from_isolated") == "True":
+            self.position(event.symbol).isolated_margin += D(event.metadata["payment"])
 
     def _has_open_position(self) -> bool:
         return any(pos.qty > 0 for pos in self._positions.values())
@@ -665,6 +684,121 @@ class Ledger:
         self._books.last_unit_nav = (self.cash_equity() + unrealized) / self._books.shares
         if self._books.last_unit_nav > self._books.high_water_mark:
             self._books.high_water_mark = self._books.last_unit_nav
+
+
+class LedgerStore:
+    """追加写入的账本流水。内存投影可以重启，原始分录以这里为准。"""
+
+    def __init__(self, path: str) -> None:
+        self._conn = sqlite3.connect(path, timeout=30, isolation_level=None, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ledger_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                account_id TEXT NOT NULL,
+                venue TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_time TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                source TEXT NOT NULL,
+                symbol TEXT,
+                position_id TEXT,
+                reversed_event_id TEXT,
+                lines_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                UNIQUE (account_id, venue, external_id)
+            )
+            """
+        )
+
+    def append(self, event: LedgerEvent) -> None:
+        lines = [
+            {
+                "asset": line.asset,
+                "bucket": line.bucket.value,
+                "debit": format(line.debit, "f"),
+                "credit": format(line.credit, "f"),
+                "note": line.note,
+            }
+            for line in event.lines
+        ]
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO ledger_events(
+                    event_id, account_id, venue, external_id, event_type, event_time, received_at,
+                    asset, source, symbol, position_id, reversed_event_id, lines_json, metadata_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    event.event_id,
+                    event.account_id,
+                    event.venue,
+                    event.external_id,
+                    event.event_type.value,
+                    event.event_time.isoformat(),
+                    event.received_at.isoformat(),
+                    event.asset,
+                    event.source,
+                    event.symbol,
+                    event.position_id,
+                    event.reversed_event_id,
+                    json.dumps(lines, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(event.metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except sqlite3.IntegrityError as exc:
+            self._conn.execute("ROLLBACK")
+            raise ConflictError(f"账本已存在不同流水: {(event.venue, event.external_id)}") from exc
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def load(self, account_id: str) -> list[LedgerEvent]:
+        rows = self._conn.execute(
+            """
+            SELECT event_id, account_id, venue, external_id, event_type, event_time, received_at,
+                   asset, source, symbol, position_id, reversed_event_id, lines_json, metadata_json
+            FROM ledger_events WHERE account_id=? ORDER BY seq
+            """,
+            (account_id,),
+        ).fetchall()
+        return [_event_from_row(row) for row in rows]
+
+
+def _event_from_row(row: tuple) -> LedgerEvent:
+    lines = tuple(
+        JournalLine(
+            asset=item["asset"],
+            bucket=AccountBucket(item["bucket"]),
+            debit=D(item["debit"]),
+            credit=D(item["credit"]),
+            note=item.get("note", ""),
+        )
+        for item in json.loads(row[12])
+    )
+    return LedgerEvent(
+        event_id=row[0],
+        account_id=row[1],
+        venue=row[2],
+        external_id=row[3],
+        event_type=LedgerEventType(row[4]),
+        event_time=datetime.fromisoformat(row[5]),
+        received_at=datetime.fromisoformat(row[6]),
+        asset=row[7],
+        source=row[8],
+        lines=lines,
+        symbol=row[9],
+        position_id=row[10],
+        metadata=json.loads(row[13]),
+        reversed_event_id=row[11],
+    )
 
 
 def _capture_position(pos: PositionState) -> tuple:
