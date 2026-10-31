@@ -186,6 +186,7 @@ def apply_fill_to_state(
     fill_price: Decimal,
     qty: Decimal,
     params: T1Params,
+    entry_time: Optional[datetime] = None,
 ) -> OpenPosition:
     stop = initial_stop(signal.side, fill_price, signal.atr, params)
     return OpenPosition(
@@ -196,7 +197,7 @@ def apply_fill_to_state(
         signal_atr=signal.atr,
         stop=stop,
         extreme=D(fill_price),
-        entry_event_time=signal.event_time,
+        entry_event_time=entry_time or signal.event_time,
     )
 
 

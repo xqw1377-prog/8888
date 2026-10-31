@@ -25,6 +25,11 @@ from cts.risk.parameters import mark_approved, proposed_bundle
 NOW = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
 
 
+def bound_evidence(engine, reason: str, now: datetime = NOW) -> str:
+    engine.register_recovery_approver("owner", now=now)
+    return engine.record_resolution_evidence(reason, statement=f"resolved:{reason}", recorded_by="owner", now=now)
+
+
 def req(symbol: str, signal: str, *, equity_version: Optional[int] = None, risk_version: Optional[int] = None) -> ReserveRequest:
     return ReserveRequest(
         symbol=symbol,
@@ -84,7 +89,7 @@ def test_clearing_one_blocker_does_not_release_others(tmp_path) -> None:
     engine.add_blocker("DAILY_LOSS", SystemState.PAUSED, now=NOW)
     engine.add_blocker("DRAWDOWN_6", SystemState.PAUSED, now=NOW)
     assert engine.occupancy().system_state == SystemState.PAUSED
-    state = engine.clear_blocker("DAILY_LOSS", resolution_evidence_id="ev-daily", now=NOW)
+    state = engine.clear_blocker("DAILY_LOSS", resolution_evidence_id=bound_evidence(engine, "DAILY_LOSS"), now=NOW)
     assert state == SystemState.PAUSED
     codes = {b.reason_code for b in engine.occupancy().blockers}
     assert codes == {"DRAWDOWN_6"}
@@ -100,7 +105,7 @@ def test_fault_is_stricter_than_paused(tmp_path) -> None:
     with pytest.raises(NewRiskBlockedError) as err:
         engine.clear_blocker("PROTECTION_OVERDUE", resolution_evidence_id="ev-fault", now=NOW)
     assert err.value.reason_code == "FAULT_REQUIRES_INVESTIGATION"
-    engine.clear_blocker("DAILY_LOSS", resolution_evidence_id="ev-daily", now=NOW)
+    engine.clear_blocker("DAILY_LOSS", resolution_evidence_id=bound_evidence(engine, "DAILY_LOSS"), now=NOW)
     assert engine.occupancy().system_state == SystemState.FAULT
 
 
@@ -127,7 +132,7 @@ def test_exit_allowed_when_paused_or_model_fails_but_cannot_flip(tmp_path) -> No
 def test_recovery_cas_fails_after_new_blocker(tmp_path) -> None:
     engine = make_engine(tmp_path)
     engine.add_blocker("DAILY_LOSS", SystemState.PAUSED, now=NOW)
-    engine.clear_blocker("DAILY_LOSS", resolution_evidence_id="ev-daily", now=NOW)
+    engine.clear_blocker("DAILY_LOSS", resolution_evidence_id=bound_evidence(engine, "DAILY_LOSS"), now=NOW)
     snap = engine.create_recovery_snapshot(now=NOW)
     approval = engine.approve_recovery(snap, approved_by="owner", now=NOW)
     engine.add_blocker("UNKNOWN_ORDER", SystemState.PAUSED, now=NOW)

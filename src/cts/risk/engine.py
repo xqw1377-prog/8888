@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional, Sequence
 from uuid import uuid4
 
+from cts.checksum import sha256_hex
 from cts.clock import utc_now
 from cts.errors import (
     ConflictError,
@@ -29,6 +30,7 @@ from cts.risk.models import (
     ParameterBundle,
     PositionOccupancy,
     RecoveryAttempt,
+    RECOVERY_FRESHNESS_TTL,
     RecoverySnapshot,
     Reservation,
     ReservationStatus,
@@ -45,6 +47,11 @@ class _RecoveryAbort(Exception):
     def __init__(self, reason_code: str, message: str) -> None:
         super().__init__(message)
         self.reason_code = reason_code
+
+
+def _within_freshness(origin: datetime, now: datetime) -> bool:
+    age = now - origin
+    return timedelta(0) <= age <= RECOVERY_FRESHNESS_TTL
 
 
 class RiskEngine:
@@ -208,22 +215,83 @@ class RiskEngine:
         now: Optional[datetime] = None,
     ) -> SystemState:
         ts = now or utc_now()
-        if not resolution_evidence_id.strip():
+        evidence_id = resolution_evidence_id.strip()
+        if not evidence_id:
             raise NewRiskBlockedError("清除阻断必须提供解决证据", reason_code="RESOLUTION_EVIDENCE_REQUIRED")
         with self.store.txn() as conn:
             active = [b for b in self.store.active_blockers(conn, self.account_id) if b.reason_code == reason_code]
             if active and active[0].severity == SystemState.FAULT:
                 raise NewRiskBlockedError("FAULT 不能通过清除阻断直接解除", reason_code="FAULT_REQUIRES_INVESTIGATION")
-            self.store._clear_blocker(conn, self.account_id, reason_code, ts, resolution_evidence_id.strip())
+            self._require_resolution_evidence(conn, reason_code, evidence_id, ts)
+            cleared = self.store._clear_blocker(conn, self.account_id, reason_code, ts, evidence_id)
+            if cleared:
+                self.store._consume_evidence(conn, evidence_id, ts)
             state = self.store._recompute_state(conn, self.account_id)
             self.store._trace(
                 conn,
                 self.account_id,
                 ts,
                 "CLEAR_BLOCKER",
-                {"reason_code": reason_code, "state": state.value, "evidence_id": resolution_evidence_id.strip()},
+                {"reason_code": reason_code, "state": state.value, "evidence_id": evidence_id},
             )
             return state
+
+    def register_recovery_approver(self, approver_id: str, *, now: Optional[datetime] = None) -> None:
+        ts = now or utc_now()
+        approver = approver_id.strip()
+        if not approver:
+            raise NewRiskBlockedError("批准人不能为空", reason_code="RECOVERY_APPROVER_UNKNOWN")
+        with self.store.txn() as conn:
+            self.store._register_approver(conn, self.account_id, approver, ts)
+
+    def record_resolution_evidence(
+        self,
+        reason_code: str,
+        *,
+        statement: str,
+        recorded_by: str,
+        now: Optional[datetime] = None,
+    ) -> str:
+        ts = now or utc_now()
+        reason = reason_code.strip()
+        body = statement.strip()
+        recorder = recorded_by.strip()
+        if not reason or not body or not recorder:
+            raise NewRiskBlockedError("解决证据缺少原因、内容或记录人", reason_code="RESOLUTION_EVIDENCE_REQUIRED")
+        evidence_id = sha256_hex(
+            {
+                "account_id": self.account_id,
+                "reason_code": reason,
+                "statement": body,
+                "recorded_by": recorder,
+                "recorded_at": ts.isoformat(),
+            }
+        )
+        with self.store.txn() as conn:
+            if not self.store._approver_exists(conn, self.account_id, recorder):
+                raise NewRiskBlockedError("证据记录人未登记", reason_code="RECOVERY_APPROVER_UNKNOWN")
+            self.store._insert_evidence(
+                conn,
+                evidence_id=evidence_id,
+                account_id=self.account_id,
+                reason_code=reason,
+                statement=body,
+                artifact_hash=evidence_id,
+                recorded_by=recorder,
+                now=ts,
+            )
+            self.store._trace(conn, self.account_id, ts, "RECORD_EVIDENCE", {"reason_code": reason, "evidence_id": evidence_id})
+        return evidence_id
+
+    def _require_resolution_evidence(self, conn, reason_code: str, evidence_id: str, now: datetime) -> None:
+        row = self.store._evidence_row(conn, evidence_id)
+        if row is None or row["account_id"] != self.account_id:
+            raise NewRiskBlockedError("解决证据不存在", reason_code="RESOLUTION_EVIDENCE_INVALID")
+        if row["reason_code"] != reason_code or row["consumed_at"] is not None:
+            raise NewRiskBlockedError("解决证据与当前阻断不匹配或已使用", reason_code="RESOLUTION_EVIDENCE_INVALID")
+        recorded_at = datetime.fromisoformat(row["recorded_at"])
+        if not _within_freshness(recorded_at, now):
+            raise NewRiskBlockedError("解决证据已超过有效期", reason_code="RESOLUTION_EVIDENCE_INVALID")
 
     def reserve(self, requests: Sequence[ReserveRequest], *, now: Optional[datetime] = None) -> list[Reservation]:
         ts = now or utc_now()
@@ -317,8 +385,13 @@ class RiskEngine:
         fill_id = fill_id or uuid4().hex
         with self.store.txn() as conn:
             res = self.store.get_reservation(conn, reservation_id)
-            existed = conn.execute("SELECT qty FROM reservation_fills WHERE fill_id=?", (fill_id,)).fetchone()
+            existed = conn.execute(
+                "SELECT reservation_id, qty FROM reservation_fills WHERE fill_id=?",
+                (fill_id,),
+            ).fetchone()
             if existed:
+                if existed["reservation_id"] != reservation_id:
+                    raise ConflictError(f"fill_id 归属冲突: {fill_id}")
                 if D(existed["qty"]) != fill_qty:
                     raise ConflictError(f"fill_id 异容: {fill_id}")
                 return res
@@ -542,10 +615,16 @@ class RiskEngine:
 
     def approve_recovery(self, snapshot: RecoverySnapshot, *, approved_by: str, now: Optional[datetime] = None) -> str:
         ts = now or utc_now()
-        if not approved_by.strip():
+        approver = approved_by.strip()
+        if not approver:
             raise NewRiskBlockedError("恢复审批缺少批准人", reason_code="RECOVERY_APPROVAL_REQUIRED")
+        if not _within_freshness(snapshot.created_at, ts):
+            raise RecoveryStaleError("恢复快照已超过有效期", reason_code="RECOVERY_APPROVAL_EXPIRED")
         approval_id = uuid4().hex
+        expires_at = ts + RECOVERY_FRESHNESS_TTL
         with self.store.txn() as conn:
+            if not self.store._approver_exists(conn, self.account_id, approver):
+                raise NewRiskBlockedError("批准人未登记", reason_code="RECOVERY_APPROVER_UNKNOWN")
             row = self.store.load_account(conn, self.account_id)
             blockers = self.store.active_blockers(conn, self.account_id)
             if any(b.severity == SystemState.FAULT for b in blockers):
@@ -566,8 +645,8 @@ class RiskEngine:
                 """
                 INSERT INTO recovery_approvals(
                     approval_id, account_id, snapshot_version, blocker_set_version, risk_version,
-                    equity_version, config_hash, blocker_ids, approved_by, created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    equity_version, config_hash, blocker_ids, approved_by, created_at, expires_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     approval_id,
@@ -578,11 +657,12 @@ class RiskEngine:
                     snapshot.equity_version,
                     snapshot.config_hash,
                     ",".join(snapshot.blocker_ids),
-                    approved_by.strip(),
+                    approver,
                     ts.isoformat(),
+                    expires_at.isoformat(),
                 ),
             )
-            self.store._trace(conn, self.account_id, ts, "APPROVE_RECOVERY", {"approval_id": approval_id, "approved_by": approved_by.strip()})
+            self.store._trace(conn, self.account_id, ts, "APPROVE_RECOVERY", {"approval_id": approval_id, "approved_by": approver})
         return approval_id
 
     def apply_recovery(
@@ -598,8 +678,8 @@ class RiskEngine:
             return self._apply_recovery_txn(snapshot, attempt_id, ts, approval_id)
         except _RecoveryAbort as exc:
             self._persist_failed_recovery(attempt_id, snapshot, ts, exc.reason_code)
-            if exc.reason_code == "RECOVERY_SNAPSHOT_STALE":
-                raise RecoveryStaleError(str(exc)) from None
+            if exc.reason_code in {"RECOVERY_SNAPSHOT_STALE", "RECOVERY_APPROVAL_EXPIRED"}:
+                raise RecoveryStaleError(str(exc), reason_code=exc.reason_code) from None
             raise NewRiskBlockedError(str(exc), reason_code=exc.reason_code) from None
 
     def _apply_recovery_txn(
@@ -653,6 +733,9 @@ class RiskEngine:
                 if blockers and not stale:
                     raise _RecoveryAbort("BLOCKER_UNRESOLVED", "活动阻断尚未用解决证据清除，不能恢复")
                 raise _RecoveryAbort("RECOVERY_SNAPSHOT_STALE", "审批快照已失效，恢复失败")
+            expires_at = datetime.fromisoformat(approval["expires_at"])
+            if ts > expires_at or not _within_freshness(snapshot.created_at, ts):
+                raise _RecoveryAbort("RECOVERY_APPROVAL_EXPIRED", "恢复审批已超过有效期")
             conn.execute(
                 "UPDATE account_state SET recovery_in_progress=0, pause_latched=0 WHERE account_id=?",
                 (self.account_id,),

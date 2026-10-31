@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 from typing import Optional
@@ -60,6 +60,9 @@ NEW_RISK_BLOCKING_STATES = {
     SystemState.FAULT,
     SystemState.RECONCILING,
 }
+
+# 试验合同：快照与恢复审批超过该窗口即失效。不是已批准的生产参数。
+RECOVERY_FRESHNESS_TTL = timedelta(hours=24)
 
 
 @dataclass(frozen=True)

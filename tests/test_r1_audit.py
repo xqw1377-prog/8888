@@ -10,14 +10,14 @@ from cts.data.models import DataGrade, MarkSample
 from cts.data.store import DataStore
 from cts.errors import ConflictError, LedgerImbalanceError, NewRiskBlockedError, RecoveryStaleError
 from cts.ledger.journal import Ledger
-from cts.ledger.models import Side
+from cts.ledger.models import LedgerEventType, Side
 from cts.money import D
 from cts.risk.models import SystemState
 from cts.strategy.replay import ReplayConfig, replay_t1
 from cts.strategy.t1 import T1Params, apply_fill_to_state, evaluate_exit, evaluate_signal
 from tests.helpers import ORIGIN, breakout_series, candle, mark, t_close
 from tests.test_ledger import TS, funded
-from tests.test_risk_p004a import NOW, make_engine, req
+from tests.test_risk_p004a import NOW, bound_evidence, make_engine, req
 
 
 def test_close_rejects_without_zeroing_position() -> None:
@@ -153,7 +153,7 @@ def test_fault_recovery_does_not_clear_blockers(tmp_path) -> None:
 def test_stale_recovery_failure_is_persisted(tmp_path) -> None:
     engine = make_engine(tmp_path)
     engine.add_blocker("DAILY_LOSS", SystemState.PAUSED, now=NOW)
-    engine.clear_blocker("DAILY_LOSS", resolution_evidence_id="ev-daily", now=NOW)
+    engine.clear_blocker("DAILY_LOSS", resolution_evidence_id=bound_evidence(engine, "DAILY_LOSS"), now=NOW)
     snap = engine.create_recovery_snapshot(now=NOW)
     approval = engine.approve_recovery(snap, approved_by="owner", now=NOW)
     engine.add_blocker("UNKNOWN_ORDER", SystemState.PAUSED, now=NOW)
@@ -224,7 +224,7 @@ def test_paused_recovery_still_reaches_running(tmp_path) -> None:
     assert err.value.reason_code == "RECOVERY_APPROVAL_REQUIRED"
     assert engine.occupancy().system_state == SystemState.PAUSED
     assert {b.reason_code for b in engine.occupancy().blockers} == {"DAILY_LOSS"}
-    state = engine.clear_blocker("DAILY_LOSS", resolution_evidence_id="ev-daily", now=NOW)
+    state = engine.clear_blocker("DAILY_LOSS", resolution_evidence_id=bound_evidence(engine, "DAILY_LOSS"), now=NOW)
     assert state == SystemState.PAUSED
     assert engine.occupancy().blockers == ()
     snap = engine.create_recovery_snapshot(now=NOW)
@@ -316,6 +316,13 @@ def test_entry_bar_stop_before_close_exits() -> None:
     )
     assert result.fills == 1
     assert result.exits == 1
+    fills = [event for event in ledger.events() if event.event_type == LedgerEventType.FILL]
+    opened = next(event for event in fills if event.metadata.get("note") == "open")
+    closed = next(event for event in fills if event.metadata.get("note") == "reduce")
+    assert opened.event_time == t_close(130)
+    assert opened.event_time < closed.event_time == breach_at
+    assert closed.event_time < t_close(131)
+    assert all(fills[i].event_time <= fills[i + 1].event_time for i in range(len(fills) - 1))
 
 
 def test_mark_is_not_used_before_available_at() -> None:
@@ -358,3 +365,83 @@ def test_trail_uses_close_not_high() -> None:
     updated, _ = evaluate_exit(pos, later, mark_price=signal.close, params=T1Params())
     assert updated.extreme == signal.close
     assert updated.stop == pos.stop
+
+
+def test_unknown_evidence_and_approver_cannot_resume(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    engine.register_recovery_approver("owner", now=NOW)
+    engine.add_blocker("DAILY_LOSS", SystemState.PAUSED, now=NOW)
+    with pytest.raises(NewRiskBlockedError) as missing:
+        engine.clear_blocker("DAILY_LOSS", resolution_evidence_id="does-not-exist", now=NOW)
+    assert missing.value.reason_code == "RESOLUTION_EVIDENCE_INVALID"
+    assert {b.reason_code for b in engine.occupancy().blockers} == {"DAILY_LOSS"}
+    snap = engine.create_recovery_snapshot(now=NOW)
+    with pytest.raises(NewRiskBlockedError) as stranger:
+        engine.approve_recovery(snap, approved_by="stranger", now=NOW)
+    assert stranger.value.reason_code == "RECOVERY_APPROVER_UNKNOWN"
+    assert engine.occupancy().system_state == SystemState.PAUSED
+
+
+def test_recovery_approval_expires_after_100_days(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    engine.add_blocker("DAILY_LOSS", SystemState.PAUSED, now=NOW)
+    engine.clear_blocker("DAILY_LOSS", resolution_evidence_id=bound_evidence(engine, "DAILY_LOSS"), now=NOW)
+    snap = engine.create_recovery_snapshot(now=NOW)
+    approval = engine.approve_recovery(snap, approved_by="owner", now=NOW)
+    later = NOW + timedelta(days=100)
+    with pytest.raises(RecoveryStaleError) as err:
+        engine.apply_recovery(snap, approval_id=approval, now=later)
+    assert err.value.reason_code == "RECOVERY_APPROVAL_EXPIRED"
+    assert engine.occupancy().system_state == SystemState.PAUSED
+
+
+def test_fill_id_cannot_attach_to_another_reservation(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    btc, eth = engine.reserve([req("BTCUSDT", "sig-btc"), req("ETHUSDT", "sig-eth")], now=NOW)
+    qty = btc.qty * D("0.1")
+    engine.apply_fill(btc.reservation_id, qty, fill_id="fill-btc", now=NOW)
+    with pytest.raises(ConflictError):
+        engine.apply_fill(eth.reservation_id, qty, fill_id="fill-btc", now=NOW)
+    reservations = {row.symbol: row for row in engine.occupancy().reservations}
+    assert reservations["BTCUSDT"].filled_qty == qty
+    assert reservations["ETHUSDT"].filled_qty == D("0")
+
+
+def test_late_mark_cannot_backdate_exit() -> None:
+    bars = breakout_series(130)
+    bars.append(candle(132, open_="118.5", high="119", low="117", close="118"))
+    breach_at = t_close(130) + timedelta(hours=1)
+    visible = bars[-1].available_at
+    marks = [mark(i, format(bars[i].close, "f")) for i in range(len(bars) - 1)]
+    marks.append(
+        MarkSample(
+            venue="SIM",
+            symbol="BTCUSDT",
+            event_time=breach_at,
+            received_at=visible,
+            available_at=visible,
+            mark_price=D("110"),
+            index_price=D("110"),
+            source_id="late-backfill",
+        )
+    )
+    ledger = Ledger("acct-backfill")
+    ledger.transfer_in(amount=D("10000"), event_time=ORIGIN, received_at=ORIGIN, external_id="dep")
+    result = replay_t1(
+        ledger=ledger,
+        symbol="BTCUSDT",
+        candles=bars,
+        marks=marks,
+        config=ReplayConfig(params=T1Params()),
+        venue="SIM",
+    )
+    fills = [event for event in ledger.events() if event.event_type == LedgerEventType.FILL]
+    opened = next(event for event in fills if event.metadata.get("note") == "open")
+    closed = next(event for event in fills if event.metadata.get("note") == "reduce")
+    assert result.fills == 1
+    assert result.exits == 1
+    assert opened.event_time == t_close(130)
+    assert closed.event_time >= visible
+    assert closed.event_time > breach_at
+    assert all(fills[i].event_time <= fills[i + 1].event_time for i in range(len(fills) - 1))
+    assert all(event.event_time <= event.received_at for event in fills)

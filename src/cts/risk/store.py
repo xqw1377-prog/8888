@@ -107,7 +107,24 @@ CREATE TABLE IF NOT EXISTS recovery_approvals (
     config_hash TEXT NOT NULL,
     blocker_ids TEXT NOT NULL,
     approved_by TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS resolution_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    statement TEXT NOT NULL,
+    artifact_hash TEXT NOT NULL,
+    recorded_by TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    consumed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS recovery_approvers (
+    account_id TEXT NOT NULL,
+    approver_id TEXT NOT NULL,
+    registered_at TEXT NOT NULL,
+    PRIMARY KEY (account_id, approver_id)
 );
 CREATE TABLE IF NOT EXISTS recovery_attempts (
     attempt_id TEXT PRIMARY KEY,
@@ -347,6 +364,52 @@ class RiskStore:
             (account_id,),
         )
         return bid
+
+    def _register_approver(self, conn: sqlite3.Connection, account_id: str, approver_id: str, now: datetime) -> None:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO recovery_approvers(account_id, approver_id, registered_at)
+            VALUES (?,?,?)
+            """,
+            (account_id, approver_id, _iso(now)),
+        )
+
+    def _approver_exists(self, conn: sqlite3.Connection, account_id: str, approver_id: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM recovery_approvers WHERE account_id=? AND approver_id=?",
+            (account_id, approver_id),
+        ).fetchone()
+        return row is not None
+
+    def _insert_evidence(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        evidence_id: str,
+        account_id: str,
+        reason_code: str,
+        statement: str,
+        artifact_hash: str,
+        recorded_by: str,
+        now: datetime,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO resolution_evidence(
+                evidence_id, account_id, reason_code, statement, artifact_hash, recorded_by, recorded_at
+            ) VALUES (?,?,?,?,?,?,?)
+            """,
+            (evidence_id, account_id, reason_code, statement, artifact_hash, recorded_by, _iso(now)),
+        )
+
+    def _evidence_row(self, conn: sqlite3.Connection, evidence_id: str):
+        return conn.execute("SELECT * FROM resolution_evidence WHERE evidence_id=?", (evidence_id,)).fetchone()
+
+    def _consume_evidence(self, conn: sqlite3.Connection, evidence_id: str, now: datetime) -> None:
+        conn.execute(
+            "UPDATE resolution_evidence SET consumed_at=? WHERE evidence_id=? AND consumed_at IS NULL",
+            (_iso(now), evidence_id),
+        )
 
     def _clear_blocker(
         self,

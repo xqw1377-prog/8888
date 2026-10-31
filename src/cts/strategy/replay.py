@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional, Sequence
 
+from cts.clock import UTC
 from cts.data.models import Candle, MarkSample
+from cts.errors import LookaheadError, UnitValidationError
 from cts.ledger.journal import Ledger
 from cts.ledger.models import Side
 from cts.money import D
@@ -43,6 +45,28 @@ class ReplayResult:
     fills: int
     exits: int
     skipped_no_fill: int
+
+
+def bar_open_time(bar: Candle) -> datetime:
+    spec = bar.interval.strip().lower()
+    if len(spec) < 2 or not spec[:-1].isdigit():
+        raise UnitValidationError(f"无法解析 K 线周期: {bar.interval}")
+    count = int(spec[:-1])
+    unit = spec[-1]
+    if unit == "h":
+        delta = timedelta(hours=count)
+    elif unit == "m":
+        delta = timedelta(minutes=count)
+    elif unit == "d":
+        delta = timedelta(days=count)
+    else:
+        raise UnitValidationError(f"无法解析 K 线周期: {bar.interval}")
+    return bar.event_time - delta
+
+
+def executable_time(entry_time: datetime, available_at: datetime) -> datetime:
+    """成交只能记在开仓之后，且不能早于触发数据的 available_at。"""
+    return max(entry_time, available_at)
 
 
 def _mark_key(mk: MarkSample) -> tuple:
@@ -92,18 +116,39 @@ def replay_t1(
     exits = 0
     skipped = 0
     consumed_marks: set[tuple] = set()
+    prior = ledger.events()
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    last_event_time = max((event.event_time for event in prior), default=epoch)
+    last_received = max((event.received_at for event in prior), default=epoch)
+
+    def stamp(when: datetime) -> datetime:
+        nonlocal last_event_time
+        if when < last_event_time:
+            raise LookaheadError(f"回放成交时间倒序: {when.isoformat()} < {last_event_time.isoformat()}")
+        last_event_time = when
+        return when
+
+    def observe(when: datetime) -> datetime:
+        nonlocal last_received
+        seen = when if when >= last_received else last_received
+        if seen < last_event_time:
+            seen = last_event_time
+        last_received = seen
+        return seen
 
     def book_stop(held: OpenPosition, breached: MarkSample) -> None:
         nonlocal exits, last_exit, position, pending
+        booked = stamp(executable_time(held.entry_event_time, breached.available_at))
+        seen = observe(booked)
         ledger.apply_fill(
             symbol=symbol,
             side=Side.LONG if held.side == Side.SHORT else Side.SHORT,
             qty=held.qty,
             price=breached.mark_price,
             multiplier=config.multiplier,
-            event_time=breached.event_time,
-            received_at=breached.available_at,
-            external_id=f"exit:{symbol}:{breached.event_time.isoformat()}:STOP",
+            event_time=booked,
+            received_at=seen,
+            external_id=f"exit:{symbol}:{booked.isoformat()}:STOP:{breached.source_id}",
             venue=venue,
             venue_trade_id=f"exit-{fills}-{exits}",
             reduce_only=True,
@@ -111,13 +156,13 @@ def replay_t1(
         notional = held.qty * breached.mark_price * config.multiplier
         ledger.post_fee(
             amount=notional * config.fee_rate,
-            event_time=breached.event_time,
-            received_at=breached.available_at,
-            external_id=f"fee-exit:{symbol}:{breached.event_time.isoformat()}",
+            event_time=booked,
+            received_at=seen,
+            external_id=f"fee-exit:{symbol}:{booked.isoformat()}:{breached.source_id}",
             venue=venue,
             symbol=symbol,
         )
-        last_exit = breached.event_time
+        last_exit = booked
         position = None
         pending = None
         exits += 1
@@ -133,29 +178,32 @@ def replay_t1(
         if position is not None and m is not None:
             position, decision = evaluate_exit(position, hist, mark_price=m, params=config.params)
             if decision is not None:
+                booked = stamp(executable_time(position.entry_event_time, bar.available_at))
+                seen = observe(booked)
+                exit_price = m if decision.reason == "STOP" else bar.close
                 ledger.apply_fill(
                     symbol=symbol,
                     side=Side.LONG if position.side == Side.SHORT else Side.SHORT,
                     qty=position.qty,
-                    price=m if decision.reason == "STOP" else (bar.close),
+                    price=exit_price,
                     multiplier=config.multiplier,
-                    event_time=bar.event_time,
-                    received_at=bar.available_at,
-                    external_id=f"exit:{symbol}:{bar.event_time.isoformat()}:{decision.reason}",
+                    event_time=booked,
+                    received_at=seen,
+                    external_id=f"exit:{symbol}:{booked.isoformat()}:{decision.reason}",
                     venue=venue,
                     venue_trade_id=f"exit-{fills}-{exits}",
                     reduce_only=True,
                 )
-                notional = position.qty * (m if decision.reason == "STOP" else bar.close) * config.multiplier
+                notional = position.qty * exit_price * config.multiplier
                 ledger.post_fee(
                     amount=notional * config.fee_rate,
-                    event_time=bar.event_time,
-                    received_at=bar.available_at,
-                    external_id=f"fee-exit:{symbol}:{bar.event_time.isoformat()}",
+                    event_time=booked,
+                    received_at=seen,
+                    external_id=f"fee-exit:{symbol}:{booked.isoformat()}",
                     venue=venue,
                     symbol=symbol,
                 )
-                last_exit = bar.event_time
+                last_exit = booked
                 position = None
                 pending = None
                 exits += 1
@@ -186,14 +234,16 @@ def replay_t1(
                     skipped += 1
                     pending = None
                 else:
+                    opened = stamp(bar_open_time(bar))
+                    observed = observe(bar.available_at)
                     ledger.apply_fill(
                         symbol=symbol,
                         side=pending.side,
                         qty=sized.qty,
                         price=fill_px,
                         multiplier=config.multiplier,
-                        event_time=bar.event_time,
-                        received_at=bar.available_at,
+                        event_time=opened,
+                        received_at=observed,
                         external_id=f"entry:{symbol}:{pending.event_time.isoformat()}",
                         venue=venue,
                         venue_trade_id=f"entry-{fills}",
@@ -201,20 +251,26 @@ def replay_t1(
                     ledger.lock_margin(
                         amount=sized.notional / config.leverage,
                         symbol=symbol,
-                        event_time=bar.event_time,
-                        received_at=bar.available_at,
+                        event_time=opened,
+                        received_at=observed,
                         external_id=f"im:{symbol}:{pending.event_time.isoformat()}",
                         venue=venue,
                     )
                     ledger.post_fee(
                         amount=sized.notional * config.fee_rate,
-                        event_time=bar.event_time,
-                        received_at=bar.available_at,
+                        event_time=opened,
+                        received_at=observed,
                         external_id=f"fee-entry:{symbol}:{pending.event_time.isoformat()}",
                         venue=venue,
                         symbol=symbol,
                     )
-                    position = apply_fill_to_state(signal=pending, fill_price=fill_px, qty=sized.qty, params=config.params)
+                    position = apply_fill_to_state(
+                        signal=pending,
+                        fill_price=fill_px,
+                        qty=sized.qty,
+                        params=config.params,
+                        entry_time=opened,
+                    )
                     fills += 1
                     pending = None
                     breached = next_available_stop(position, marks, consumed_marks, bar.available_at)
