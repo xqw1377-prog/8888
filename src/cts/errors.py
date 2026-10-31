@@ -38,3 +38,19 @@ class RiskLimitError(CtsError):
 
 class SnapshotInconsistentError(CtsError):
     reason_code = "SNAPSHOT_INCONSISTENT"
+
+
+class RecoveryStaleError(CtsError):
+    reason_code = "RECOVERY_SNAPSHOT_STALE"
+
+
+class ParameterAdmissionError(CtsError):
+    reason_code = "PARAM_NOT_APPROVED"
+
+
+class ExitRejectedError(CtsError):
+    reason_code = "EXIT_REJECTED"
+
+
+class NewRiskBlockedError(CtsError):
+    reason_code = "NEW_RISK_BLOCKED"
