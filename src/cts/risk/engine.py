@@ -396,6 +396,38 @@ class RiskEngine:
             )
             return created
 
+    def admit_live_open(
+        self,
+        reservation_id: str,
+        *,
+        symbol: str,
+        side: Side,
+        qty: Decimal,
+        notional: Decimal,
+    ) -> Reservation:
+        """开仓的唯一风险准入。暂停、故障或没有仍有效的预留时拒绝。"""
+        qty = D(qty)
+        notional = D(notional)
+        with self.store.txn() as conn:
+            view = self._view(conn)
+            row = self.store.load_account(conn, self.account_id)
+            bundle = self.store.load_bundle(row)
+            mode = RuntimeMode(row["mode"])
+            self._admit_new_risk(view, bundle, mode)
+            try:
+                reservation = self.store.get_reservation(conn, reservation_id)
+            except KeyError as exc:
+                raise NewRiskBlockedError("没有有效风险批准", reason_code="NEW_RISK_BLOCKED") from exc
+            if reservation.account_id != self.account_id:
+                raise NewRiskBlockedError("风险批准不属于该账户", reason_code="NEW_RISK_BLOCKED")
+            if reservation.status not in (ReservationStatus.PENDING, ReservationStatus.PARTIAL):
+                raise NewRiskBlockedError("风险批准已失效", reason_code="NEW_RISK_BLOCKED")
+            if reservation.symbol != symbol or reservation.side != side:
+                raise NewRiskBlockedError("风险批准与订单不一致", reason_code="NEW_RISK_BLOCKED")
+            if qty > reservation.unfilled_qty or notional > reservation.pending_notional:
+                raise RiskLimitError("订单超出已批准的风险预留")
+            return reservation
+
     def apply_fill(
         self,
         reservation_id: str,

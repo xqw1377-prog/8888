@@ -1,6 +1,7 @@
-"""实盘通道。默认适配器仍拒绝；授权会话只在限额和账户模式通过后签名。"""
+"""实盘通道。S1-A：不该发的请求不能到达传输层。签名只出现在已准入的模拟盘开仓。"""
 
 from datetime import datetime, timedelta, timezone
+import threading
 
 import pytest
 
@@ -8,31 +9,39 @@ from cts import LIVE_TRADING_AUTHORIZATION
 from cts.errors import CtsError
 from cts.execution.live import (
     LIVE_GRANT_STATEMENT,
-    MAINNET_BASE,
     TESTNET_BASE,
     LiveExchangeAdapter,
     LiveGrant,
     LiveSession,
+    TransportResult,
     VenueCredentials,
+    open_testnet_transport,
 )
 from cts.ledger.models import Side
 from cts.money import D
+from cts.risk.models import SystemState
+from tests.test_risk_p004a import make_engine, req
 
 
 NOW = datetime(2026, 10, 31, 12, tzinfo=timezone.utc)
 SECRET = "test-secret-not-a-credential"
 
 
-class RecordingTransport:
+class RecordingOpener:
     def __init__(self, responses: list) -> None:
         self.responses = list(responses)
-        self.calls: list[tuple[str, str, str, dict[str, str]]] = []
+        self.calls: list[tuple[str, str, dict[str, str]]] = []
 
-    def __call__(self, method: str, path: str, query: str, headers: dict[str, str]):
-        self.calls.append((method, path, query, headers))
+    def __call__(self, method: str, url: str, headers: dict[str, str]):
+        self.calls.append((method, url, headers))
         if not self.responses:
             raise AssertionError("unexpected request")
         return self.responses.pop(0)
+
+
+def transport(responses: list) -> tuple[RecordingOpener, object]:
+    opener = RecordingOpener(responses)
+    return opener, open_testnet_transport(opener)
 
 
 def grant(**overrides) -> LiveGrant:
@@ -54,7 +63,7 @@ def healthy(symbol: str = "BTCUSDT") -> list:
         {"dualSidePosition": False},
         {"multiAssetsMargin": False},
         [{"symbol": symbol, "marginType": "isolated"}],
-        {"orderId": 1, "status": "NEW", "clientOrderId": "cid-1"},
+        {"orderId": 1, "status": "NEW", "executedQty": "0"},
     ]
 
 
@@ -68,90 +77,529 @@ def test_default_adapter_still_refuses_without_a_request() -> None:
 
 
 def test_missing_or_expired_grant_does_not_touch_the_transport() -> None:
-    transport = RecordingTransport(healthy())
+    opener, pinned = transport(healthy())
     credentials = VenueCredentials("key-id", SECRET)
     with pytest.raises(CtsError) as missing:
-        LiveSession(grant(statement="请下单"), credentials, transport, now=NOW)
+        LiveSession(grant(statement="请下单"), credentials, pinned, now=NOW)
     assert missing.value.reason_code == "LIVE_TRADING_HOLD"
     with pytest.raises(CtsError) as expired:
-        LiveSession(grant(expires_at=NOW - timedelta(seconds=1)), credentials, transport, now=NOW)
+        LiveSession(grant(expires_at=NOW - timedelta(seconds=1)), credentials, pinned, now=NOW)
     assert expired.value.reason_code == "LIVE_GRANT_EXPIRED"
-    assert transport.calls == []
+    assert opener.calls == []
 
 
-def test_cross_margin_account_blocks_before_the_order() -> None:
-    transport = RecordingTransport(
+def test_mainnet_grant_produces_no_write_request() -> None:
+    opener, pinned = transport(healthy())
+    with pytest.raises(CtsError) as err:
+        LiveSession(grant(network="MAINNET"), VenueCredentials("key-id", SECRET), pinned, now=NOW)
+    assert err.value.reason_code == "LIVE_VENUE_UNVERIFIED"
+    assert opener.calls == []
+    with pytest.raises(CtsError) as unbound:
+        from cts.execution.live import urllib_transport
+
+        urllib_transport("https://fapi.binance.com")
+    assert unbound.value.reason_code == "LIVE_VENUE_UNVERIFIED"
+
+
+def test_testnet_rejects_a_transport_that_is_not_bound_to_the_demo_host() -> None:
+    calls: list = []
+
+    class Foreign:
+        base_url = "https://fapi.binance.com"
+
+        def __call__(self, method: str, path: str, query: str, headers: dict[str, str]):
+            calls.append(path)
+
+    with pytest.raises(CtsError) as err:
+        LiveSession(grant(network="TESTNET"), VenueCredentials("key-id", SECRET), Foreign(), now=NOW)
+    assert err.value.reason_code == "LIVE_VENUE_UNVERIFIED"
+    assert calls == []
+
+
+def test_redirect_is_not_followed(tmp_path) -> None:
+    engine, reservation, session, opener = admitted(tmp_path, [])
+
+    def redirect(method: str, url: str, headers: dict[str, str]):
+        opener.calls.append((method, url, headers))
+        return TransportResult(status=302, location="https://fapi.binance.com/fapi/v1/order")
+
+    session._transport = open_testnet_transport(redirect)
+    with pytest.raises(CtsError) as err:
+        submit(session, engine, reservation.reservation_id)
+    assert err.value.reason_code == "LIVE_VENUE_UNVERIFIED"
+    assert len(opener.calls) == 1
+    host = opener.calls[0][1].split("/", 3)[2]
+    assert host == "demo-fapi.binance.com"
+    assert "/fapi/v1/order" not in opener.calls[0][1]
+
+
+def test_claimed_notional_must_match_qty_price_and_contract_unit(tmp_path) -> None:
+    engine, reservation, session, opener = admitted(tmp_path, healthy())
+    with pytest.raises(CtsError) as mismatch:
+        submit(session, engine, reservation.reservation_id, qty=D("10000"), price=D("100"), notional=D("1"))
+    assert mismatch.value.reason_code == "UNIT_INVALID"
+    with pytest.raises(CtsError) as unit:
+        submit(
+            session,
+            engine,
+            reservation.reservation_id,
+            qty=D("1"),
+            price=D("50"),
+            notional=D("50"),
+            contract_unit=D("2"),
+        )
+    assert unit.value.reason_code == "UNIT_INVALID"
+    assert opener.calls == []
+
+
+def test_cumulative_budget_approves_at_most_one_of_two_sixties(tmp_path) -> None:
+    engine = make_engine(tmp_path, equity="100000")
+    first = engine.reserve([req("BTCUSDT", "s-budget-btc")], now=NOW)[0]
+    second = engine.reserve([req("ETHUSDT", "s-budget-eth")], now=NOW)[0]
+    opener, pinned = transport(healthy() + healthy())
+    session = LiveSession(
+        grant(network="TESTNET", account_id=engine.account_id, max_notional=D("100")),
+        VenueCredentials("key-id", SECRET),
+        pinned,
+        now=NOW,
+    )
+    submit(session, engine, first.reservation_id, symbol="BTCUSDT", qty=D("0.6"), price=D("100"), notional=D("60"), client_order_id="cid-btc")
+    with pytest.raises(CtsError) as err:
+        submit(session, engine, second.reservation_id, symbol="ETHUSDT", qty=D("0.6"), price=D("100"), notional=D("60"), client_order_id="cid-eth")
+    assert err.value.reason_code == "RISK_LIMIT"
+    posts = [call for call in opener.calls if "/fapi/v1/order" in call[1] and call[0] == "POST"]
+    assert len(posts) == 1
+
+    engine_b = make_engine(tmp_path / "concurrent.db", equity="100000")
+    left = engine_b.reserve([req("BTCUSDT", "s-race-btc")], now=NOW)[0]
+    right = engine_b.reserve([req("ETHUSDT", "s-race-eth")], now=NOW)[0]
+    both = [
+        {"dualSidePosition": False},
+        {"multiAssetsMargin": False},
+        [
+            {"symbol": "BTCUSDT", "marginType": "isolated"},
+            {"symbol": "ETHUSDT", "marginType": "isolated"},
+        ],
+        {"orderId": 1, "status": "NEW", "executedQty": "0"},
+    ]
+    opener_b, pinned_b = transport(both + both)
+    raced = LiveSession(
+        grant(network="TESTNET", account_id=engine_b.account_id, max_notional=D("100")),
+        VenueCredentials("key-id", SECRET),
+        pinned_b,
+        now=NOW,
+    )
+    barrier = threading.Barrier(2)
+    errors: list[str] = []
+
+    def race(reservation_id: str, symbol: str, client_order_id: str) -> None:
+        barrier.wait()
+        try:
+            submit(
+                raced,
+                engine_b,
+                reservation_id,
+                symbol=symbol,
+                qty=D("0.6"),
+                price=D("100"),
+                notional=D("60"),
+                client_order_id=client_order_id,
+            )
+        except CtsError as exc:
+            errors.append(exc.reason_code)
+
+    threads = [
+        threading.Thread(target=race, args=(left.reservation_id, "BTCUSDT", "cid-left")),
+        threading.Thread(target=race, args=(right.reservation_id, "ETHUSDT", "cid-right")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    posts = [call for call in opener_b.calls if call[0] == "POST" and "/fapi/v1/order" in call[1]]
+    assert posts and len(posts) == 1
+    assert errors == ["RISK_LIMIT"]
+
+
+def test_invalid_order_fields_never_reach_the_transport(tmp_path) -> None:
+    engine, reservation, session, opener = admitted(tmp_path, healthy())
+    samples = [
+        {"qty": D("NaN")},
+        {"qty": D("Infinity")},
+        {"qty": D("0")},
+        {"qty": D("-1")},
+        {"price": D("0")},
+        {"side": "BUY"},
+        {"client_order_id": "  "},
+    ]
+    for sample in samples:
+        with pytest.raises(CtsError) as err:
+            submit(session, engine, reservation.reservation_id, **sample)
+        assert err.value.reason_code == "UNIT_INVALID"
+    assert opener.calls == []
+
+
+def test_missing_account_mode_fields_stop_before_the_order(tmp_path) -> None:
+    cases = [
+        [{}],
+        [{"dualSidePosition": False}, {}],
+        [{"dualSidePosition": False}, {"multiAssetsMargin": False}, [{"symbol": "BTCUSDT"}]],
+    ]
+    for responses in cases:
+        engine, reservation, session, opener = admitted(tmp_path / str(len(responses)), responses)
+        with pytest.raises(CtsError) as err:
+            submit(session, engine, reservation.reservation_id)
+        assert err.value.reason_code == "ACCOUNT_MODE_DRIFT"
+        assert not any(call[0] == "POST" for call in opener.calls)
+
+
+def test_pause_fault_or_missing_approval_cannot_open(tmp_path) -> None:
+    engine, reservation, session, opener = admitted(tmp_path / "pause.db", healthy())
+    engine.add_blocker("MANUAL_PAUSE", SystemState.PAUSED, "暂停", now=NOW)
+    with pytest.raises(CtsError) as paused:
+        submit(session, engine, reservation.reservation_id)
+    assert paused.value.reason_code == "MANUAL_PAUSE"
+    assert opener.calls == []
+
+    faulted, fault_reservation, fault_session, fault_opener = admitted(tmp_path / "fault.db", healthy())
+    faulted.add_blocker("FAULT_REQUIRES_INVESTIGATION", SystemState.FAULT, "故障", now=NOW)
+    with pytest.raises(CtsError) as fault:
+        submit(fault_session, faulted, fault_reservation.reservation_id)
+    assert fault.value.reason_code == "FAULT_REQUIRES_INVESTIGATION"
+    assert fault_opener.calls == []
+
+    bare, _, bare_session, bare_opener = admitted(tmp_path / "bare.db", healthy())
+    with pytest.raises(CtsError) as missing:
+        submit(bare_session, bare, "missing-approval")
+    assert missing.value.reason_code == "NEW_RISK_BLOCKED"
+    assert bare_opener.calls == []
+
+    class PretendRisk:
+        account_id = bare.account_id
+
+        def admit_live_open(self, *args, **kwargs):
+            return None
+
+    with pytest.raises(CtsError) as pretend:
+        submit(bare_session, PretendRisk(), reservation.reservation_id)
+    assert pretend.value.reason_code == "NEW_RISK_BLOCKED"
+    assert bare_opener.calls == []
+
+
+def test_cross_margin_account_blocks_before_the_order(tmp_path) -> None:
+    engine, reservation, session, opener = admitted(
+        tmp_path,
         [
             {"dualSidePosition": False},
             {"multiAssetsMargin": False},
             [{"symbol": "BTCUSDT", "marginType": "cross"}],
-        ]
+        ],
     )
-    session = LiveSession(grant(), VenueCredentials("key-id", SECRET), transport, now=NOW)
     with pytest.raises(CtsError) as err:
-        session.submit(
-            symbol="BTCUSDT",
-            side=Side.LONG,
-            qty=D("0.01"),
-            price=D("100"),
-            client_order_id="cid-1",
-            notional=D("1"),
-            now=NOW,
-        )
+        submit(session, engine, reservation.reservation_id)
     assert err.value.reason_code == "ACCOUNT_MODE_DRIFT"
     assert session.orders_sent == 0
-    assert [call[1] for call in transport.calls] == [
+    assert [call[1].split("?", 1)[0].removeprefix(TESTNET_BASE) for call in opener.calls] == [
         "/fapi/v1/positionSide/dual",
         "/fapi/v1/multiAssetsMargin",
         "/fapi/v2/positionRisk",
     ]
 
 
-def test_authorized_limit_order_is_signed_without_exposing_the_secret() -> None:
-    transport = RecordingTransport(healthy())
-    session = LiveSession(grant(), VenueCredentials("key-id", SECRET), transport, now=NOW)
-    assert session.base_url == MAINNET_BASE
-    demo = LiveSession(grant(network="TESTNET"), VenueCredentials("key-id", SECRET), RecordingTransport(healthy()), now=NOW)
-    assert demo.base_url == TESTNET_BASE
-    assert demo.base_url == "https://demo-fapi.binance.com"
+def test_admitted_demo_limit_order_is_signed_without_exposing_the_secret(tmp_path) -> None:
+    engine, reservation, session, opener = admitted(tmp_path, healthy())
+    assert session.base_url == TESTNET_BASE
     assert SECRET not in repr(session)
-    body = session.submit(
-        symbol="BTCUSDT",
-        side=Side.LONG,
-        qty=D("0.01"),
-        price=D("100"),
-        client_order_id="cid-1",
-        notional=D("1"),
-        now=NOW,
-    )
+    body = submit(session, engine, reservation.reservation_id)
     assert body["status"] == "NEW"
     assert session.orders_sent == 1
-    method, path, query, headers = transport.calls[-1]
+    method, url, headers = opener.calls[-1]
     assert method == "POST"
-    assert path == "/fapi/v1/order"
-    assert "symbol=BTCUSDT" in query
-    assert "reduceOnly=false" in query
-    assert "signature=" in query
-    assert SECRET not in query
+    assert url.startswith(f"{TESTNET_BASE}/fapi/v1/order?")
+    assert "symbol=BTCUSDT" in url
+    assert "reduceOnly=false" in url
+    assert "signature=" in url
+    assert SECRET not in url
     assert headers["X-MBX-APIKEY"] == "key-id"
     assert SECRET not in headers["X-MBX-APIKEY"]
+    assert all(call[1].startswith(TESTNET_BASE) for call in opener.calls)
 
 
-def test_notional_above_the_grant_is_refused_before_preflight() -> None:
-    transport = RecordingTransport(healthy())
-    session = LiveSession(grant(max_notional=D("10")), VenueCredentials("key-id", SECRET), transport, now=NOW)
+def test_notional_above_the_grant_is_refused_before_preflight(tmp_path) -> None:
+    engine, reservation, session, opener = admitted(tmp_path, healthy(), max_notional=D("10"))
     with pytest.raises(CtsError) as err:
-        session.submit(
-            symbol="BTCUSDT",
-            side=Side.LONG,
-            qty=D("1"),
-            price=D("100"),
-            client_order_id="cid-1",
-            notional=D("100"),
-            now=NOW,
-        )
+        submit(session, engine, reservation.reservation_id, qty=D("1"), price=D("100"), notional=D("100"))
     assert err.value.reason_code == "RISK_LIMIT"
-    assert transport.calls == []
+    assert opener.calls == []
+
+
+def test_unknown_order_id_does_not_reach_the_transport(tmp_path) -> None:
+    _, _, session, opener = admitted(tmp_path, healthy())
+    with pytest.raises(CtsError) as query:
+        session.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    with pytest.raises(CtsError) as cancel:
+        session.cancel(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert query.value.reason_code == "RECONCILIATION_FAILED"
+    assert cancel.value.reason_code == "RECONCILIATION_FAILED"
+    assert opener.calls == []
+
+
+def test_order_intent_is_stored_before_the_post(tmp_path) -> None:
+    from cts.execution.orders import OrderStore
+
+    path = tmp_path / "orders.db"
+    engine = make_engine(tmp_path / "risk.db", equity="100000")
+    reservation = engine.reserve([req("BTCUSDT", "s-intent")], now=NOW)[0]
+    seen: list[tuple[str, str, bool]] = []
+    responses = healthy()
+
+    def opener(method: str, url: str, headers: dict[str, str]):
+        order = OrderStore(str(path)).get("cid-1")
+        assert order is not None
+        seen.append((method, order.status, order.dispatch_started))
+        if not responses:
+            raise AssertionError("unexpected request")
+        return responses.pop(0)
+
+    session = LiveSession(
+        grant(network="TESTNET", account_id=engine.account_id, max_notional=D("100")),
+        VenueCredentials("key-id", SECRET),
+        open_testnet_transport(opener),
+        now=NOW,
+        path=str(path),
+    )
+    body = submit(session, engine, reservation.reservation_id)
+    assert body["status"] == "NEW"
+    assert seen[0] == ("GET", "INTENT", False)
+    assert seen[-1][0] == "POST" and seen[-1][1:] == ("INTENT", True)
+    assert session.get_order("cid-1").status == "NEW"
+    again = submit(session, engine, reservation.reservation_id)
+    assert again["status"] == "NEW"
+    assert [row[0] for row in seen].count("POST") == 1
+    with pytest.raises(CtsError) as changed:
+        submit(session, engine, reservation.reservation_id, qty=D("0.02"), price=D("100"), notional=D("2"), client_order_id="cid-1")
+    assert changed.value.reason_code == "IDEMPOTENCY_CONFLICT"
+
+
+def test_lost_submit_response_keeps_the_budget_until_query(tmp_path) -> None:
+    path = tmp_path / "orders.db"
+    engine = make_engine(tmp_path / "risk.db", equity="100000")
+    reservation = engine.reserve([req("BTCUSDT", "s-unknown")], now=NOW)[0]
+    other = engine.reserve([req("ETHUSDT", "s-blocked")], now=NOW)[0]
+    calls: list[str] = []
+    preflight = healthy()[:3]
+
+    def opener(method: str, url: str, headers: dict[str, str]):
+        calls.append(method)
+        if method == "POST":
+            raise TimeoutError("response lost")
+        return preflight.pop(0)
+
+    session = LiveSession(
+        grant(network="TESTNET", account_id=engine.account_id, max_notional=D("100")),
+        VenueCredentials("key-id", SECRET),
+        open_testnet_transport(opener),
+        now=NOW,
+        path=str(path),
+    )
+    with pytest.raises(CtsError) as lost:
+        submit(session, engine, reservation.reservation_id, qty=D("0.6"), price=D("100"), notional=D("60"))
+    assert lost.value.reason_code == "UNKNOWN_ORDER"
+    assert session.orders_sent == 0
+    assert session.reserved_notional == D("60")
+    assert session.get_order("cid-1").status == "UNKNOWN"
+    with pytest.raises(CtsError) as blocked:
+        submit(
+            session,
+            engine,
+            other.reservation_id,
+            symbol="ETHUSDT",
+            qty=D("0.1"),
+            price=D("100"),
+            notional=D("10"),
+            client_order_id="cid-2",
+        )
+    assert blocked.value.reason_code == "UNKNOWN_ORDER"
+    assert calls.count("POST") == 1
+
+    restored = LiveSession(
+        grant(network="TESTNET", account_id=engine.account_id, max_notional=D("100")),
+        VenueCredentials("key-id", SECRET),
+        open_testnet_transport(opener),
+        now=NOW,
+        path=str(path),
+    )
+    assert restored.get_order("cid-1").status == "UNKNOWN"
+    assert restored.reserved_notional == D("60")
+
+    def reconcile(method: str, url: str, headers: dict[str, str]):
+        calls.append(method + ":reconcile")
+        return {"status": "NEW", "executedQty": "0", "origQty": "0.6", "clientOrderId": "cid-1"}
+
+    restored._transport = open_testnet_transport(reconcile)
+    body = restored.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert body["status"] == "NEW"
+    assert restored.get_order("cid-1").status == "NEW"
+    assert restored.reserved_notional == D("60")
+
+
+def test_partial_fill_releases_only_the_unfilled_notional(tmp_path) -> None:
+    path = tmp_path / "orders.db"
+    engine = make_engine(tmp_path / "risk.db", equity="100000")
+    first = engine.reserve([req("BTCUSDT", "s-partial")], now=NOW)[0]
+    second = engine.reserve([req("ETHUSDT", "s-next")], now=NOW)[0]
+    script = healthy() + [
+        {"status": "PARTIALLY_FILLED", "executedQty": "0.2", "origQty": "0.6", "clientOrderId": "cid-1"},
+        {"status": "CANCELED", "executedQty": "0.2", "origQty": "0.6", "clientOrderId": "cid-1"},
+    ] + [
+        {"dualSidePosition": False},
+        {"multiAssetsMargin": False},
+        [
+            {"symbol": "BTCUSDT", "marginType": "isolated"},
+            {"symbol": "ETHUSDT", "marginType": "isolated"},
+        ],
+        {"status": "NEW", "executedQty": "0", "origQty": "0.6", "clientOrderId": "cid-2"},
+    ]
+    opener, pinned = transport(script)
+    session = LiveSession(
+        grant(network="TESTNET", account_id=engine.account_id, max_notional=D("100")),
+        VenueCredentials("key-id", SECRET),
+        pinned,
+        now=NOW,
+        path=str(path),
+    )
+    submit(session, engine, first.reservation_id, qty=D("0.6"), price=D("100"), notional=D("60"))
+    session.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert session.get_order("cid-1").executed_qty == D("0.2")
+    assert session.reserved_notional == D("60")
+    session.cancel(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert session.get_order("cid-1").status == "CANCELED"
+    assert session.reserved_notional == D("20")
+    submit(
+        session,
+        engine,
+        second.reservation_id,
+        symbol="ETHUSDT",
+        qty=D("0.6"),
+        price=D("100"),
+        notional=D("60"),
+        client_order_id="cid-2",
+    )
+    assert session.reserved_notional == D("80")
+
+
+def test_expired_grant_blocks_new_risk_but_keeps_query_and_cancel(tmp_path) -> None:
+    path = tmp_path / "orders.db"
+    engine = make_engine(tmp_path / "risk.db", equity="100000")
+    reservation = engine.reserve([req("BTCUSDT", "s-expire")], now=NOW)[0]
+    later = NOW + timedelta(minutes=11)
+    opener, pinned = transport(
+        healthy()
+        + [
+            {"status": "NEW", "executedQty": "0", "origQty": "0.01", "clientOrderId": "cid-1"},
+            {"status": "CANCELED", "executedQty": "0", "origQty": "0.01", "clientOrderId": "cid-1"},
+        ]
+    )
+    session = LiveSession(
+        grant(network="TESTNET", account_id=engine.account_id, expires_at=NOW + timedelta(minutes=10)),
+        VenueCredentials("key-id", SECRET),
+        pinned,
+        now=NOW,
+        path=str(path),
+    )
+    submit(session, engine, reservation.reservation_id)
+    before = len(opener.calls)
+    queried = session.query(symbol="BTCUSDT", client_order_id="cid-1", now=later)
+    canceled = session.cancel(symbol="BTCUSDT", client_order_id="cid-1", now=later)
+    assert queried["status"] == "NEW"
+    assert canceled["status"] == "CANCELED"
+    assert session.reserved_notional == D("0")
+    with pytest.raises(CtsError) as expired:
+        submit(session, engine, reservation.reservation_id, client_order_id="cid-2", now=later)
+    assert expired.value.reason_code == "LIVE_GRANT_EXPIRED"
+    assert [call[0] for call in opener.calls[before:]] == ["GET", "DELETE"]
+
+
+def test_restart_promotes_a_dispatched_intent_to_unknown(tmp_path) -> None:
+    from cts.execution.orders import LiveOrder, OrderStore
+
+    path = tmp_path / "orders.db"
+    engine = make_engine(tmp_path / "risk.db", equity="100000")
+    store = OrderStore(str(path))
+    draft = LiveOrder(
+        client_order_id="cid-crash",
+        account_id=engine.account_id,
+        reservation_id="res-1",
+        symbol="BTCUSDT",
+        side="LONG",
+        qty=D("0.6"),
+        price=D("100"),
+        notional=D("60"),
+        status="INTENT",
+        executed_qty=D("0"),
+        dispatch_started=True,
+        body={},
+    )
+    store.insert_intent(
+        LiveOrder(
+            client_order_id=draft.client_order_id,
+            account_id=draft.account_id,
+            reservation_id=draft.reservation_id,
+            symbol=draft.symbol,
+            side=draft.side,
+            qty=draft.qty,
+            price=draft.price,
+            notional=draft.notional,
+            status="INTENT",
+            executed_qty=D("0"),
+            dispatch_started=False,
+            body={},
+        ),
+        NOW,
+    )
+    store.save(draft, NOW)
+    opener, pinned = transport([])
+    session = LiveSession(
+        grant(network="TESTNET", account_id=engine.account_id, max_notional=D("100")),
+        VenueCredentials("key-id", SECRET),
+        pinned,
+        now=NOW,
+        path=str(path),
+    )
+    assert session.get_order("cid-crash").status == "UNKNOWN"
+    assert session.reserved_notional == D("60")
+    assert opener.calls == []
+
+
+def admitted(path, responses: list, **overrides):
+    engine = make_engine(path, equity="100000")
+    reservation = engine.reserve([req("BTCUSDT", "s-open")], now=NOW)[0]
+    opener, pinned = transport(responses)
+    fields = {"network": "TESTNET", "account_id": engine.account_id, "max_notional": D("100000")}
+    fields.update(overrides)
+    session = LiveSession(
+        grant(**fields),
+        VenueCredentials("key-id", SECRET),
+        pinned,
+        now=NOW,
+    )
+    return engine, reservation, session, opener
+
+
+def submit(session: LiveSession, engine, reservation_id: str, **overrides):
+    payload = {
+        "symbol": "BTCUSDT",
+        "side": Side.LONG,
+        "qty": D("0.01"),
+        "price": D("100"),
+        "client_order_id": "cid-1",
+        "notional": D("1"),
+        "now": NOW,
+        "risk": engine,
+        "reservation_id": reservation_id,
+    }
+    payload.update(overrides)
+    return session.submit(**payload)
 
 
 def test_env_credentials_are_not_read_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -165,11 +613,44 @@ def test_env_credentials_are_not_read_when_absent(monkeypatch: pytest.MonkeyPatc
 
 
 def test_other_venues_are_refused_before_any_request() -> None:
-    transport = RecordingTransport(healthy())
+    opener, pinned = transport(healthy())
     with pytest.raises(CtsError) as err:
-        LiveSession(grant(venue="OTHER"), VenueCredentials("key-id", SECRET), transport, now=NOW)
+        LiveSession(grant(venue="OTHER"), VenueCredentials("key-id", SECRET), pinned, now=NOW)
     assert err.value.reason_code == "LIVE_VENUE_UNVERIFIED"
-    assert transport.calls == []
+    assert opener.calls == []
+
+
+def test_venue_wallet_replaces_the_local_ledger_balance() -> None:
+    from cts.console.app import ConsoleState, apply_venue_wallet
+    from cts.execution.live import parse_usdt_wallet
+    from cts.ledger.journal import Ledger
+    from tests.test_ledger import TS
+
+    body = {
+        "totalMarginBalance": "4999.65538680",
+        "assets": [
+            {
+                "asset": "USDT",
+                "walletBalance": "4999.65538680",
+                "availableBalance": "4999.65538680",
+                "unrealizedProfit": "0.00000000",
+                "marginBalance": "4999.65538680",
+                "initialMargin": "0.00000000",
+            }
+        ],
+    }
+    venue = parse_usdt_wallet(body)
+    ledger = Ledger("acct")
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep")
+    state = ConsoleState.from_ledger(ledger)
+    assert state.books["source"] == "本地账本"
+    assert state.books["wallet"] == "10000"
+    apply_venue_wallet(state, venue, as_of="2026-10-31T00:00:00+00:00")
+    apply_venue_wallet(state, venue, as_of="2026-10-31T00:01:00+00:00")
+    assert state.equity == "4999.65538680"
+    assert state.books["wallet"] == "4999.65538680"
+    assert state.books["source"] == "币安模拟盘"
+    assert state.books["gap"] == format(D("4999.65538680") - D("10000"), "f")
 
 
 def test_blank_credentials_are_rejected() -> None:
