@@ -258,6 +258,7 @@ class Ledger:
         price_source: str = "",
         quote_grade: str = "",
         price_event_time: Optional[datetime] = None,
+        event_type: LedgerEventType = LedgerEventType.FILL,
     ) -> tuple[LedgerEvent, Decimal]:
         key = (venue, external_id)
         qty = require_positive(D(qty), "qty")
@@ -334,7 +335,7 @@ class Ledger:
             event_id=uuid4().hex,
             account_id=self.account_id,
             venue=venue,
-            event_type=LedgerEventType.FILL,
+            event_type=event_type,
             event_time=event_time,
             received_at=received_at,
             asset=self.asset,
@@ -634,7 +635,7 @@ class Ledger:
         return clone
 
     def _project_position(self, event: LedgerEvent) -> None:
-        if event.event_type == LedgerEventType.FILL and event.symbol:
+        if event.event_type in (LedgerEventType.FILL, LedgerEventType.LIQUIDATION, LedgerEventType.ADL) and event.symbol:
             _restore_position_from_fill(self, event)
         if event.event_type == LedgerEventType.FUNDING and event.symbol:
             self.position(event.symbol).funding_cum += D(event.metadata.get("payment", "0"))

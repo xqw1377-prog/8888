@@ -100,7 +100,7 @@ class LedgerEvent:
 
 def _assert_balanced(lines: tuple[JournalLine, ...], asset: str, event_type: LedgerEventType) -> None:
     if not lines:
-        if event_type == LedgerEventType.FILL:
+        if event_type in (LedgerEventType.FILL, LedgerEventType.LIQUIDATION, LedgerEventType.ADL):
             return
         raise LedgerImbalanceError("事件至少需要两条分录")
     debit = Decimal("0")
