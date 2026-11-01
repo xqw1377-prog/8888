@@ -37,10 +37,16 @@ class SteadyClock:
         self.utc += 4
         return value
 
-    def monotonic_millis(self) -> int:
+    def utc_ns(self) -> int:
+        return self.utc_millis() * 1_000_000
+
+    def monotonic_ns(self) -> int:
         value = self.mono
         self.mono += 4
-        return value
+        return value * 1_000_000
+
+    def quantum_ns(self) -> int:
+        return 1
 
 
 class FakeOpener:
@@ -238,32 +244,65 @@ def test_tls_stays_verified_and_redirects_are_not_followed(tmp_path) -> None:
     assert audit_evidence(tmp_path / "evidence") == "PASS"
 
 
+def _sample(
+    *,
+    t0: int,
+    t1: int,
+    m0_before: int,
+    m0_after: int,
+    m1_before: int,
+    m1_after: int,
+    server_time: int,
+    quantum_ns: int = 1,
+) -> ClockSample:
+    return ClockSample(t0, t1, m0_before, m0_after, m1_before, m1_after, server_time, quantum_ns)
+
+
 def test_utc_rollback_fails_while_the_old_formula_would_pass(tmp_path) -> None:
-    sample = ClockSample(t0=10_000, t1=9_000, m0=0, m1=100, server_time=9_500)
-    old_rtt = sample.t1 - sample.t0
+    t0_ms, t1_ms, server_ms = 10_000, 9_000, 9_500
+    old_rtt = t1_ms - t0_ms
     old_u = old_rtt / 2
-    old_offset = sample.server_time - (sample.t0 + sample.t1) / 2
+    old_offset = server_ms - (t0_ms + t1_ms) / 2
+    assert old_u < 0
     assert abs(old_offset) + old_u <= 1000
+    sample = _sample(
+        t0=t0_ms * 1_000_000,
+        t1=t1_ms * 1_000_000,
+        m0_before=0,
+        m0_after=0,
+        m1_before=100_000_000,
+        m1_after=100_000_000,
+        server_time=server_ms,
+    )
     judgement = judge_clock(sample)
     assert judgement.verdict == "FAIL"
     assert judgement.reason == "UTC时间倒退"
-    assert judgement.rtt == 100
-    assert judgement.uncertainty == "50"
+    assert judgement.rtt == 100_000_000
+    assert not judgement.uncertainty.startswith("-")
 
     class RollbackClock:
         def __init__(self) -> None:
-            self.utc_values = [1, 10_000, 9_000]
-            self.mono_values = [0, 100]
+            self.utc_values = [1]
+            self.utc_ns_values = [10_000, 9_000]
+            self.mono_values = [0, 0, 100, 100]
 
         def utc_millis(self) -> int:
             if self.utc_values:
                 return self.utc_values.pop(0)
             return 9_000
 
-        def monotonic_millis(self) -> int:
+        def utc_ns(self) -> int:
+            if self.utc_ns_values:
+                return self.utc_ns_values.pop(0)
+            return 9_000
+
+        def monotonic_ns(self) -> int:
             if self.mono_values:
                 return self.mono_values.pop(0)
             return 100
+
+        def quantum_ns(self) -> int:
+            return 1
 
     clock = RollbackClock()
 
@@ -283,6 +322,178 @@ def test_utc_rollback_fails_while_the_old_formula_would_pass(tmp_path) -> None:
     assert "m1=100" in evidence
     assert "serverTime=9500" in evidence
     assert "verdict=FAIL" in evidence
+
+
+def test_one_millisecond_quantization_gap_can_be_compatible() -> None:
+    """先后截断到毫秒会差 1，纳秒区间内仍是同一次经过。"""
+    t0 = 900_000
+    t1 = 482_100_000
+    m0_after = 1_100_000
+    m1 = 1_100_000 + (t1 - t0)
+    assert (t1 // 1_000_000 - t0 // 1_000_000) - (m1 // 1_000_000 - m0_after // 1_000_000) == 1
+    judgement = judge_clock(
+        _sample(
+            t0=t0,
+            t1=t1,
+            m0_before=800_000,
+            m0_after=m0_after,
+            m1_before=m1 - 200_000,
+            m1_after=m1,
+            server_time=241,
+        )
+    )
+    assert judgement.verdict == "PASS"
+    assert judgement.reason == ""
+
+
+def test_read_interval_changes_compatibility_without_a_fixed_slack() -> None:
+    narrow = judge_clock(
+        _sample(
+            t0=0,
+            t1=5_000_000,
+            m0_before=0,
+            m0_after=1_000,
+            m1_before=1_000_000,
+            m1_after=1_001_000,
+            server_time=3,
+        )
+    )
+    assert narrow.verdict == "FAIL"
+    assert narrow.reason == "无法解释的时间跳变"
+    wide = judge_clock(
+        _sample(
+            t0=0,
+            t1=5_000_000,
+            m0_before=0,
+            m0_after=3_000_000,
+            m1_before=3_000_000,
+            m1_after=8_000_000,
+            server_time=3,
+        )
+    )
+    assert wide.verdict == "PASS"
+
+
+def test_wider_read_interval_still_counts_against_the_budget() -> None:
+    quantum = 1_000_000
+    base = 1_998_000_000
+    inside = judge_clock(
+        _sample(
+            t0=0,
+            t1=base,
+            m0_before=0,
+            m0_after=0,
+            m1_before=base,
+            m1_after=base,
+            server_time=999,
+            quantum_ns=quantum,
+        )
+    )
+    assert inside.verdict == "PASS"
+    outside = judge_clock(
+        _sample(
+            t0=0,
+            t1=base,
+            m0_before=0,
+            m0_after=0,
+            m1_before=base,
+            m1_after=base + 2_000_000,
+            server_time=999,
+            quantum_ns=quantum,
+        )
+    )
+    assert outside.verdict == "FAIL"
+    assert outside.reason == "不确定度超过1000毫秒"
+
+
+def test_real_clock_jump_fails_even_when_offset_would_pass() -> None:
+    judgement = judge_clock(
+        _sample(
+            t0=0,
+            t1=5_000_000,
+            m0_before=0,
+            m0_after=1_000,
+            m1_before=1_000,
+            m1_after=2_000,
+            server_time=3,
+        )
+    )
+    assert judgement.verdict == "FAIL"
+    assert judgement.reason == "无法解释的时间跳变"
+
+
+def test_budget_boundary_keeps_sampling_uncertainty() -> None:
+    quantum = 1_000_000
+    exact = judge_clock(
+        _sample(
+            t0=0,
+            t1=0,
+            m0_before=0,
+            m0_after=0,
+            m1_before=0,
+            m1_after=0,
+            server_time=999,
+            quantum_ns=quantum,
+        )
+    )
+    assert exact.verdict == "PASS"
+    over = judge_clock(
+        _sample(
+            t0=0,
+            t1=0,
+            m0_before=0,
+            m0_after=0,
+            m1_before=0,
+            m1_after=0,
+            server_time=999,
+            quantum_ns=quantum + 1,
+        )
+    )
+    assert over.verdict == "FAIL"
+    assert over.reason == "偏移加不确定度超过1000毫秒"
+    at_uncertainty = judge_clock(
+        _sample(
+            t0=0,
+            t1=1_998_000_000,
+            m0_before=0,
+            m0_after=0,
+            m1_before=1_998_000_000,
+            m1_after=1_998_000_000,
+            server_time=999,
+            quantum_ns=quantum,
+        )
+    )
+    assert at_uncertainty.verdict == "PASS"
+    past_uncertainty = judge_clock(
+        _sample(
+            t0=0,
+            t1=1_998_000_002,
+            m0_before=0,
+            m0_after=0,
+            m1_before=1_998_000_002,
+            m1_after=1_998_000_002,
+            server_time=999,
+            quantum_ns=quantum,
+        )
+    )
+    assert past_uncertainty.verdict == "FAIL"
+    assert past_uncertainty.reason == "不确定度超过1000毫秒"
+
+
+def test_monotonic_rollback_fails() -> None:
+    judgement = judge_clock(
+        _sample(
+            t0=0,
+            t1=1_000,
+            m0_before=5_000,
+            m0_after=4_000,
+            m1_before=6_000,
+            m1_after=7_000,
+            server_time=0,
+        )
+    )
+    assert judgement.verdict == "FAIL"
+    assert judgement.reason == "单调时钟倒退"
 
 
 def test_missing_mode_fields_fail_closed(tmp_path) -> None:
