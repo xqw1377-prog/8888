@@ -193,7 +193,11 @@ def run_readonly_verification(
     known_client_order_ids: set[str] | None = None,
     plan_sha: str = PLAN_BASELINE,
 ) -> str:
-    """执行白名单内的只读核对并封印证据。不创建订单库。"""
+    """执行白名单内的只读核对并封印证据。不创建订单库。
+
+    ``known_client_order_ids`` 不授予登记资格。未完成委托只认原订单库里的账户与订单身份。
+    """
+    del known_client_order_ids
     evidence_dir.mkdir(parents=True, exist_ok=True)
     runner = _Runner(
         opener=opener,
@@ -206,7 +210,6 @@ def run_readonly_verification(
         code_sha=code_sha,
         plan_sha=plan_sha,
         clock=clock or Clock(),
-        known_orders=set(known_client_order_ids or ()),
     )
     pending: Exception | None = None
     try:
@@ -215,6 +218,7 @@ def run_readonly_verification(
         runner.capture(exc)
         pending = exc
     finally:
+        runner.recheck_end()
         runner.close_gaps()
         runner.write()
         seal_evidence(evidence_dir)
@@ -239,7 +243,6 @@ class _Runner:
         self.code_sha = kwargs["code_sha"]
         self.plan_sha = kwargs["plan_sha"]
         self.clock: Clock = kwargs["clock"]
-        self.known_orders: set[str] = kwargs["known_orders"]
         self.started = self.clock.utc_millis()
         self.ended = self.started
         self.requests: list[str] = []
@@ -248,6 +251,7 @@ class _Runner:
         self.rules_text = ""
         self.wallet_text = "暂无证据"
         self.orders_text = "NOT_RUN"
+        self.end_snapshot = ""
         self.stopped = False
         self.secrets = (self.credentials.api_key, self.credentials.api_secret)
 
@@ -272,6 +276,8 @@ class _Runner:
 
     def _execute(self) -> None:
         self._inspect_local()
+        if self.stopped:
+            return
         if self.network != "TESTNET" or not self.account_id or not self.order_db or not self.risk_db:
             self._check("账户绑定", "FAIL", "账户、库路径或网络未绑定到 TESTNET")
             self.stopped = True
@@ -403,8 +409,15 @@ class _Runner:
                 self._check("钱包", "FAIL", "钱包正文无法解析")
                 self.stopped = True
                 return
-            usdt = next((row for row in assets if isinstance(row, dict) and row.get("asset") == "USDT"), None)
-            if not isinstance(usdt, dict) or any(key not in usdt for key in WALLET_FIELDS):
+            usdt_rows = [row for row in assets if isinstance(row, dict) and row.get("asset") == "USDT"]
+            if len(usdt_rows) != 1:
+                self.wallet_text = _wallet_lines(usdt_rows) or "暂无证据"
+                detail = "USDT 行重复或歧义" if len(usdt_rows) > 1 else "USDT 钱包字段缺失"
+                self._check("钱包", "FAIL", detail)
+                self.stopped = True
+                return
+            usdt = usdt_rows[0]
+            if any(key not in usdt for key in WALLET_FIELDS):
                 self.wallet_text = "暂无证据"
                 self._check("钱包", "FAIL", "USDT 钱包字段缺失")
                 self.stopped = True
@@ -441,12 +454,18 @@ class _Runner:
                     self._check(f"未完成委托{symbol}", "FAIL", "委托正文或行结构不合法")
                     self.stopped = True
                     return
+                book = _registered_orders(Path(self.order_db))
+                if book is None:
+                    self.orders_text = "\n".join(lines) if lines else "暂无证据"
+                    self._check(f"未完成委托{symbol}", "FAIL", "原订单库无法核对委托登记")
+                    self.stopped = True
+                    return
                 identities = [str(row["clientOrderId"]) for row in rows]
-                unknown = [item for item in identities if item not in self.known_orders]
+                unknown = [row for row in rows if not _same_order(book, row, symbol, self.account_id)]
                 lines.append(f"{symbol} count={len(rows)} clientOrderId={','.join(identities)}")
                 if unknown:
                     self.orders_text = "\n".join(lines)
-                    self._check(f"未完成委托{symbol}", "FAIL", "存在本系统未登记的委托")
+                    self._check(f"未完成委托{symbol}", "FAIL", "委托未在原订单库登记或订单身份不一致")
                     self.stopped = True
                     return
                 self._check(f"未完成委托{symbol}", "PASS", f"count={len(rows)}")
@@ -515,47 +534,104 @@ class _Runner:
         return "只读核验通过"
 
     def _inspect_local(self) -> None:
-        order_path = Path(self.order_db)
-        risk_path = Path(self.risk_db)
-        if not order_path.is_file() or not risk_path.is_file():
-            self._check("原订单库", *_file_gate(order_path, "原订单库"))
-            self._check("原风险库", *_file_gate(risk_path, "原风险库"))
-            self._check("账户归属", "FAIL", "原库缺失，无法核实账户归属")
-            self._check("未决订单", "FAIL", "原库缺失，无法核实未决订单")
-            self._check("风险阻断", "FAIL", "原库缺失，无法核实风险阻断")
-            return
         try:
-            orders, meta = _read_order_db(order_path)
-            accounts, holds, blockers = _read_risk_db(risk_path)
-        except Exception:
-            self._check("原订单库", "FAIL", "原订单库无法只读核对")
-            self._check("原风险库", "FAIL", "原风险库无法只读核对")
-            self._check("账户归属", "FAIL", "原库无法核实账户归属")
-            self._check("未决订单", "FAIL", "原库无法核实未决订单")
-            self._check("风险阻断", "FAIL", "原库无法核实风险阻断")
-            return
-        self._check("原订单库", "PASS", "已只读打开原订单库")
-        self._check("原风险库", "PASS", "已只读打开原风险库")
+            order_path = Path(self.order_db)
+            risk_path = Path(self.risk_db)
+            if not order_path.is_file() or not risk_path.is_file():
+                self._check("原订单库", *_file_gate(order_path, "原订单库"))
+                self._check("原风险库", *_file_gate(risk_path, "原风险库"))
+                self._check("账户归属", "FAIL", "原库缺失，无法核实账户归属")
+                self._check("未决订单", "FAIL", "原库缺失，无法核实未决订单")
+                self._check("风险阻断", "FAIL", "原库缺失，无法核实风险阻断")
+                return
+            try:
+                orders, meta = _read_order_db(order_path)
+                accounts, holds, blockers = _read_risk_db(risk_path)
+            except Exception:
+                self._check("原订单库", "FAIL", "原订单库无法只读核对")
+                self._check("原风险库", "FAIL", "原风险库无法只读核对")
+                self._check("账户归属", "FAIL", "原库无法核实账户归属")
+                self._check("未决订单", "FAIL", "原库无法核实未决订单")
+                self._check("风险阻断", "FAIL", "原库无法核实风险阻断")
+                return
+            self._check("原订单库", "PASS", "已只读打开原订单库")
+            self._check("原风险库", "PASS", "已只读打开原风险库")
+            self._record_ownership(orders, meta, accounts, risk_path)
+            self._record_pending(orders)
+            self._record_blocks(holds, blockers)
+        finally:
+            self._stop_if_local_failed()
+
+    def _record_ownership(self, orders: list, meta: list, accounts: set[str], risk_path: Path) -> None:
         foreign_orders = [row for row in orders if row["account_id"] != self.account_id]
-        meta_owned = [row for row in meta if row["account_id"] == self.account_id]
-        meta_foreign = [row for row in meta if row["account_id"] != self.account_id]
-        path_mismatch = False
-        if meta_owned:
-            recorded = Path(str(meta_owned[0]["risk_db_path"])).resolve()
-            path_mismatch = recorded != risk_path.resolve()
-        if accounts != {self.account_id} or foreign_orders or (meta_foreign and not meta_owned) or path_mismatch:
+        owned = [row for row in meta if row["account_id"] == self.account_id]
+        path_mismatch = True
+        if len(owned) == 1 and str(owned[0]["risk_db_path"]).strip():
+            path_mismatch = Path(str(owned[0]["risk_db_path"])).resolve() != risk_path.resolve()
+        if len(owned) != 1 or path_mismatch:
+            self._check("账户归属", "FAIL", "缺少匹配的账户与风险库路径绑定")
+            return
+        if accounts != {self.account_id} or foreign_orders:
             self._check("账户归属", "FAIL", "账户与原库归属不一致")
-        else:
-            self._check("账户归属", "PASS", "原库账户与本次绑定一致")
-        pending = [row for row in orders if row["account_id"] == self.account_id and row["status"] in UNRESOLVED_ORDER_STATUSES]
+            return
+        self._check("账户归属", "PASS", "原库账户与风险库路径绑定一致")
+
+    def _record_pending(self, orders: list) -> None:
+        pending = [
+            row for row in orders
+            if row["account_id"] == self.account_id and row["status"] in UNRESOLVED_ORDER_STATUSES
+        ]
         if pending:
             self._check("未决订单", "FAIL", "原订单库仍有未决订单")
         else:
             self._check("未决订单", "PASS", "原订单库没有未决订单")
+
+    def _record_blocks(self, holds: int, blockers: int) -> None:
         if holds or blockers:
             self._check("风险阻断", "FAIL", "原风险库仍有阻断")
         else:
             self._check("风险阻断", "PASS", "原风险库没有阻断")
+
+    def _stop_if_local_failed(self) -> None:
+        recorded = {name: result for name, result, _ in self.checks}
+        names = ("原订单库", "原风险库", "账户归属", "未决订单", "风险阻断")
+        if any(recorded.get(name) != "PASS" for name in names):
+            self.stopped = True
+
+    def recheck_end(self) -> None:
+        """封存前再读一次未决订单和风险阻断，留下结束快照。"""
+        order_path = Path(self.order_db)
+        risk_path = Path(self.risk_db)
+        try:
+            if not order_path.is_file() or not risk_path.is_file():
+                self.end_snapshot = "结束快照 原库缺失 未决订单=未核对 风险阻断=未核对"
+                self._check("未决订单", "FAIL", "结束快照时原库缺失，未再放行")
+                self._check("风险阻断", "FAIL", "结束快照时原库缺失，未再放行")
+                return
+            orders, _meta = _read_order_db(order_path)
+            _accounts, holds, blockers = _read_risk_db(risk_path)
+        except Exception:
+            self.end_snapshot = "结束快照 无法只读核对"
+            self._check("未决订单", "FAIL", "结束快照无法只读核对")
+            self._check("风险阻断", "FAIL", "结束快照无法只读核对")
+            return
+        pending = [
+            row for row in orders
+            if row["account_id"] == self.account_id and row["status"] in UNRESOLVED_ORDER_STATUSES
+        ]
+        identities = [str(row["client_order_id"]) for row in pending]
+        self.end_snapshot = (
+            f"结束快照 未决订单={len(pending)} clientOrderId={','.join(identities) or '-'} "
+            f"风险持有={holds} 未清除阻断={blockers}"
+        )
+        if pending:
+            self._check("未决订单", "FAIL", "结束快照仍有未决订单")
+        else:
+            self._check("未决订单", "PASS", "结束快照没有未决订单")
+        if holds or blockers:
+            self._check("风险阻断", "FAIL", "结束快照仍有阻断")
+        else:
+            self._check("风险阻断", "PASS", "结束快照没有阻断")
 
     def write(self) -> None:
         self.ended = self.clock.utc_millis()
@@ -581,6 +657,8 @@ class _Runner:
         check_lines = [f"{name} {verdict} {detail}".rstrip() for name, verdict, detail in self.checks]
         if rules_hash:
             check_lines.append(f"规则原文SHA256 {rules_hash}")
+        if self.end_snapshot:
+            check_lines.append(self.end_snapshot)
         check_lines.append(self.verdict)
         files = {
             "e1_code.txt": f"code_sha={self.code_sha}\nplan_sha={self.plan_sha}\n",
@@ -651,6 +729,59 @@ def _finite_original(value: object) -> tuple[str, bool]:
     return text, bool(number.is_finite())
 
 
+def _wallet_lines(rows: list[dict]) -> str:
+    lines = []
+    for row in rows:
+        for key in WALLET_FIELDS:
+            if key not in row:
+                lines.append(f"{key}=缺失")
+                continue
+            text, _ok = _finite_original(row[key])
+            lines.append(f"{key}={text}")
+    return "\n".join(lines)
+
+
+def _registered_orders(path: Path) -> list[sqlite3.Row] | None:
+    if not path.is_file():
+        return None
+    try:
+        orders, _meta = _read_order_db(path)
+    except Exception:
+        return None
+    return orders
+
+
+def _same_order(book: list, venue: dict, symbol: str, account_id: str) -> bool:
+    """登记只认原订单库。账户、品种、方向和数量都要与库内那一行一致。"""
+    client_id = venue.get("clientOrderId")
+    matches = [row for row in book if str(row["client_order_id"]) == client_id]
+    if len(matches) != 1:
+        return False
+    row = matches[0]
+    if str(row["account_id"]) != account_id or str(row["symbol"]) != symbol:
+        return False
+    if venue.get("symbol") != symbol:
+        return False
+    side = venue.get("side")
+    qty = venue.get("origQty")
+    if not isinstance(side, str) or qty is None:
+        return False
+    if not _same_side(str(row["side"]), side):
+        return False
+    try:
+        return Decimal(str(row["qty"])) == Decimal(str(qty))
+    except Exception:
+        return False
+
+
+def _same_side(stored: str, venue: str) -> bool:
+    left = stored.upper()
+    right = venue.upper()
+    if left == right:
+        return True
+    return (left, right) in {("LONG", "BUY"), ("SHORT", "SELL")}
+
+
 def _order_rows(body: object) -> list[dict] | None:
     if isinstance(body, list):
         rows = body
@@ -690,7 +821,9 @@ def _connect_readonly(path: Path) -> sqlite3.Connection:
 def _read_order_db(path: Path) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
     connection = _connect_readonly(path)
     try:
-        orders = connection.execute("SELECT account_id, status FROM live_orders").fetchall()
+        orders = connection.execute(
+            "SELECT client_order_id, account_id, symbol, side, qty, status FROM live_orders"
+        ).fetchall()
         meta = connection.execute("SELECT account_id, risk_db_path FROM live_session_meta").fetchall()
         return list(orders), list(meta)
     finally:

@@ -122,7 +122,11 @@ class FakeOpener:
         if parts.path == "/fapi/v1/openOrders":
             if self.orders_body is not None:
                 return self.orders_body
-            return {"orders": list(self.orders)}
+            rows = [
+                row for row in self.orders
+                if not isinstance(row, dict) or row.get("symbol") in (None, symbol)
+            ]
+            return {"orders": rows}
         raise AssertionError(parts.path)
 
 
@@ -367,6 +371,8 @@ def test_missing_databases_fail_without_creating_them(tmp_path) -> None:
     assert "原风险库 FAIL" in checks
     assert "未决订单 FAIL" in checks
     assert "风险阻断 FAIL" in checks
+    assert opener.calls == []
+    assert "结束快照" in checks
 
 
 @pytest.mark.parametrize("body", [{}, {"code": -1}, [1, "bad", {}], {"orders": {"clientOrderId": "cid"}}])
@@ -402,6 +408,195 @@ def test_null_wallet_fields_keep_original_text_and_fail(tmp_path) -> None:
     checks = (tmp_path / "evidence" / "e5_checks.txt").read_text(encoding="utf-8")
     assert "钱包 FAIL" in checks
     assert "不是有限数值" in checks
+
+
+def test_block_added_during_collection_fails_the_end_snapshot(tmp_path) -> None:
+    import sqlite3
+
+    orders, risk = _prepare_books(tmp_path)
+    planted = {"done": False}
+
+    class Plant(FakeOpener):
+        def __call__(self, method: str, url: str, headers: dict[str, str]):
+            if not planted["done"]:
+                planted["done"] = True
+                risk_conn = sqlite3.connect(risk)
+                risk_conn.execute(
+                    """
+                    INSERT INTO live_risk_holds(
+                        hold_id, account_id, reservation_id, client_order_id, reason, created_at, owner_id
+                    ) VALUES (?,?,?,?,?,?,?)
+                    """,
+                    ("hold-late", "acct-readonly", "res-late", "cid-late", "采集期间新增", "2026-11-01T00:00:00+00:00", "owner-late"),
+                )
+                risk_conn.commit()
+                risk_conn.close()
+                order_conn = sqlite3.connect(orders)
+                order_conn.execute(
+                    """
+                    INSERT INTO live_orders(
+                        client_order_id, account_id, reservation_id, symbol, side, qty, price, notional,
+                        status, executed_qty, dispatch_started, body, updated_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        "cid-late", "acct-readonly", "res-late", "BTCUSDT", "LONG", "0.001", "100", "0.1",
+                        "UNKNOWN", "0", 1, "{}", "2026-11-01T00:00:00+00:00",
+                    ),
+                )
+                order_conn.commit()
+                order_conn.close()
+            return super().__call__(method, url, headers)
+
+    clock = SteadyClock()
+    opener = Plant(clock)
+    verdict = run_readonly_verification(
+        opener=opener,
+        evidence_dir=tmp_path / "evidence",
+        account_id="acct-readonly",
+        order_db=str(orders),
+        risk_db=str(risk),
+        network="TESTNET",
+        credentials=_creds(),
+        code_sha=CODE,
+        clock=clock,
+    )
+    assert verdict == "只读核验未通过"
+    checks = (tmp_path / "evidence" / "e5_checks.txt").read_text(encoding="utf-8")
+    assert "结束快照 未决订单=1 clientOrderId=cid-late 风险持有=1 未清除阻断=0" in checks
+    pending = [line for line in checks.splitlines() if line.startswith("未决订单 ")]
+    blocks = [line for line in checks.splitlines() if line.startswith("风险阻断 ")]
+    assert pending[-1].startswith("未决订单 FAIL")
+    assert blocks[-1].startswith("风险阻断 FAIL")
+
+
+def test_caller_ids_do_not_register_open_orders(tmp_path) -> None:
+    orders, risk = _prepare_books(tmp_path)
+    clock = SteadyClock()
+    opener = FakeOpener(
+        clock,
+        orders=[
+            {
+                "clientOrderId": "outside-book",
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+                "origQty": "0.001",
+            }
+        ],
+    )
+    verdict = run_readonly_verification(
+        opener=opener,
+        evidence_dir=tmp_path / "evidence",
+        account_id="acct-readonly",
+        order_db=str(orders),
+        risk_db=str(risk),
+        network="TESTNET",
+        credentials=_creds(),
+        code_sha=CODE,
+        clock=clock,
+        known_client_order_ids={"outside-book"},
+    )
+    assert verdict == "只读核验未通过"
+    checks = (tmp_path / "evidence" / "e5_checks.txt").read_text(encoding="utf-8")
+    assert "未在原订单库登记或订单身份不一致" in checks
+
+
+def test_open_order_matches_the_original_book(tmp_path) -> None:
+    import sqlite3
+
+    orders, risk = _prepare_books(tmp_path)
+    connection = sqlite3.connect(orders)
+    connection.execute(
+        """
+        INSERT INTO live_orders(
+            client_order_id, account_id, reservation_id, symbol, side, qty, price, notional,
+            status, executed_qty, dispatch_started, body, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "cid-registered", "acct-readonly", "res-1", "BTCUSDT", "LONG", "0.001", "100", "0.1",
+            "NEW", "0", 1, "{}", "2026-11-01T00:00:00+00:00",
+        ),
+    )
+    connection.commit()
+    connection.close()
+    clock = SteadyClock()
+    opener = FakeOpener(
+        clock,
+        orders=[
+            {
+                "clientOrderId": "cid-registered",
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+                "origQty": "0.001",
+            }
+        ],
+    )
+    verdict = run_readonly_verification(
+        opener=opener,
+        evidence_dir=tmp_path / "evidence",
+        account_id="acct-readonly",
+        order_db=str(orders),
+        risk_db=str(risk),
+        network="TESTNET",
+        credentials=_creds(),
+        code_sha=CODE,
+        clock=clock,
+        known_client_order_ids=set(),
+    )
+    assert verdict == "只读核验通过"
+
+
+def test_deleted_account_binding_fails_before_any_request(tmp_path) -> None:
+    import sqlite3
+
+    orders, risk = _prepare_books(tmp_path)
+    connection = sqlite3.connect(orders)
+    connection.execute("DELETE FROM live_session_meta")
+    connection.commit()
+    connection.close()
+    clock = SteadyClock()
+    opener = FakeOpener(clock)
+    verdict = run_readonly_verification(
+        opener=opener,
+        evidence_dir=tmp_path / "evidence",
+        account_id="acct-readonly",
+        order_db=str(orders),
+        risk_db=str(risk),
+        network="TESTNET",
+        credentials=_creds(),
+        code_sha=CODE,
+        clock=clock,
+    )
+    assert verdict == "只读核验未通过"
+    assert opener.calls == []
+    checks = (tmp_path / "evidence" / "e5_checks.txt").read_text(encoding="utf-8")
+    assert "账户归属 FAIL" in checks
+    assert "缺少匹配的账户与风险库路径绑定" in checks
+
+
+def test_duplicate_usdt_rows_fail(tmp_path) -> None:
+    clock = SteadyClock()
+    row = {
+        "asset": "USDT",
+        "walletBalance": "1.25000000",
+        "availableBalance": "1.00000000",
+        "unrealizedProfit": "0.00000000",
+        "marginBalance": "1.25000000",
+    }
+    other = dict(row)
+    other["walletBalance"] = "9.00000000"
+    other["marginBalance"] = "9.00000000"
+    opener = FakeOpener(clock, assets=[row, other])
+    verdict = _run(tmp_path, opener, clock)
+    assert verdict == "只读核验未通过"
+    wallet = (tmp_path / "evidence" / "e8_wallet.txt").read_text(encoding="utf-8")
+    assert "walletBalance=1.25000000" in wallet
+    assert "walletBalance=9.00000000" in wallet
+    checks = (tmp_path / "evidence" / "e5_checks.txt").read_text(encoding="utf-8")
+    assert "钱包 FAIL" in checks
+    assert "重复或歧义" in checks
+    assert "钱包 PASS" not in checks
 
 
 def test_json_signature_field_is_redacted(tmp_path) -> None:
