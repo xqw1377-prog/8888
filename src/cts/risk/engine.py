@@ -670,7 +670,7 @@ class RiskEngine:
             )
 
     def recover_dead_hold_owners(self, *, now: datetime) -> None:
-        """只有原锁文件仍在，且能被独占时，才记恢复证据。路径缺失或身份不符保持未知。"""
+        """只对实际打开的描述符核对登记身份，再锁这同一个描述符。路径缺失或身份不符保持未知。"""
         with self.store.txn() as conn:
             rows = conn.execute(
                 """
@@ -685,23 +685,22 @@ class RiskEngine:
             if row["lock_dev"] is None or row["lock_ino"] is None:
                 continue
             path = self.owner_lock_path(owner_id)
-            if not path.is_file():
-                continue
             try:
-                current = os.stat(path)
+                fd = os.open(path, os.O_RDWR)
             except OSError:
                 continue
-            if current.st_dev != row["lock_dev"] or current.st_ino != row["lock_ino"]:
-                continue
-            fd = os.open(path, os.O_RDWR)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
+                current = os.fstat(fd)
+                if current.st_dev != row["lock_dev"] or current.st_ino != row["lock_ino"]:
+                    continue
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    continue
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                dead.append((owner_id, "所有者锁已释放"))
+            finally:
                 os.close(fd)
-                continue
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
-            dead.append((owner_id, "所有者锁已释放"))
         if not dead:
             return
         with self.store.txn() as conn:
@@ -756,27 +755,20 @@ class RiskEngine:
         client_order_id: str,
         reservation_id: str,
         now: datetime,
-        keep_hold_ids: set[str],
+        release_hold_ids: set[str],
     ) -> int:
-        """解除本次已结束的请求。同一所有者仍在途的请求保留；其他所有者只在已有恢复证据时清除。"""
+        """只删除明确已结束的请求。不在这份名单里的阻断继续保留。"""
         self.recover_dead_hold_owners(now=now)
+        finished = set(release_hold_ids)
+        finished.add(hold_id)
         with self.store.txn() as conn:
-            rows = conn.execute(
-                """
-                SELECT hold_id FROM live_risk_holds
-                WHERE account_id=? AND client_order_id=? AND owner_id=?
-                """,
-                (self.account_id, client_order_id, owner_id),
-            ).fetchall()
-            for row in rows:
-                if row["hold_id"] != hold_id and row["hold_id"] in keep_hold_ids:
-                    continue
+            for finished_id in finished:
                 conn.execute(
                     """
                     DELETE FROM live_risk_holds
-                    WHERE hold_id=? AND account_id=? AND owner_id=?
+                    WHERE hold_id=? AND account_id=? AND owner_id=? AND client_order_id=?
                     """,
-                    (row["hold_id"], self.account_id, owner_id),
+                    (finished_id, self.account_id, owner_id, client_order_id),
                 )
             conn.execute(
                 """

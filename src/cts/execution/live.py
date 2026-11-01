@@ -165,7 +165,7 @@ class LiveSession:
         self.orders_sent = 0
         self._budget_lock = threading.Lock()
         self._hold_lock = threading.Lock()
-        self._inflight_holds: set[str] = set()
+        self._finished_holds: dict[str, str] = {}
         self._owner_id: str | None = None
         self._owner_lock_fd: int | None = None
         self._reserved_notional = sum(
@@ -327,14 +327,14 @@ class LiveSession:
                 [("symbol", symbol), ("origClientOrderId", client_order_id), ("recvWindow", "5000"), ("timestamp", _millis(now))],
             )
         except Exception:
-            self._note_request_finished(hold_id)
+            self._note_request_finished(hold_id, client_order_id)
             saved = self._save_order(self.get_order(client_order_id), status="UNKNOWN", dispatch_started=True, now=now)
             self._hold_risk_unknown(saved.reservation_id, now, saved.client_order_id)
             raise CtsError("查询响应丢失，订单状态未知，额度继续占用", reason_code="UNKNOWN_ORDER") from None
         try:
             saved = self._apply_venue(order.client_order_id, body, now)
         except Exception:
-            self._note_request_finished(hold_id)
+            self._note_request_finished(hold_id, client_order_id)
             raise
         if hold_id is not None:
             self._settle_request_hold(saved, hold_id, now)
@@ -358,14 +358,14 @@ class LiveSession:
                 [("symbol", symbol), ("origClientOrderId", client_order_id), ("recvWindow", "5000"), ("timestamp", _millis(now))],
             )
         except Exception:
-            self._note_request_finished(hold_id)
+            self._note_request_finished(hold_id, client_order_id)
             saved = self._save_order(self.get_order(client_order_id), status="UNKNOWN", dispatch_started=True, now=now)
             self._hold_risk_unknown(saved.reservation_id, now, saved.client_order_id)
             raise CtsError("撤单响应丢失，订单状态未知，额度继续占用", reason_code="UNKNOWN_ORDER") from None
         try:
             saved = self._apply_venue(order.client_order_id, body, now)
         except Exception:
-            self._note_request_finished(hold_id)
+            self._note_request_finished(hold_id, client_order_id)
             raise
         self._settle_request_hold(saved, hold_id, now)
         return body
@@ -608,8 +608,6 @@ class LiveSession:
         risk = self._bound_risk(order)
         owner_id = self._ensure_hold_owner(now)
         hold_id = f"{order.client_order_id}:{reason}:{uuid4()}"
-        with self._hold_lock:
-            self._inflight_holds.add(hold_id)
         try:
             risk.hold_live_request(
                 order.reservation_id,
@@ -620,15 +618,15 @@ class LiveSession:
                 now=now,
             )
         except Exception:
-            self._note_request_finished(hold_id)
+            self._note_request_finished(hold_id, order.client_order_id)
             raise
         return hold_id
 
-    def _note_request_finished(self, hold_id: str | None) -> None:
-        if hold_id is None:
+    def _note_request_finished(self, hold_id: str | None, client_order_id: str | None) -> None:
+        if hold_id is None or client_order_id is None:
             return
         with self._hold_lock:
-            self._inflight_holds.discard(hold_id)
+            self._finished_holds[hold_id] = client_order_id
 
     def _settle_request_hold(self, order: LiveOrder, hold_id: str, now: datetime) -> None:
         risk = self._risk
@@ -637,16 +635,23 @@ class LiveSession:
             return
         others_blocked = self._other_request_blocked(order)
         with self._hold_lock:
-            self._inflight_holds.discard(hold_id)
-            keep_hold_ids = set(self._inflight_holds)
+            release_ids = {
+                finished_id
+                for finished_id, finished_order in self._finished_holds.items()
+                if finished_order == order.client_order_id
+            }
+            release_ids.add(hold_id)
         remaining = risk.settle_live_request(
             hold_id=hold_id,
             owner_id=owner_id,
             client_order_id=order.client_order_id,
             reservation_id=order.reservation_id,
             now=now,
-            keep_hold_ids=keep_hold_ids,
+            release_hold_ids=release_ids,
         )
+        with self._hold_lock:
+            for finished_id in release_ids:
+                self._finished_holds.pop(finished_id, None)
         if remaining or others_blocked:
             return
         risk.clear_live_unknown(order.reservation_id)

@@ -22,6 +22,7 @@ from cts.execution.live import (
 )
 from cts.ledger.models import Side
 from cts.money import D
+from cts.risk.engine import RiskEngine
 from cts.risk.models import SystemState
 from tests.test_risk_p004a import make_engine, req
 
@@ -1701,6 +1702,101 @@ def test_same_session_keeps_the_other_inflight_request(tmp_path) -> None:
     worker.join(2)
     assert worker.is_alive() is False
     assert engine.live_hold_count(reservation.reservation_id) == 0
+
+
+def test_opened_fd_must_match_the_registered_lock(tmp_path, monkeypatch) -> None:
+    engine, reservation, session_a, _opener = admitted(tmp_path, healthy())
+    submit(session_a, engine, reservation.reservation_id)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked(method: str, url: str, headers: dict[str, str]):
+        entered.set()
+        assert release.wait(2)
+        return _ack_new()
+
+    session_a._transport = open_testnet_transport(blocked)
+    session_b = _open_peer(session_a, engine, open_testnet_transport(lambda method, url, headers: _ack_new()))
+    worker = threading.Thread(target=lambda: session_a.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW))
+    worker.start()
+    assert entered.wait(2)
+    path = engine.owner_lock_path(session_a._owner_id)
+    real_open = os.open
+    armed = {"value": True}
+
+    def open_after_replace(file, flags, mode=0o777, *, dir_fd=None):
+        target = os.fspath(file)
+        if armed["value"] and target == os.fspath(path) and flags == os.O_RDWR:
+            armed["value"] = False
+            os.unlink(target)
+            created = real_open(target, os.O_CREAT | os.O_RDWR, 0o600)
+            os.close(created)
+        if dir_fd is None:
+            return real_open(file, flags, mode)
+        return real_open(file, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", open_after_replace)
+    session_b.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert engine.live_hold_count(reservation.reservation_id) == 1
+    assert _owner_row(engine, session_a._owner_id)["recovered_at"] is None
+    with pytest.raises(CtsError) as blocked_risk:
+        engine.reserve([req("ETHUSDT", "s-lock-fd-identity")], now=NOW)
+    assert blocked_risk.value.reason_code == "UNKNOWN_ORDER"
+    release.set()
+    worker.join(2)
+    assert worker.is_alive() is False
+
+
+def test_cleanup_keeps_a_request_registered_after_the_release_list(tmp_path, monkeypatch) -> None:
+    engine, reservation, session, _opener = admitted(tmp_path, healthy())
+    submit(session, engine, reservation.reservation_id)
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release_first = threading.Event()
+    release_second = threading.Event()
+    calls = {"n": 0}
+
+    def opener(method: str, url: str, headers: dict[str, str]):
+        if method != "GET":
+            return _ack_new()
+        calls["n"] += 1
+        if calls["n"] == 1:
+            first_entered.set()
+            assert release_first.wait(2)
+            return _ack_new()
+        second_entered.set()
+        assert release_second.wait(2)
+        return _ack_new()
+
+    session._transport = open_testnet_transport(opener)
+    real_settle = RiskEngine.settle_live_request
+    started = {"value": False}
+    second = threading.Thread(target=lambda: session.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW))
+
+    def settle_after_new_request(self, **kwargs):
+        if not started["value"]:
+            started["value"] = True
+            second.start()
+            assert second_entered.wait(2)
+        return real_settle(self, **kwargs)
+
+    monkeypatch.setattr(RiskEngine, "settle_live_request", settle_after_new_request)
+    first = threading.Thread(target=lambda: session.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW))
+    first.start()
+    assert first_entered.wait(2)
+    release_first.set()
+    first.join(2)
+    assert first.is_alive() is False
+    assert engine.live_hold_count(reservation.reservation_id) == 1
+    with pytest.raises(CtsError) as blocked:
+        engine.reserve([req("ETHUSDT", "s-release-list-race")], now=NOW)
+    assert blocked.value.reason_code == "UNKNOWN_ORDER"
+    release_second.set()
+    second.join(2)
+    assert second.is_alive() is False
+    assert engine.live_hold_count(reservation.reservation_id) == 0
+    created = engine.reserve([req("ETHUSDT", "s-release-list-cleared")], now=NOW)
+    assert created[0].qty > 0
 
 
 def test_cancel_identity_must_be_present(tmp_path) -> None:
