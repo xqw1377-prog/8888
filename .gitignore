@@ -8,6 +8,7 @@ build/
 venv/
 .env
 .env.*
+var/
 .DS_Store
 *.db
 *.db-journal

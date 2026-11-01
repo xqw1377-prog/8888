@@ -1,58 +1,109 @@
 # 真实只读核验执行材料
 
-状态：**材料已备，执行未决定。**
+状态：**传输器已审查，原库未绑定，执行未决定。**
 
-本文件不是授权。没有另一次书面决定之前，不访问 `https://demo-fapi.binance.com`，不读取真实密钥，不生成实际采集证据。TESTNET 试单仍未授权。实盘保持 `HOLD`。`main` 不合并。
+本文件不是授权。没有另一次书面决定之前，不执行下面的命令，不访问 `https://demo-fapi.binance.com`。TESTNET 试单仍未授权。实盘保持 `HOLD`。`main` 不合并。
 
-已验收的运行器是 `5b51364a52ef935b9f7c014711c637dc127771f3` 的本地假传输器。方案条文以 `4ae24f4ee2293e68d607d26c872e671ff5d442d6` 为准。源码若再变动，本次 PASS-LOCAL 不自动覆盖新 SHA。
+只读运行器的本地假传输器验收冻结在 `5b51364a52ef935b9f7c014711c637dc127771f3`。那次验收不覆盖真实网络传输。方案条文以 `4ae24f4ee2293e68d607d26c872e671ff5d442d6` 为准。
 
-## 1. 另一次决定必须写明的范围
+## 1. 拟用网络传输器
 
-决定只覆盖当次进程的只读核验，并且只能使用方案第 2 节的 GET 白名单。决定里要同时写明这些仍然不做：
+拟用 `src/cts/execution/live.py` 里的 `_urllib_opener`。它的调用形式是 `(method, url, headers)`，与 `run_readonly_verification` 的 `opener` 一致。
 
-- 不发送 POST、PUT、PATCH、DELETE，包括下单和撤单。
-- 不查询单笔订单。查询和撤单属于以后另行授权的交易会话。
-- 不授权限额试单。只读结论不是试单授权，也不是实盘放行。
-- 不改变 `LIVE_TRADING_AUTHORIZATION`。
-- 进程异常退出时不补发任何写请求。
+不使用 `PinnedTransport` 或 `urllib_transport`。那两个入口的调用形式是 `(method, path, query, headers)`，还会改写列表正文，不能交给只读运行器。
 
-## 2. 当次输入
+| 源码 | 位置 | 提交 |
+|---|---|---|
+| `_urllib_opener`、`_RefuseRedirect` | `src/cts/execution/live.py` 第 896–911 行 | `89dfdb9226a9ffe03d4a9986588454a1cf1004d0`，此后未改 |
+| `_ssl_context` | 同文件第 786–793 行 | `1d2bdaf803c664f6750e58c64cc3cc949de76fce` |
+| 文件 blob | `src/cts/execution/live.py` | `6bd696db9c5fc2dcfc8f86295d18c633b500877c` |
 
-`run_readonly_verification` 没有默认传输器。调用方不传入 `opener` 时，它不会访问网络。将来的决定通过之后，才由当次调用显式传入只绑定模拟盘的 opener。
+这个 blob 已经包含在运行器冻结提交 `5b51364` 中。`5b51364` 之后没有再改 `src/cts/execution/live.py`。
 
-| 输入 | 要求 |
+这次只读了源码，并在本机检查了 SSL 上下文和 `build_opener` 装上的 handler。没有打开套接字，没有访问币安。
+
+### 主机绑定
+
+`_urllib_opener` 只拒绝主机名不是 `demo-fapi.binance.com` 的 URL。它本身不检查方案、端口和用户信息。
+
+运行器在调用 opener 之前先走 `enforce_host`：方案必须是 `https`，主机必须是 `demo-fapi.binance.com`，端口只能是省略或 `443`，URL 不能带用户名或密码。非 GET、白名单以外的路径和品种在更早的 `_validate` 被拒绝，到不了 opener。
+
+因此拟用方式只有一条：把 `_urllib_opener()` 交给 `run_readonly_verification`。单独调用 opener 不能满足主机绑定，也不限制方法。
+
+### TLS
+
+`_ssl_context` 使用 `ssl.create_default_context()`。证书库存在时用系统默认库，否则用 `/etc/ssl/cert.pem`，再否则仍使用默认上下文。源码没有关闭证书校验或主机名校验的分支。
+
+本机这个上下文的 `verify_mode` 是 `CERT_REQUIRED`，`check_hostname` 是 `True`。这还不是与币安完成的一次握手。
+
+### 禁止跳转
+
+`build_opener` 放入的跳转 handler 只有 `_RefuseRedirect`。它的 `redirect_request` 直接抛错，不返回下一个请求。本机 handler 列表里的跳转类只有 `_RefuseRedirect`。`301`、`302`、`303`、`307`、`308` 因此不会被跟随。
+
+假传输器测试调用的是运行器自己的 `refuse_redirect`，不是这个 urllib handler。真实跳转响应仍未验收。
+
+## 2. 账户及原库绑定
+
+本机目前没有可核验的原库。仓库内没有订单库或风险库文件。`.env` 只有 `CTS_BINANCE_API_KEY`、`CTS_BINANCE_API_SECRET`、`CTS_BINANCE_NETWORK` 这三个名字。网络变量的值是 `TESTNET`。没有账户编号。
+
+| 项 | 当前值 |
 |---|---|
-| `opener` | 显式传入。只接受 `https://demo-fapi.binance.com`，端口 443。证书校验保持打开。HTTP 3xx 不读取、不跟随 |
-| `account_id` | 与原订单库、原风险库里的账户相同 |
-| `order_db`、`risk_db` | 两个原文件都已经存在。缺失时失败，并且不新建 |
-| `network` | `TESTNET`。环境变量 `CTS_BINANCE_NETWORK` 也必须是 `TESTNET` |
-| `credentials` | 只从本机环境变量 `CTS_BINANCE_API_KEY`、`CTS_BINANCE_API_SECRET` 读取。不写入仓库、证据或日志 |
-| `code_sha` | `5b51364a52ef935b9f7c014711c637dc127771f3` |
-| `plan_sha` | `4ae24f4ee2293e68d607d26c872e671ff5d442d6` |
-| `evidence_dir` | 本机目录。含账户原文的证据不提交进仓库 |
-| `known_client_order_ids` | 不授予登记资格。未完成委托只认原订单库中的账户和订单身份 |
+| 账户 | 未绑定 |
+| 订单库 | 不存在。材料不新建 |
+| 风险库 | 不存在。材料不新建 |
+| `CTS_BINANCE_NETWORK` | `TESTNET` |
 
-不要把 `LiveSession` 当作这次只读核验的入口。打开会话会写订单库。不要把只读钱包展示接口当作整次核验。
+执行前必须已经有两个原文件，并且订单库里有一条与该账户、该风险库路径一致的绑定。缺失就失败，不新建。下面命令里的账户和库路径没有默认值；这三个环境变量现在都没有设置。
 
-## 3. 发送前的原库状态
+## 3. 证据输出目录
 
-两个库都以只读方式打开。下面任一条不成立，就停止，不发请求，并封存“只读核验未通过”：
+`/Users/xinquanwang/8888/var/readonly-evidence`
 
-- 订单库有一条与本次账户、本次风险库路径一致的绑定。
-- 风险库账户集合就是这次的账户，订单也不属于其他账户。
-- 没有状态为 `UNKNOWN`、`QUERYING`、`CANCELING` 的未决订单。
-- 风险库没有未清除阻断，也没有风险持有。
+`var/` 已忽略，不提交证据。目录里将来会有方案第 6 节的 E1–E11。生成并封印之后不再改。证据不写密钥、签名值或完整签名 URL。
 
-封存前再读一次。采集期间如果绑定被删除、风险库路径被改掉、风险库账户被换掉，或者出现新的未决订单或阻断，总结论失败。结束快照要留下这次读到的结果。
+## 4. 执行命令
 
-## 4. 请求与证据
+在仓库根目录执行。命令现在会停在授权检查，不会访问网络。账户和原库绑定好之前，也不要设置 `CTS_READONLY_EXECUTION`。
 
-允许的主机、路径和查询以方案第 2 节为准，这里不另写一套白名单。时钟、交易规则、账户模式、钱包和未完成委托以方案第 4 节为准。证据以方案第 6 节的 E1–E11 为准。
+```bash
+cd /Users/xinquanwang/8888
+PYTHONPATH=src .venv/bin/python - <<'PY'
+import os
+import sys
+from pathlib import Path
 
-证据生成并封印之后不再改。要改就重新封印。日志和证据去掉 API Key、签名值和完整签名 URL。E10 只保留这句：“凭据已在本机环境变量中，未写入仓库。网络变量为 TESTNET”。
+from cts.execution.live import _urllib_opener, credentials_from_env, load_local_env
+from cts.ops.readonly_verify import PLAN_BASELINE, run_readonly_verification
 
-总结论只有“只读核验通过”和“只读核验未通过”。两种结论都不放行试单，也不放行实盘。
+if os.environ.get("CTS_READONLY_EXECUTION") != "授权本进程按冻结方案执行一次只读核验":
+    sys.exit("只读核验尚未授权执行")
+load_local_env()
+if os.environ.get("CTS_BINANCE_NETWORK") != "TESTNET":
+    sys.exit("网络不是 TESTNET")
+account_id = os.environ["CTS_READONLY_ACCOUNT_ID"]
+order_db = os.environ["CTS_READONLY_ORDER_DB"]
+risk_db = os.environ["CTS_READONLY_RISK_DB"]
+for path in (order_db, risk_db):
+    if not Path(path).is_file():
+        sys.exit(f"原库不存在，未新建：{path}")
+print(run_readonly_verification(
+    opener=_urllib_opener(),
+    evidence_dir=Path("/Users/xinquanwang/8888/var/readonly-evidence"),
+    account_id=account_id,
+    order_db=order_db,
+    risk_db=risk_db,
+    network="TESTNET",
+    credentials=credentials_from_env(),
+    code_sha="5b51364a52ef935b9f7c014711c637dc127771f3",
+    plan_sha=PLAN_BASELINE,
+))
+PY
+```
 
-## 5. 本材料完成时没有做的事
+密钥只留在本机环境变量里。命令和本文件都不写入密钥。
 
-没有修改产品源码，没有访问币安，没有读取真实密钥，没有执行这次只读核验。
+`LiveSession` 不能当作这次入口，打开会话会写订单库。只读钱包展示接口也不能代替这次核验。
+
+## 5. 仍未做的事
+
+没有修改产品源码，没有访问币安，没有读取或记录密钥，没有执行上面的命令。原库仍未绑定。执行决定还没有作。
