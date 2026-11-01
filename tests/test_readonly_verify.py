@@ -44,12 +44,28 @@ class SteadyClock:
 
 
 class FakeOpener:
-    def __init__(self, clock: SteadyClock | None = None, *, dual=None, margin="isolated", orders=None, boom: str = "") -> None:
+    def __init__(
+        self,
+        clock: SteadyClock | None = None,
+        *,
+        dual=None,
+        margin="isolated",
+        orders=None,
+        orders_body=None,
+        boom: str = "",
+        strip_filters: bool = False,
+        wallet_null: bool = False,
+        assets=None,
+    ) -> None:
         self.clock = clock
         self.dual = {"dualSidePosition": False} if dual is None else dual
         self.margin = margin
         self.orders = [] if orders is None else orders
+        self.orders_body = orders_body
         self.boom = boom
+        self.strip_filters = strip_filters
+        self.wallet_null = wallet_null
+        self.assets = assets
         self.calls: list[tuple[str, str]] = []
 
     def __call__(self, method: str, url: str, headers: dict[str, str]):
@@ -64,7 +80,11 @@ class FakeOpener:
             assert self.clock is not None
             return {"serverTime": self.clock.utc - 4}
         if parts.path == "/fapi/v1/exchangeInfo":
-            return {"symbols": [_symbol("BTCUSDT"), _symbol("ETHUSDT")]}
+            symbols = [_symbol("BTCUSDT"), _symbol("ETHUSDT")]
+            if self.strip_filters:
+                for item in symbols:
+                    item.pop("filters", None)
+            return {"symbols": symbols}
         if parts.path == "/fapi/v1/positionSide/dual":
             return self.dual
         if parts.path == "/fapi/v1/multiAssetsMargin":
@@ -74,6 +94,20 @@ class FakeOpener:
                 return {"positions": [{"symbol": symbol}]}
             return {"positions": [{"symbol": symbol, "marginType": self.margin}]}
         if parts.path == "/fapi/v2/account":
+            if self.assets is not None:
+                return {"assets": self.assets}
+            if self.wallet_null:
+                return {
+                    "assets": [
+                        {
+                            "asset": "USDT",
+                            "walletBalance": None,
+                            "availableBalance": None,
+                            "unrealizedProfit": None,
+                            "marginBalance": None,
+                        }
+                    ]
+                }
             return {
                 "assets": [
                     {
@@ -86,6 +120,8 @@ class FakeOpener:
                 ]
             }
         if parts.path == "/fapi/v1/openOrders":
+            if self.orders_body is not None:
+                return self.orders_body
             return {"orders": list(self.orders)}
         raise AssertionError(parts.path)
 
@@ -110,13 +146,32 @@ def _creds() -> VenueCredentials:
     return VenueCredentials(KEY, SECRET)
 
 
-def _run(tmp_path, opener, clock=None):
+def _prepare_books(tmp_path):
+    from cts.execution.orders import OrderStore
+    from cts.money import D
+    from cts.risk.engine import RiskEngine
+
+    orders = tmp_path / "orders.db"
+    risk = tmp_path / "risk.db"
+    store = OrderStore(str(orders))
+    store.set_risk_path("acct-readonly", str(risk.resolve()))
+    store.close()
+    engine = RiskEngine.create(str(risk), "acct-readonly", equity=D("10000"))
+    engine.close()
+    return orders, risk
+
+
+def _run(tmp_path, opener, clock=None, *, books: bool = True):
+    if books:
+        orders, risk = _prepare_books(tmp_path)
+    else:
+        orders, risk = tmp_path / "missing-orders.db", tmp_path / "missing-risk.db"
     return run_readonly_verification(
         opener=opener,
         evidence_dir=tmp_path / "evidence",
         account_id="acct-readonly",
-        order_db=str(tmp_path / "orders.db"),
-        risk_db=str(tmp_path / "risk.db"),
+        order_db=str(orders),
+        risk_db=str(risk),
         network="TESTNET",
         credentials=_creds(),
         code_sha=CODE,
@@ -286,3 +341,74 @@ def test_evidence_manifest_detects_modification(tmp_path) -> None:
     assert audit_evidence(evidence) == "PASS"
     assert KEY not in _text(tmp_path)
     assert SECRET not in _text(tmp_path)
+
+
+def test_parse_error_cannot_seal_a_pass(tmp_path) -> None:
+    clock = SteadyClock()
+    opener = FakeOpener(clock, assets=123)
+    verdict = _run(tmp_path, opener, clock)
+    assert verdict == "只读核验未通过"
+    checks = (tmp_path / "evidence" / "e5_checks.txt").read_text(encoding="utf-8")
+    assert "只读核验通过" not in checks
+    assert "钱包 FAIL" in checks
+
+
+def test_missing_databases_fail_without_creating_them(tmp_path) -> None:
+    clock = SteadyClock()
+    opener = FakeOpener(clock)
+    orders = tmp_path / "missing-orders.db"
+    risk = tmp_path / "missing-risk.db"
+    verdict = _run(tmp_path, opener, clock, books=False)
+    assert verdict == "只读核验未通过"
+    assert orders.exists() is False
+    assert risk.exists() is False
+    checks = (tmp_path / "evidence" / "e5_checks.txt").read_text(encoding="utf-8")
+    assert "原订单库 FAIL" in checks
+    assert "原风险库 FAIL" in checks
+    assert "未决订单 FAIL" in checks
+    assert "风险阻断 FAIL" in checks
+
+
+@pytest.mark.parametrize("body", [{}, {"code": -1}, [1, "bad", {}], {"orders": {"clientOrderId": "cid"}}])
+def test_malformed_open_orders_fail(tmp_path, body) -> None:
+    clock = SteadyClock()
+    opener = FakeOpener(clock, orders_body=body)
+    verdict = _run(tmp_path, opener, clock)
+    assert verdict == "只读核验未通过"
+    checks = (tmp_path / "evidence" / "e5_checks.txt").read_text(encoding="utf-8")
+    assert "委托正文或行结构不合法" in checks
+
+
+def test_missing_filters_fail(tmp_path) -> None:
+    clock = SteadyClock()
+    opener = FakeOpener(clock, strip_filters=True)
+    verdict = _run(tmp_path, opener, clock)
+    assert verdict == "只读核验未通过"
+    checks = (tmp_path / "evidence" / "e5_checks.txt").read_text(encoding="utf-8")
+    assert "交易规则 FAIL" in checks
+    assert "价格步长" in checks
+
+
+def test_null_wallet_fields_keep_original_text_and_fail(tmp_path) -> None:
+    clock = SteadyClock()
+    opener = FakeOpener(clock, wallet_null=True)
+    verdict = _run(tmp_path, opener, clock)
+    assert verdict == "只读核验未通过"
+    wallet = (tmp_path / "evidence" / "e8_wallet.txt").read_text(encoding="utf-8")
+    assert "walletBalance=null" in wallet
+    assert "availableBalance=null" in wallet
+    assert "unrealizedProfit=null" in wallet
+    assert "marginBalance=null" in wallet
+    checks = (tmp_path / "evidence" / "e5_checks.txt").read_text(encoding="utf-8")
+    assert "钱包 FAIL" in checks
+    assert "不是有限数值" in checks
+
+
+def test_json_signature_field_is_redacted(tmp_path) -> None:
+    secret = "structured-signature-value"
+    opener = FakeOpener(boom='{"signature": "' + secret + '", "msg": "boom"}')
+    with pytest.raises(CtsError) as raised:
+        _run(tmp_path, opener, SteadyClock())
+    blob = str(raised.value) + "\n" + _text(tmp_path)
+    assert secret not in blob
+    assert KEY not in blob

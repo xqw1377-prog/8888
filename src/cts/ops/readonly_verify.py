@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from cts.errors import CtsError
 from cts.execution.live import (
@@ -42,6 +43,26 @@ SIGNED_PATHS = {
 }
 
 Opener = Callable[[str, str, dict[str, str]], object]
+REQUIRED_CHECKS = (
+    "原订单库",
+    "原风险库",
+    "账户归属",
+    "未决订单",
+    "风险阻断",
+    "时钟取样1",
+    "时钟取样2",
+    "时钟取样3",
+    "交易规则",
+    "持仓模式",
+    "联合保证金",
+    "逐仓BTCUSDT",
+    "逐仓ETHUSDT",
+    "钱包",
+    "未完成委托BTCUSDT",
+    "未完成委托ETHUSDT",
+)
+UNRESOLVED_ORDER_STATUSES = frozenset({"UNKNOWN", "QUERYING", "CANCELING"})
+WALLET_FIELDS = ("walletBalance", "availableBalance", "unrealizedProfit", "marginBalance")
 
 
 @dataclass(frozen=True)
@@ -95,12 +116,18 @@ def judge_clock(sample: ClockSample) -> ClockJudgement:
     return _clock_result(sample, rtt, "PASS", "")
 
 
-def redact_text(text: str, secrets: tuple[str, ...]) -> str:
+def redact_text(text: str, secrets: tuple[str, ...] = ()) -> str:
+    """去掉密钥、查询串签名、JSON 签名字段和完整 URL。"""
     cleaned = text
     for secret in secrets:
         if secret:
             cleaned = cleaned.replace(secret, "[已脱敏]")
-    cleaned = re.sub(r"signature=[^&\s]+", "signature=[已脱敏]", cleaned)
+    cleaned = re.sub(
+        r'(?is)(["\']signature["\']\s*:\s*)(["\'])(?:\\.|(?!\2).)*\2',
+        r"\1\2[已脱敏]\2",
+        cleaned,
+    )
+    cleaned = re.sub(r"(?i)\bsignature\b\s*[:=]\s*[\"']?[^\"'&\s,}\]]+", "signature=[已脱敏]", cleaned)
     cleaned = re.sub(r"https?://\S+", "[已脱敏URL]", cleaned)
     return cleaned
 
@@ -181,11 +208,22 @@ def run_readonly_verification(
         clock=clock or Clock(),
         known_orders=set(known_client_order_ids or ()),
     )
+    pending: Exception | None = None
     try:
         runner.execute()
+    except Exception as exc:
+        runner.capture(exc)
+        pending = exc
     finally:
+        runner.close_gaps()
         runner.write()
         seal_evidence(evidence_dir)
+    if pending is not None:
+        cleaned = CtsError(
+            redact_text(str(pending), runner.secrets),
+            reason_code=getattr(pending, "reason_code", "RECONCILIATION_FAILED"),
+        )
+        raise cleaned
     return runner.verdict
 
 
@@ -214,6 +252,26 @@ class _Runner:
         self.secrets = (self.credentials.api_key, self.credentials.api_secret)
 
     def execute(self) -> None:
+        try:
+            self._execute()
+        except CtsError:
+            raise
+        except Exception as exc:
+            self.capture(exc)
+
+    def capture(self, exc: Exception) -> None:
+        if not any(name == "传输" for name, _, _ in self.checks):
+            self._check("传输", "FAIL", "传输或解析异常，原文已脱敏")
+        self.stopped = True
+
+    def close_gaps(self) -> None:
+        present = {name for name, _, _ in self.checks}
+        for name in REQUIRED_CHECKS:
+            if name not in present:
+                self._check(name, "FAIL", "未完成")
+
+    def _execute(self) -> None:
+        self._inspect_local()
         if self.network != "TESTNET" or not self.account_id or not self.order_db or not self.risk_db:
             self._check("账户绑定", "FAIL", "账户、库路径或网络未绑定到 TESTNET")
             self.stopped = True
@@ -337,41 +395,66 @@ class _Runner:
         self._check(f"逐仓{symbol}", "PASS", margin)
 
     def _wallet(self) -> None:
-        status, body = self._send("GET", "/fapi/v2/account", _signed_params(None, self.clock.utc_millis(), self.credentials))
-        assets = body.get("assets") if isinstance(body, dict) else None
-        usdt = next((row for row in assets or [] if isinstance(row, dict) and row.get("asset") == "USDT"), None)
-        fields = ("walletBalance", "availableBalance", "unrealizedProfit", "marginBalance")
-        if status != 200 or usdt is None or any(key not in usdt for key in fields):
+        try:
+            status, body = self._send("GET", "/fapi/v2/account", _signed_params(None, self.clock.utc_millis(), self.credentials))
+            assets = body.get("assets") if isinstance(body, dict) else None
+            if status != 200 or not isinstance(assets, list):
+                self.wallet_text = "暂无证据"
+                self._check("钱包", "FAIL", "钱包正文无法解析")
+                self.stopped = True
+                return
+            usdt = next((row for row in assets if isinstance(row, dict) and row.get("asset") == "USDT"), None)
+            if not isinstance(usdt, dict) or any(key not in usdt for key in WALLET_FIELDS):
+                self.wallet_text = "暂无证据"
+                self._check("钱包", "FAIL", "USDT 钱包字段缺失")
+                self.stopped = True
+                return
+            lines = []
+            finite = True
+            for key in WALLET_FIELDS:
+                text, ok = _finite_original(usdt[key])
+                lines.append(f"{key}={text}")
+                finite = finite and ok
+            self.wallet_text = "\n".join(lines)
+            if not finite:
+                self._check("钱包", "FAIL", "钱包字段不是有限数值")
+                self.stopped = True
+                return
+            self._check("钱包", "PASS", "已记录 USDT 四个字段原文")
+        except Exception:
             self.wallet_text = "暂无证据"
-            self._check("钱包", "FAIL", "USDT 钱包字段缺失")
+            self._check("钱包", "FAIL", "钱包正文无法解析")
             self.stopped = True
-            return
-        self.wallet_text = "\n".join(f"{key}={usdt[key]}" for key in fields)
-        self._check("钱包", "PASS", "已记录 USDT 四个字段原文")
 
     def _open_orders(self) -> None:
         lines = []
-        for symbol in SYMBOLS:
-            status, body = self._send(
-                "GET",
-                "/fapi/v1/openOrders",
-                _signed_params(symbol, self.clock.utc_millis(), self.credentials),
-            )
-            rows = _rows(body, "orders")
-            if status != 200:
-                self.orders_text = "暂无证据"
-                self._check(f"未完成委托{symbol}", "FAIL", "委托正文不可读")
-                self.stopped = True
-                return
-            identities = [str(row.get("clientOrderId", "")) for row in rows]
-            unknown = [item for item in identities if item not in self.known_orders]
-            lines.append(f"{symbol} count={len(rows)} clientOrderId={','.join(identities)}")
-            if unknown:
-                self.orders_text = "\n".join(lines)
-                self._check(f"未完成委托{symbol}", "FAIL", "存在本系统未登记的委托")
-                self.stopped = True
-                return
-            self._check(f"未完成委托{symbol}", "PASS", f"count={len(rows)}")
+        try:
+            for symbol in SYMBOLS:
+                status, body = self._send(
+                    "GET",
+                    "/fapi/v1/openOrders",
+                    _signed_params(symbol, self.clock.utc_millis(), self.credentials),
+                )
+                rows = _order_rows(body)
+                if status != 200 or rows is None:
+                    self.orders_text = "暂无证据" if not lines else "\n".join(lines)
+                    self._check(f"未完成委托{symbol}", "FAIL", "委托正文或行结构不合法")
+                    self.stopped = True
+                    return
+                identities = [str(row["clientOrderId"]) for row in rows]
+                unknown = [item for item in identities if item not in self.known_orders]
+                lines.append(f"{symbol} count={len(rows)} clientOrderId={','.join(identities)}")
+                if unknown:
+                    self.orders_text = "\n".join(lines)
+                    self._check(f"未完成委托{symbol}", "FAIL", "存在本系统未登记的委托")
+                    self.stopped = True
+                    return
+                self._check(f"未完成委托{symbol}", "PASS", f"count={len(rows)}")
+        except Exception:
+            self.orders_text = "暂无证据"
+            self._check("未完成委托", "FAIL", "委托正文无法解析")
+            self.stopped = True
+            return
         self.orders_text = "\n".join(lines)
 
     def _send(self, method: str, path: str, params: tuple[tuple[str, str], ...], stamp: int | None = None) -> tuple[int, object]:
@@ -386,11 +469,14 @@ class _Runner:
         try:
             result = self.opener(method, url, {"X-MBX-APIKEY": self.credentials.api_key})
         except Exception as exc:
-            message = redact_text(str(exc), self.secrets)
             self.requests.append(f"{collected} GET {path} {DEMO_HOST} 未完成")
-            self._check("传输", "FAIL", message)
+            self._check("传输", "FAIL", "传输或解析异常，原文已脱敏")
             self.stopped = True
-            raise CtsError(message, reason_code=getattr(exc, "reason_code", "RECONCILIATION_FAILED")) from None
+            cleaned = CtsError(
+                redact_text(str(exc), self.secrets),
+                reason_code=getattr(exc, "reason_code", "RECONCILIATION_FAILED"),
+            )
+            raise cleaned from None
         status, body = _unpack(result)
         self.requests.append(f"{collected} GET {path} {DEMO_HOST} {status}")
         if 300 <= status < 400:
@@ -421,11 +507,55 @@ class _Runner:
 
     @property
     def verdict(self) -> str:
-        if not self.checks or any(verdict != "PASS" for _, verdict, _ in self.checks):
+        recorded = {name: result for name, result, _ in self.checks}
+        if any(recorded.get(name) != "PASS" for name in REQUIRED_CHECKS):
             return "只读核验未通过"
         if not self.rules_text or len(self.samples) != 3:
             return "只读核验未通过"
         return "只读核验通过"
+
+    def _inspect_local(self) -> None:
+        order_path = Path(self.order_db)
+        risk_path = Path(self.risk_db)
+        if not order_path.is_file() or not risk_path.is_file():
+            self._check("原订单库", *_file_gate(order_path, "原订单库"))
+            self._check("原风险库", *_file_gate(risk_path, "原风险库"))
+            self._check("账户归属", "FAIL", "原库缺失，无法核实账户归属")
+            self._check("未决订单", "FAIL", "原库缺失，无法核实未决订单")
+            self._check("风险阻断", "FAIL", "原库缺失，无法核实风险阻断")
+            return
+        try:
+            orders, meta = _read_order_db(order_path)
+            accounts, holds, blockers = _read_risk_db(risk_path)
+        except Exception:
+            self._check("原订单库", "FAIL", "原订单库无法只读核对")
+            self._check("原风险库", "FAIL", "原风险库无法只读核对")
+            self._check("账户归属", "FAIL", "原库无法核实账户归属")
+            self._check("未决订单", "FAIL", "原库无法核实未决订单")
+            self._check("风险阻断", "FAIL", "原库无法核实风险阻断")
+            return
+        self._check("原订单库", "PASS", "已只读打开原订单库")
+        self._check("原风险库", "PASS", "已只读打开原风险库")
+        foreign_orders = [row for row in orders if row["account_id"] != self.account_id]
+        meta_owned = [row for row in meta if row["account_id"] == self.account_id]
+        meta_foreign = [row for row in meta if row["account_id"] != self.account_id]
+        path_mismatch = False
+        if meta_owned:
+            recorded = Path(str(meta_owned[0]["risk_db_path"])).resolve()
+            path_mismatch = recorded != risk_path.resolve()
+        if accounts != {self.account_id} or foreign_orders or (meta_foreign and not meta_owned) or path_mismatch:
+            self._check("账户归属", "FAIL", "账户与原库归属不一致")
+        else:
+            self._check("账户归属", "PASS", "原库账户与本次绑定一致")
+        pending = [row for row in orders if row["account_id"] == self.account_id and row["status"] in UNRESOLVED_ORDER_STATUSES]
+        if pending:
+            self._check("未决订单", "FAIL", "原订单库仍有未决订单")
+        else:
+            self._check("未决订单", "PASS", "原订单库没有未决订单")
+        if holds or blockers:
+            self._check("风险阻断", "FAIL", "原风险库仍有阻断")
+        else:
+            self._check("风险阻断", "PASS", "原风险库没有阻断")
 
     def write(self) -> None:
         self.ended = self.clock.utc_millis()
@@ -503,6 +633,83 @@ def _unpack(result: object) -> tuple[int, object]:
     return 200, result
 
 
+def _finite_original(value: object) -> tuple[str, bool]:
+    if isinstance(value, bool) or value is None:
+        return ("null" if value is None else json.dumps(value), False)
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, int):
+        text = str(value)
+    elif isinstance(value, float):
+        text = json.dumps(value)
+    else:
+        return json.dumps(value, ensure_ascii=False), False
+    try:
+        number = Decimal(text)
+    except Exception:
+        return text, False
+    return text, bool(number.is_finite())
+
+
+def _order_rows(body: object) -> list[dict] | None:
+    if isinstance(body, list):
+        rows = body
+    elif isinstance(body, dict) and isinstance(body.get("orders"), list) and set(body) <= {"orders"}:
+        rows = body["orders"]
+    else:
+        return None
+    parsed: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("clientOrderId"), str) or not row["clientOrderId"].strip():
+            return None
+        parsed.append(row)
+    return parsed
+
+
+def _file_gate(path: Path, label: str) -> tuple[str, str]:
+    if not path.is_file():
+        return "FAIL", f"{label}不存在，未新建"
+    try:
+        if label == "原订单库":
+            _read_order_db(path)
+        else:
+            _read_risk_db(path)
+    except Exception:
+        return "FAIL", f"{label}无法只读核对"
+    return "PASS", f"已只读打开{label}"
+
+
+def _connect_readonly(path: Path) -> sqlite3.Connection:
+    uri = "file:" + quote(path.resolve().as_posix()) + "?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=5)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only=ON")
+    return connection
+
+
+def _read_order_db(path: Path) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+    connection = _connect_readonly(path)
+    try:
+        orders = connection.execute("SELECT account_id, status FROM live_orders").fetchall()
+        meta = connection.execute("SELECT account_id, risk_db_path FROM live_session_meta").fetchall()
+        return list(orders), list(meta)
+    finally:
+        connection.close()
+
+
+def _read_risk_db(path: Path) -> tuple[set[str], int, int]:
+    connection = _connect_readonly(path)
+    try:
+        accounts = {str(row["account_id"]) for row in connection.execute("SELECT account_id FROM account_state")}
+        holds = int(connection.execute("SELECT COUNT(*) FROM live_risk_holds").fetchone()[0])
+        blockers = int(
+            connection.execute("SELECT COUNT(*) FROM blockers WHERE cleared_at IS NULL").fetchone()[0]
+        )
+        return accounts, holds, blockers
+    finally:
+        connection.close()
+
+
 def _rows(body: object, key: str) -> list[dict]:
     if isinstance(body, list):
         return [row for row in body if isinstance(row, dict)]
@@ -534,6 +741,33 @@ def _rule_reason(row: dict) -> str:
             return f"{row.get('symbol')} 面值无法核对"
         if size != Decimal("1"):
             return f"{row.get('symbol')} 面值不是 1"
+    filters = row.get("filters")
+    if not isinstance(filters, list):
+        return f"{row.get('symbol')} 缺少价格步长、数量步长、最小数量或最小名义额"
+    wanted = {
+        "PRICE_FILTER": ("tickSize",),
+        "LOT_SIZE": ("stepSize", "minQty"),
+        "MIN_NOTIONAL": ("notional", "minNotional"),
+    }
+    for filter_type, keys in wanted.items():
+        matches = [item for item in filters if isinstance(item, dict) and item.get("filterType") == filter_type]
+        if len(matches) != 1:
+            return f"{row.get('symbol')} 缺少价格步长、数量步长、最小数量或最小名义额"
+        present = [key for key in keys if key in matches[0]]
+        if filter_type == "MIN_NOTIONAL":
+            if not present:
+                return f"{row.get('symbol')} 缺少最小名义额"
+            for key in present:
+                text, ok = _finite_original(matches[0][key])
+                if not ok or Decimal(text) <= 0:
+                    return f"{row.get('symbol')} 最小名义额不是有限正数"
+        else:
+            if tuple(present) != keys:
+                return f"{row.get('symbol')} 缺少价格步长、数量步长或最小数量"
+            for key in keys:
+                text, ok = _finite_original(matches[0][key])
+                if not ok or Decimal(text) <= 0:
+                    return f"{row.get('symbol')} 的 {key} 不是有限正数"
     return ""
 
 
