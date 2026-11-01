@@ -66,6 +66,7 @@ WALLET_FIELDS = ("walletBalance", "availableBalance", "unrealizedProfit", "margi
 
 
 BUDGET_NS = 1_000_000_000
+SERVER_TIME_QUANTUM_NS = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -77,7 +78,9 @@ class ClockSample:
     m1_before: int
     m1_after: int
     server_time: int
-    quantum_ns: int
+    utc_quantum_ns: int
+    mono_quantum_ns: int
+    server_quantum_ns: int
 
 
 @dataclass(frozen=True)
@@ -89,14 +92,11 @@ class ClockJudgement:
     reason: str
 
 
-def clock_quantum_ns() -> int:
-    """两种时钟的量化单位，取实际分辨率的纳秒上界。"""
-    quantum = 1
-    for name in ("time", "monotonic"):
-        resolution = time.get_clock_info(name).resolution
-        nanos = (Decimal(str(resolution)) * Decimal(BUDGET_NS)).to_integral_value(rounding=ROUND_CEILING)
-        quantum = max(quantum, int(nanos))
-    return quantum
+def resolution_ns(clock_name: str) -> int:
+    """把时钟分辨率换成不低估的整数纳秒。"""
+    resolution = time.get_clock_info(clock_name).resolution
+    nanos = (Decimal(str(resolution)) * Decimal(BUDGET_NS)).to_integral_value(rounding=ROUND_CEILING)
+    return max(1, int(nanos))
 
 
 class Clock:
@@ -109,8 +109,14 @@ class Clock:
     def utc_millis(self) -> int:
         return self.utc_ns() // 1_000_000
 
-    def quantum_ns(self) -> int:
-        return clock_quantum_ns()
+    def utc_quantum_ns(self) -> int:
+        return resolution_ns("time")
+
+    def mono_quantum_ns(self) -> int:
+        return resolution_ns("monotonic")
+
+    def server_quantum_ns(self) -> int:
+        return SERVER_TIME_QUANTUM_NS
 
 
 def transport_security():
@@ -123,13 +129,12 @@ def refuse_redirect(status: int, location: str) -> None:
 
 
 def judge_clock(sample: ClockSample) -> ClockJudgement:
-    """RTT 只来自单调时钟。采样区间和量化精度只用来判断经过时间是否相容。
+    """用三种时钟各自的量化区间判断经过时间，再用最坏偏移进入 1000 毫秒门禁。
 
-    相容只说明两种经过时间落在同一次采样能解释的范围内。随后仍用
-    `|offset| + u ≤ 1000` 毫秒，且 `u ≤ 1000` 毫秒。u 含 RTT 的一半和量化单位，
-    不用负数不确定度。
+    相容只说明 UTC 与单调时钟的经过时间有交集。随后仍要求最坏
+    `|offset| + u ≤ 1000` 毫秒，且 `u ≤ 1000` 毫秒。不把服务端毫秒读数当成精确纳秒。
     """
-    if sample.quantum_ns < 1:
+    if sample.utc_quantum_ns < 1 or sample.mono_quantum_ns < 1 or sample.server_quantum_ns < 1:
         return _clock_fail(sample, "时间量化精度无效")
     if not (
         sample.m0_before <= sample.m0_after
@@ -137,31 +142,47 @@ def judge_clock(sample: ClockSample) -> ClockJudgement:
         and sample.m0_after <= sample.m1_before
     ):
         return _clock_fail(sample, "单调时钟倒退")
-    rtt = sample.m1_after - sample.m0_before
     if sample.t1 < sample.t0:
-        return _clock_result(sample, rtt, "FAIL", "UTC时间倒退")
+        return _clock_result(sample, "FAIL", "UTC时间倒退")
     if not _elapsed_compatible(sample):
-        return _clock_result(sample, rtt, "FAIL", "无法解释的时间跳变")
-    allowance = rtt + 2 * sample.quantum_ns
-    twice_offset = _twice_offset_ns(sample)
-    if allowance > 2 * BUDGET_NS or abs(twice_offset) + allowance > 2 * BUDGET_NS:
-        reason = "不确定度超过1000毫秒" if allowance > 2 * BUDGET_NS else "偏移加不确定度超过1000毫秒"
-        return _clock_result(sample, rtt, "FAIL", reason)
-    return _clock_result(sample, rtt, "PASS", "")
+        return _clock_result(sample, "FAIL", "无法解释的时间跳变")
+    span = _max_span_ns(sample)
+    worst_twice = _worst_twice_offset_ns(sample)
+    if span > 2 * BUDGET_NS or worst_twice + span > 2 * BUDGET_NS:
+        reason = "不确定度超过1000毫秒" if span > 2 * BUDGET_NS else "偏移加不确定度超过1000毫秒"
+        return _clock_result(sample, "FAIL", reason)
+    return _clock_result(sample, "PASS", "")
 
 
 def _elapsed_compatible(sample: ClockSample) -> bool:
-    quantum = sample.quantum_ns
+    utc_slack = sample.utc_quantum_ns - 1
+    mono_slack = sample.mono_quantum_ns - 1
     utc_elapsed = sample.t1 - sample.t0
-    utc_low = utc_elapsed - quantum + 1
-    utc_high = utc_elapsed + quantum - 1
-    mono_low = sample.m1_before - sample.m0_after
-    mono_high = sample.m1_after - sample.m0_before
+    utc_low = utc_elapsed - utc_slack
+    utc_high = utc_elapsed + utc_slack
+    mono_low = (sample.m1_before - sample.m0_after) - mono_slack
+    mono_high = (sample.m1_after - sample.m0_before) + mono_slack
     return utc_low <= mono_high and mono_low <= utc_high
 
 
-def _twice_offset_ns(sample: ClockSample) -> int:
-    return 2 * sample.server_time * 1_000_000 - (sample.t0 + sample.t1)
+def _max_span_ns(sample: ClockSample) -> int:
+    return (sample.m1_after - sample.m0_before) + (sample.mono_quantum_ns - 1)
+
+
+def _worst_twice_offset_ns(sample: ClockSample) -> int:
+    utc_slack = sample.utc_quantum_ns - 1
+    server_slack = sample.server_quantum_ns - 1
+    sum_low = sample.t0 + sample.t1
+    sum_high = sum_low + 2 * utc_slack
+    server_low = sample.server_time * 1_000_000
+    server_high = server_low + server_slack
+    candidates = (
+        abs(2 * server_low - sum_low),
+        abs(2 * server_low - sum_high),
+        abs(2 * server_high - sum_low),
+        abs(2 * server_high - sum_high),
+    )
+    return max(candidates)
 
 
 def redact_text(text: str, secrets: tuple[str, ...] = ()) -> str:
@@ -379,11 +400,12 @@ class _Runner:
             m1_before,
             m1_after,
             0 if server is None else server,
-            self.clock.quantum_ns(),
+            self.clock.utc_quantum_ns(),
+            self.clock.mono_quantum_ns(),
+            self.clock.server_quantum_ns(),
         )
         if server is None:
-            span = m1_after - m0_before
-            return sample, _clock_result(sample, span if span > 0 else 0, "FAIL", "服务器时间缺失")
+            return sample, _clock_result(sample, "FAIL", "服务器时间缺失")
         return sample, judge_clock(sample)
 
     def _rules(self) -> None:
@@ -706,17 +728,19 @@ class _Runner:
             clock_lines.append(
                 " ".join(
                     [
-                        f"t0={sample.t0}",
-                        f"t1={sample.t1}",
-                        f"m0={sample.m0_before}",
-                        f"m0_after={sample.m0_after}",
-                        f"m1={sample.m1_after}",
-                        f"m1_before={sample.m1_before}",
-                        f"serverTime={sample.server_time}",
-                        f"quantum_ns={sample.quantum_ns}",
-                        f"rtt={judgement.rtt}",
-                        f"u={judgement.uncertainty}",
-                        f"offset={judgement.offset}",
+                        f"t0_ns={sample.t0}",
+                        f"t1_ns={sample.t1}",
+                        f"m0_before_ns={sample.m0_before}",
+                        f"m0_after_ns={sample.m0_after}",
+                        f"m1_before_ns={sample.m1_before}",
+                        f"m1_after_ns={sample.m1_after}",
+                        f"serverTime_ms={sample.server_time}",
+                        f"utc_quantum_ns={sample.utc_quantum_ns}",
+                        f"mono_quantum_ns={sample.mono_quantum_ns}",
+                        f"server_quantum_ns={sample.server_quantum_ns}",
+                        f"rtt_ns={judgement.rtt}",
+                        f"u_ns={judgement.uncertainty}",
+                        f"worst_abs_offset_ns={judgement.offset}",
                         f"verdict={judgement.verdict}",
                         f"reason={judgement.reason}",
                     ]
@@ -988,17 +1012,18 @@ def _clock_fail(sample: ClockSample, reason: str) -> ClockJudgement:
     return ClockJudgement("FAIL", 0, "", "", reason)
 
 
-def _clock_result(sample: ClockSample, rtt: int, verdict: str, reason: str) -> ClockJudgement:
-    twice_offset = _twice_offset_ns(sample)
+def _clock_result(sample: ClockSample, verdict: str, reason: str) -> ClockJudgement:
+    rtt = sample.m1_after - sample.m0_before
+    span = _max_span_ns(sample) if sample.mono_quantum_ns >= 1 else rtt
+    twice_offset = _worst_twice_offset_ns(sample) if sample.server_quantum_ns >= 1 and sample.utc_quantum_ns >= 1 else 0
     if twice_offset % 2 == 0:
         offset = str(twice_offset // 2)
     else:
         offset = f"{twice_offset}/2"
-    twice_uncertainty = rtt + 2 * max(sample.quantum_ns, 0)
-    if twice_uncertainty % 2 == 0:
-        uncertainty = str(twice_uncertainty // 2)
+    if span % 2 == 0:
+        uncertainty = str(span // 2)
     else:
-        uncertainty = f"{twice_uncertainty}/2"
+        uncertainty = f"{span}/2"
     return ClockJudgement(verdict, rtt, uncertainty, offset, reason)
 
 
