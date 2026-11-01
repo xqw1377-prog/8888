@@ -76,6 +76,14 @@ class OrderStore:
             )
             """
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_session_meta (
+                account_id TEXT PRIMARY KEY,
+                risk_db_path TEXT NOT NULL
+            )
+            """
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -91,7 +99,7 @@ class OrderStore:
                     SET status='UNKNOWN'
                     WHERE account_id=? AND (
                         (dispatch_started=1 AND status='INTENT')
-                        OR status='CANCELING'
+                        OR status IN ('CANCELING', 'QUERYING')
                     )
                     """,
                     (account_id,),
@@ -100,6 +108,30 @@ class OrderStore:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+
+    def set_risk_path(self, account_id: str, path: str) -> None:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO live_session_meta(account_id, risk_db_path) VALUES (?,?)
+                    ON CONFLICT(account_id) DO UPDATE SET risk_db_path=excluded.risk_db_path
+                    """,
+                    (account_id, path),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def get_risk_path(self, account_id: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT risk_db_path FROM live_session_meta WHERE account_id=?",
+                (account_id,),
+            ).fetchone()
+        return None if row is None else str(row["risk_db_path"])
 
     def for_account(self, account_id: str) -> list[LiveOrder]:
         with self._lock:

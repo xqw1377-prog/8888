@@ -136,6 +136,7 @@ class LiveSession:
         *,
         now: datetime,
         path: str | None = None,
+        risk: RiskEngine | None = None,
     ) -> None:
         self._risk: RiskEngine | None = None
         identity = _admit_identity(grant)
@@ -165,6 +166,9 @@ class LiveSession:
             (budget_notional(order) for order in self.orders.for_account(self.grant.account_id)),
             start=D("0"),
         )
+        if isinstance(risk, RiskEngine):
+            self._bind_risk(risk)
+        self._recover_unknown_orders(now)
 
     @property
     def reserved_notional(self) -> Decimal:
@@ -207,8 +211,8 @@ class LiveSession:
             client_order_id=client_order_id,
             allowed=self.grant.symbols,
         )
-        if isinstance(risk, RiskEngine) and risk.account_id == self.grant.account_id:
-            self._risk = risk
+        if isinstance(risk, RiskEngine):
+            self._bind_risk(risk)
         if reduce_only:
             raise CtsError("减仓写单不在本批放行，未发送请求", reason_code="LIVE_TRADING_HOLD")
         if computed > self.grant.max_notional:
@@ -303,8 +307,12 @@ class LiveSession:
 
     def query(self, *, symbol: str, client_order_id: str, now: datetime, risk: RiskEngine | None = None) -> dict:
         if isinstance(risk, RiskEngine):
-            self._risk = risk
+            self._bind_risk(risk)
         order = self._require_own(client_order_id, symbol)
+        if order.status not in ("CANCELED", "EXPIRED", "REJECTED", "FILLED"):
+            self._bound_risk(order)
+            self._save_order(order, status="QUERYING", dispatch_started=True, now=now)
+            self._hold_risk_unknown(order.reservation_id, now)
         try:
             body = self._signed(
                 "GET",
@@ -320,13 +328,15 @@ class LiveSession:
 
     def cancel(self, *, symbol: str, client_order_id: str, now: datetime, risk: RiskEngine | None = None) -> dict:
         if isinstance(risk, RiskEngine):
-            self._risk = risk
+            self._bind_risk(risk)
         order = self._require_own(client_order_id, symbol)
         if order.status == "FILLED":
             raise CtsError("订单已全部成交，未发送撤单", reason_code="RECONCILIATION_FAILED")
         if order.status in ("CANCELED", "EXPIRED", "REJECTED"):
             return order.body
+        self._bound_risk(order)
         self._save_order(order, status="CANCELING", dispatch_started=True, now=now)
+        self._hold_risk_unknown(order.reservation_id, now)
         try:
             body = self._signed(
                 "DELETE",
@@ -450,23 +460,16 @@ class LiveSession:
         order = self.get_order(client_order_id)
         status = body.get("status")
         definitive = {"NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "REJECTED"}
-        reported_symbol = body.get("symbol")
-        reported_side = body.get("side")
-        expected_side = "BUY" if order.side == Side.LONG.value else "SELL"
-        if (
-            body.get("clientOrderId") not in (None, client_order_id)
-            or reported_symbol not in (None, order.symbol)
-            or (reported_side is not None and reported_side != expected_side)
-            or status not in definitive
-            or "executedQty" not in body
-        ):
+        try:
+            executed = D(str(body["executedQty"])) if "executedQty" in body else None
+        except (ArithmeticError, TypeError, ValueError):
+            executed = None
+        loose_new = status == "NEW" and executed == 0 and order.executed_qty == 0
+        if status not in definitive or executed is None or (not self._identity_ok(order, body) and not loose_new):
             self._save_order(order, status="UNKNOWN", dispatch_started=True, now=now)
             self._hold_risk_unknown(order.reservation_id, now)
             raise CtsError("交易所订单状态不能确认", reason_code="UNKNOWN_ORDER")
         try:
-            executed = D(str(body["executedQty"]))
-            if "origQty" in body and D(str(body["origQty"])) != order.qty:
-                raise ValueError("origQty")
             if not executed.is_finite() or executed < 0 or executed > order.qty:
                 raise ValueError("executedQty")
             if status == "NEW" and executed != 0:
@@ -481,6 +484,8 @@ class LiveSession:
             raise CtsError("成交数量与原订单不一致，未释放额度", reason_code="RECONCILIATION_FAILED") from None
         if executed < order.executed_qty:
             raise CtsError("成交数量不能回退", reason_code="RECONCILIATION_FAILED")
+        if executed > order.executed_qty or status in ("CANCELED", "EXPIRED", "REJECTED", "FILLED", "PARTIALLY_FILLED"):
+            self._bound_risk(order)
         if status == "REJECTED" and executed != 0:
             self._project_execution(order, executed, "FILLED" if executed == order.qty else "PARTIALLY_FILLED", now)
             self._save_order(
@@ -503,28 +508,64 @@ class LiveSession:
             body=body,
         )
 
+    def _identity_ok(self, order: LiveOrder, body: dict) -> bool:
+        expected_side = "BUY" if order.side == Side.LONG.value else "SELL"
+        if body.get("clientOrderId") != order.client_order_id or body.get("symbol") != order.symbol:
+            return False
+        if body.get("side") != expected_side or "origQty" not in body:
+            return False
+        try:
+            return D(str(body["origQty"])) == order.qty
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+
     def _project_execution(self, order: LiveOrder, executed: Decimal, status: str, now: datetime) -> None:
         risk = self._risk
         if not isinstance(risk, RiskEngine) or risk.account_id != order.account_id:
+            if executed > order.executed_qty or status in ("CANCELED", "EXPIRED", "REJECTED", "FILLED", "PARTIALLY_FILLED"):
+                raise CtsError("风险引擎未绑定，未写入成交或释放", reason_code="RECONCILIATION_FAILED")
             return
-        delta = executed - order.executed_qty
-        if delta > 0:
-            risk.apply_fill(
-                order.reservation_id,
-                delta,
-                fill_id=f"{order.client_order_id}:{format(executed, 'f')}",
-                now=now,
-            )
+        try:
+            risk.project_live_cumulative(order.reservation_id, order.client_order_id, executed, now=now)
+        except UnitValidationError as exc:
+            raise CtsError("成交数量不能回退", reason_code="RECONCILIATION_FAILED") from exc
         if status in ("CANCELED", "EXPIRED", "REJECTED", "FILLED"):
             risk.release_live_order(order.client_order_id)
+            risk.release_unbound_reservation(order.reservation_id)
         still_unknown = any(
             row.client_order_id != order.client_order_id
             and row.reservation_id == order.reservation_id
             and row.status == "UNKNOWN"
-            for row in self.orders.for_account(order.account_id)
+        for row in self.orders.for_account(order.account_id)
         )
-        if not still_unknown:
+        if status != "UNKNOWN" and not still_unknown:
             risk.clear_live_unknown(order.reservation_id)
+
+    def _bind_risk(self, risk: RiskEngine) -> None:
+        if risk.account_id != self.grant.account_id:
+            raise CtsError("风险引擎不属于该账户", reason_code="RECONCILIATION_FAILED")
+        self._risk = risk
+        self.orders.set_risk_path(self.grant.account_id, risk.store.path)
+
+    def _bound_risk(self, order: LiveOrder) -> RiskEngine:
+        risk = self._risk
+        if not isinstance(risk, RiskEngine) or risk.account_id != order.account_id:
+            raise CtsError("风险引擎未绑定，未写入成交或释放", reason_code="RECONCILIATION_FAILED")
+        return risk
+
+    def _recover_unknown_orders(self, now: datetime) -> None:
+        unknown = [order for order in self.orders.for_account(self.grant.account_id) if order.status == "UNKNOWN"]
+        if not unknown:
+            return
+        if self._risk is None:
+            path = self.orders.get_risk_path(self.grant.account_id)
+            if not path or not Path(path).is_file():
+                return
+            from cts.risk.store import RiskStore
+
+            self._risk = RiskEngine(RiskStore(path), self.grant.account_id)
+        for order in unknown:
+            self._risk.hold_live_unknown(order.reservation_id, now=now)
 
     def _hold_risk_unknown(self, reservation_id: str, now: datetime) -> None:
         risk = self._risk

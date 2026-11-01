@@ -502,9 +502,16 @@ class RiskEngine:
 
     @contextmanager
     def live_send_guard(self):
-        """暂停落库和发送权抢占共用这把锁，POST 也必须在锁内完成。"""
+        """账户库的写事务包住发送许可和 POST。另一个 RiskStore 不能在这期间提交暂停。"""
         with self.store._lock:
-            yield
+            self.store._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                self.store._conn.execute("ROLLBACK")
+                raise
+            else:
+                self.store._conn.execute("COMMIT")
 
     def recheck_live_open(
         self,
@@ -521,31 +528,48 @@ class RiskEngine:
         qty = D(qty)
         notional = D(notional)
         price = D(price)
+        if self.store._conn.in_transaction:
+            self._recheck_live_open(self.store._conn, reservation_id, client_order_id=client_order_id, symbol=symbol, side=side, qty=qty, notional=notional, price=price)
+            return
         with self.store.txn() as conn:
-            self._require_live_reservation(
-                conn,
-                reservation_id,
-                symbol=symbol,
-                side=side,
-                qty=qty,
-                notional=notional,
-                price=price,
-            )
-            current = conn.execute(
-                """
-                SELECT * FROM live_order_allocations
-                WHERE client_order_id=? AND released=0
-                """,
-                (client_order_id,),
-            ).fetchone()
-            if (
-                current is None
-                or current["reservation_id"] != reservation_id
-                or D(current["qty"]) != qty
-                or D(current["notional"]) != notional
-                or D(current["price"]) != price
-            ):
-                raise NewRiskBlockedError("发送前风险占用已失效", reason_code="NEW_RISK_BLOCKED")
+            self._recheck_live_open(conn, reservation_id, client_order_id=client_order_id, symbol=symbol, side=side, qty=qty, notional=notional, price=price)
+
+    def _recheck_live_open(
+        self,
+        conn,
+        reservation_id: str,
+        *,
+        client_order_id: str,
+        symbol: str,
+        side: Side,
+        qty: Decimal,
+        notional: Decimal,
+        price: Decimal,
+    ) -> None:
+        self._require_live_reservation(
+            conn,
+            reservation_id,
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            notional=notional,
+            price=price,
+        )
+        current = conn.execute(
+            """
+            SELECT * FROM live_order_allocations
+            WHERE client_order_id=? AND released=0
+            """,
+            (client_order_id,),
+        ).fetchone()
+        if (
+            current is None
+            or current["reservation_id"] != reservation_id
+            or D(current["qty"]) != qty
+            or D(current["notional"]) != notional
+            or D(current["price"]) != price
+        ):
+            raise NewRiskBlockedError("发送前风险占用已失效", reason_code="NEW_RISK_BLOCKED")
 
     def release_live_order(self, client_order_id: str) -> None:
         with self.store.txn() as conn:
@@ -553,6 +577,78 @@ class RiskEngine:
                 "UPDATE live_order_allocations SET released=1 WHERE client_order_id=?",
                 (client_order_id,),
             )
+
+    def release_unbound_reservation(self, reservation_id: str) -> None:
+        """没有仍有效的订单占用时，撤掉预留上的未成交额度。请求途中标成未知的预留，在确定撤单或完结后同样释放。"""
+        with self.store.txn() as conn:
+            held = conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM live_order_allocations
+                WHERE reservation_id=? AND released=0
+                """,
+                (reservation_id,),
+            ).fetchone()["n"]
+            if held:
+                return
+            try:
+                reservation = self.store.get_reservation(conn, reservation_id)
+            except KeyError:
+                return
+            if reservation.account_id != self.account_id:
+                return
+            if reservation.status in (ReservationStatus.RELEASED, ReservationStatus.FILLED):
+                return
+            status = ReservationStatus.FILLED if reservation.filled_qty >= reservation.qty else ReservationStatus.RELEASED
+            conn.execute(
+                "UPDATE reservations SET status=? WHERE reservation_id=?",
+                (status.value, reservation_id),
+            )
+
+    def project_live_cumulative(
+        self,
+        reservation_id: str,
+        client_order_id: str,
+        cumulative: Decimal,
+        *,
+        now: datetime,
+    ) -> Decimal:
+        """按风险库里的累计游标只补差额。游标和成交在同一个事务里提交。"""
+        cumulative = D(cumulative)
+        if cumulative < 0:
+            raise UnitValidationError("成交数量不能为负")
+        with self.store.txn() as conn:
+            row = conn.execute(
+                "SELECT reservation_id, cumulative FROM live_fill_cursors WHERE client_order_id=?",
+                (client_order_id,),
+            ).fetchone()
+            previous = D(row["cumulative"]) if row is not None else D("0")
+            if row is not None and row["reservation_id"] != reservation_id:
+                raise ConflictError("成交游标与预留不一致")
+            if cumulative < previous:
+                raise UnitValidationError("成交数量不能回退")
+            delta = cumulative - previous
+            if delta > 0:
+                self._book_fill(
+                    conn,
+                    reservation_id,
+                    delta,
+                    fill_id=f"live:{client_order_id}:{format(cumulative, 'f')}",
+                    now=now,
+                )
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO live_fill_cursors(client_order_id, account_id, reservation_id, cumulative)
+                    VALUES (?,?,?,?)
+                    """,
+                    (client_order_id, self.account_id, reservation_id, format(cumulative, "f")),
+                )
+            elif delta > 0:
+                conn.execute(
+                    "UPDATE live_fill_cursors SET cumulative=? WHERE client_order_id=?",
+                    (format(cumulative, "f"), client_order_id),
+                )
+            return cumulative
 
     def hold_live_unknown(self, reservation_id: str, *, now: datetime) -> None:
         """订单状态未知时，预留本身进入 UNKNOWN，风险引擎不能再生成新预留。"""
@@ -654,57 +750,60 @@ class RiskEngine:
             raise UnitValidationError("成交数量必须为正")
         fill_id = fill_id or uuid4().hex
         with self.store.txn() as conn:
-            res = self.store.get_reservation(conn, reservation_id)
-            existed = conn.execute(
-                "SELECT reservation_id, qty FROM reservation_fills WHERE fill_id=?",
-                (fill_id,),
-            ).fetchone()
-            if existed:
-                if existed["reservation_id"] != reservation_id:
-                    raise ConflictError(f"fill_id 归属冲突: {fill_id}")
-                if D(existed["qty"]) != fill_qty:
-                    raise ConflictError(f"fill_id 异容: {fill_id}")
-                return res
-            previous = self._filled_qty(conn, reservation_id)
-            conn.execute(
-                "INSERT INTO reservation_fills(fill_id, reservation_id, qty) VALUES (?,?,?)",
-                (fill_id, reservation_id, format(fill_qty, "f")),
-            )
-            new_filled = self._filled_qty(conn, reservation_id)
-            if new_filled > res.qty:
-                raise UnitValidationError("禁止用超量成交翻仓或超预留占用")
-            added = new_filled - previous
-            if res.status == ReservationStatus.RELEASED:
-                status = ReservationStatus.FILLED if new_filled == res.qty else ReservationStatus.RELEASED
-            else:
-                status = self._status_after_fill(res, new_filled)
-            conn.execute(
-                "UPDATE reservations SET filled_qty=?, status=? WHERE reservation_id=?",
-                (format(new_filled, "f"), status.value, reservation_id),
-            )
-            if added > 0:
-                self._add_position_occupancy(
-                    conn,
-                    res,
-                    added,
-                    (added / res.qty) * res.notional,
-                    (added / res.qty) * res.risk_amount,
-                )
-            self.store._bump_risk(conn, self.account_id)
-            self.store._trace(
+            return self._book_fill(conn, reservation_id, fill_qty, fill_id=fill_id, now=ts)
+
+    def _book_fill(self, conn, reservation_id: str, fill_qty: Decimal, *, fill_id: str, now: datetime) -> Reservation:
+        res = self.store.get_reservation(conn, reservation_id)
+        existed = conn.execute(
+            "SELECT reservation_id, qty FROM reservation_fills WHERE fill_id=?",
+            (fill_id,),
+        ).fetchone()
+        if existed:
+            if existed["reservation_id"] != reservation_id:
+                raise ConflictError(f"fill_id 归属冲突: {fill_id}")
+            if D(existed["qty"]) != fill_qty:
+                raise ConflictError(f"fill_id 异容: {fill_id}")
+            return res
+        previous = self._filled_qty(conn, reservation_id)
+        conn.execute(
+            "INSERT INTO reservation_fills(fill_id, reservation_id, qty) VALUES (?,?,?)",
+            (fill_id, reservation_id, format(fill_qty, "f")),
+        )
+        new_filled = self._filled_qty(conn, reservation_id)
+        if new_filled > res.qty:
+            raise UnitValidationError("禁止用超量成交翻仓或超预留占用")
+        added = new_filled - previous
+        if res.status == ReservationStatus.RELEASED:
+            status = ReservationStatus.FILLED if new_filled == res.qty else ReservationStatus.RELEASED
+        else:
+            status = self._status_after_fill(res, new_filled)
+        conn.execute(
+            "UPDATE reservations SET filled_qty=?, status=? WHERE reservation_id=?",
+            (format(new_filled, "f"), status.value, reservation_id),
+        )
+        if added > 0:
+            self._add_position_occupancy(
                 conn,
-                self.account_id,
-                ts,
-                "FILL",
-                {
-                    "reservation_id": reservation_id,
-                    "fill_id": fill_id,
-                    "fill_qty": format(fill_qty, "f"),
-                    "filled_qty": format(new_filled, "f"),
-                    "status": status.value,
-                },
+                res,
+                added,
+                (added / res.qty) * res.notional,
+                (added / res.qty) * res.risk_amount,
             )
-            return self.store.get_reservation(conn, reservation_id)
+        self.store._bump_risk(conn, self.account_id)
+        self.store._trace(
+            conn,
+            self.account_id,
+            now,
+            "FILL",
+            {
+                "reservation_id": reservation_id,
+                "fill_id": fill_id,
+                "fill_qty": format(fill_qty, "f"),
+                "filled_qty": format(new_filled, "f"),
+                "status": status.value,
+            },
+        )
+        return self.store.get_reservation(conn, reservation_id)
 
     def mark_unknown(self, reservation_id: str, *, now: Optional[datetime] = None) -> Reservation:
         ts = now or utc_now()

@@ -85,6 +85,12 @@ CREATE TABLE IF NOT EXISTS reservation_fills (
     reservation_id TEXT NOT NULL,
     qty TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS live_fill_cursors (
+    client_order_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    reservation_id TEXT NOT NULL,
+    cumulative TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS blockers (
     blocker_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL,
