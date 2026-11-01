@@ -1,6 +1,6 @@
 # 真实只读核验执行材料
 
-状态：**传输器已审查，原库未绑定，执行未决定。**
+状态：**传输器已审查，原库确认不存在，执行未决定。**
 
 本文件不是授权。没有另一次书面决定之前，不执行下面的命令，不访问 `https://demo-fapi.binance.com`。TESTNET 试单仍未授权。实盘保持 `HOLD`。`main` 不合并。
 
@@ -44,39 +44,89 @@
 
 ## 2. 账户及原库绑定
 
-本机目前没有可核验的原库。仓库内没有订单库或风险库文件。`.env` 只有 `CTS_BINANCE_API_KEY`、`CTS_BINANCE_API_SECRET`、`CTS_BINANCE_NETWORK` 这三个名字。网络变量的值是 `TESTNET`。没有账户编号。
+本机没有可当作原库的订单库和风险库。这次核对只打开已有文件，没有新建。
+
+查过的位置：仓库目录、桌面、文稿、`~/Library/Application Support`，以及用户主目录里除照片、音乐、依赖缓存和 `Library` 其余部分以外的数据库。环境变量里没有账户编号。`.env` 只有 `CTS_BINANCE_API_KEY`、`CTS_BINANCE_API_SECRET`、`CTS_BINANCE_NETWORK` 这三个名字，网络变量的值是 `TESTNET`。
+
+临时目录里有 pytest 留下的库，还有 98 个 `cts-orders-*.db`。后者的账户只有 `acct-1` 和 `acct-durable-path`，`live_session_meta` 都是空的。这些是测试残留，不是已经绑定的原库，也不能拿来通过只读核验。
 
 | 项 | 当前值 |
 |---|---|
 | 账户 | 未绑定 |
-| 订单库 | 不存在。材料不新建 |
-| 风险库 | 不存在。材料不新建 |
+| 订单库 | 不存在 |
+| 风险库 | 不存在 |
 | `CTS_BINANCE_NETWORK` | `TESTNET` |
 
-执行前必须已经有两个原文件，并且订单库里有一条与该账户、该风险库路径一致的绑定。缺失就失败，不新建。下面命令里的账户和库路径没有默认值；这三个环境变量现在都没有设置。
+只读命令发现原库缺失就停止，并且不新建。下面不把临时库填进命令。
 
-## 3. 证据输出目录
+## 3. 首次初始化
+
+这是单独的一步，不是只读核验，这次也不执行。没有另一次书面决定之前，不创建这两个文件。
+
+决定需要写明三件事：账户编号、两个还不存在的持久路径、本地账本的起始权益。起始权益是新账本自己的数字，不是币安钱包读数，也不沿用任何屏幕上的旧余额。本材料不代选这三项。
+
+路径若已经存在，就停下来把它当作原库核对，不用初始化覆盖。两个路径都不存在时，顺序是：
+
+1. 用 `RiskEngine.create` 建立风险库，然后关闭。不调用 `RiskEngine.reopen`，避免写入重启阻断。
+2. 用 `OrderStore` 建立订单库，把该账户的 `risk_db_path` 写成风险库的解析后路径，然后关闭。不打开 `LiveSession`，避免把在途订单改成 `UNKNOWN`。
+3. 这一步不访问币安，也不等于允许随后执行只读核验。
+
+初始化完成后，只读核验应能看到一条账户与风险库路径的绑定、风险库里只有这个账户、没有未决订单、没有风险持有、没有未清除阻断。只读运行器仍然不会在缺失时自己建库。
+
+## 4. 证据输出目录
 
 `/Users/xinquanwang/8888/var/readonly-evidence`
 
 `var/` 已忽略，不提交证据。目录里将来会有方案第 6 节的 E1–E11。生成并封印之后不再改。证据不写密钥、签名值或完整签名 URL。
 
-## 4. 执行命令
+## 5. 执行命令
 
-在仓库根目录执行。命令现在会停在授权检查，不会访问网络。账户和原库绑定好之前，也不要设置 `CTS_READONLY_EXECUTION`。
+命令只在冻结提交的独立工作目录里加载源码。当前分支后续的文档改动不会被这次核验导入。工作目录是 `/Users/xinquanwang/8888/var/readonly-worktree`，位于已忽略的 `var/` 下。目录若已存在就停，不覆盖、不重置。
+
+导入产品模块之前先做三件事：`HEAD` 必须等于完整冻结 SHA；`src` 和 `pyproject.toml` 没有已修改或已暂存的差异；`src` 下没有未跟踪代码。E1 使用这次 `git rev-parse HEAD` 的结果。冻结 SHA 只用来核对，不直接写进证据。
+
+下面的命令现在会停在授权检查。原库还没有绑定，也不要设置 `CTS_READONLY_EXECUTION`。
 
 ```bash
-cd /Users/xinquanwang/8888
-PYTHONPATH=src .venv/bin/python - <<'PY'
+git -C /Users/xinquanwang/8888 worktree add --detach \
+  /Users/xinquanwang/8888/var/readonly-worktree \
+  5b51364a52ef935b9f7c014711c637dc127771f3
+cd /Users/xinquanwang/8888/var/readonly-worktree
+env -u PYTHONPATH /Users/xinquanwang/8888/.venv/bin/python - <<'PY'
 import os
+import subprocess
 import sys
 from pathlib import Path
 
-from cts.execution.live import _urllib_opener, credentials_from_env, load_local_env
-from cts.ops.readonly_verify import PLAN_BASELINE, run_readonly_verification
+FREEZE = "5b51364a52ef935b9f7c014711c637dc127771f3"
+root = Path("/Users/xinquanwang/8888/var/readonly-worktree")
+
+def git(*args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout
 
 if os.environ.get("CTS_READONLY_EXECUTION") != "授权本进程按冻结方案执行一次只读核验":
     sys.exit("只读核验尚未授权执行")
+head = git("rev-parse", "HEAD").strip()
+if head != FREEZE:
+    sys.exit(f"HEAD 不是冻结提交：{head}")
+dirty = git("status", "--porcelain", "--untracked-files=all", "--", "src", "pyproject.toml")
+untracked = git("ls-files", "--others", "--exclude-standard", "--", "src")
+if dirty.strip() or untracked.strip():
+    sys.exit("源码或依赖配置已变化，或 src 下有未跟踪代码")
+code_sha = git("rev-parse", "HEAD").strip()
+if code_sha != head:
+    sys.exit("源码 SHA 在核对后发生了变化")
+
+sys.path.insert(0, str(root / "src"))
+from cts.execution.live import _urllib_opener, credentials_from_env, load_local_env
+from cts.ops.readonly_verify import PLAN_BASELINE, run_readonly_verification
+
 load_local_env()
 if os.environ.get("CTS_BINANCE_NETWORK") != "TESTNET":
     sys.exit("网络不是 TESTNET")
@@ -94,7 +144,7 @@ print(run_readonly_verification(
     risk_db=risk_db,
     network="TESTNET",
     credentials=credentials_from_env(),
-    code_sha="5b51364a52ef935b9f7c014711c637dc127771f3",
+    code_sha=code_sha,
     plan_sha=PLAN_BASELINE,
 ))
 PY
@@ -104,6 +154,6 @@ PY
 
 `LiveSession` 不能当作这次入口，打开会话会写订单库。只读钱包展示接口也不能代替这次核验。
 
-## 5. 仍未做的事
+## 6. 仍未做的事
 
-没有修改产品源码，没有访问币安，没有读取或记录密钥，没有执行上面的命令。原库仍未绑定。执行决定还没有作。
+没有修改产品源码，没有访问币安，没有读取或记录密钥，没有创建工作目录，没有执行上面的命令，也没有按第 3 节建库。真实只读核验和首次初始化都还没有决定。
