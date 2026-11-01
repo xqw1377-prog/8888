@@ -1,10 +1,10 @@
 # 真实只读核验执行材料
 
-状态：**第二次真实只读核验未通过，该轮授权已经结束。** 第一次摘要见 `docs/READONLY_RUN_SUMMARY.md`。重跑摘要见 `docs/READONLY_RUN_R2_SUMMARY.md`。网络诊断范围见 `docs/READONLY_NETDIAG_SCOPE.md`。初始化证据见 `docs/LOCAL_LEDGER_INIT.md`。
+状态：**CLOCK-R1 已登记为新的本地冻结点，网络重跑未授权。** 登记见 `docs/READONLY_RUNNER_ACCEPTANCE.md`。第一次摘要见 `docs/READONLY_RUN_SUMMARY.md`。重跑摘要见 `docs/READONLY_RUN_R2_SUMMARY.md`。网络诊断范围见 `docs/READONLY_NETDIAG_SCOPE.md`。初始化证据见 `docs/LOCAL_LEDGER_INIT.md`。
 
 本文件不是授权。没有另一次书面决定之前，不执行下面的命令，不访问 `https://demo-fapi.binance.com`。TESTNET 试单仍未授权。实盘保持 `HOLD`。`main` 不合并。
 
-只读运行器的本地假传输器验收冻结在 `5b51364a52ef935b9f7c014711c637dc127771f3`。那次验收不覆盖真实网络传输。方案条文以 `4ae24f4ee2293e68d607d26c872e671ff5d442d6` 为准。
+只读运行器的当前本地冻结点是 `0c23ca1f444090593b5369ef238ddf4be43bc9b3`。历史冻结点 `5b51364a52ef935b9f7c014711c637dc127771f3` 保留。两次真实核验仍是未通过。本地验收不覆盖真实网络传输。方案条文以 `4ae24f4ee2293e68d607d26c872e671ff5d442d6` 为准。
 
 ## 1. 拟用网络传输器
 
@@ -18,7 +18,7 @@
 | `_ssl_context` | 同文件第 786–793 行 | `1d2bdaf803c664f6750e58c64cc3cc949de76fce` |
 | 文件 blob | `src/cts/execution/live.py` | `6bd696db9c5fc2dcfc8f86295d18c633b500877c` |
 
-这个 blob 已经包含在运行器冻结提交 `5b51364` 中。`5b51364` 之后没有再改 `src/cts/execution/live.py`。
+这个 blob 已经包含在历史冻结点 `5b51364` 中，并原样留在当前冻结点 `0c23ca1`。从 `5b51364` 到 `0c23ca1`，产品源码只改了 `src/cts/ops/readonly_verify.py`，`src/cts/execution/live.py` 和 `pyproject.toml` 没有变。
 
 这次只读了源码，并在本机检查了 SSL 上下文和 `build_opener` 装上的 handler。没有打开套接字，没有访问币安。
 
@@ -85,31 +85,34 @@
 
 ## 4. 证据输出目录
 
-`/Users/xinquanwang/8888/var/readonly-evidence`
+已封存、不得覆盖：
 
-`var/` 已忽略，不提交证据。目录里将来会有方案第 6 节的 E1–E11。生成并封印之后不再改。证据不写密钥、签名值或完整签名 URL。
+- `/Users/xinquanwang/8888/var/readonly-evidence`
+- `/Users/xinquanwang/8888/var/readonly-evidence-r2`
+
+`var/` 已忽略，不提交证据。以后若另有执行决定，必须使用一个新的证据目录。生成并封印之后不再改。证据不写密钥、签名值或完整签名 URL。
 
 ## 5. 执行命令
 
-命令只在冻结提交的独立工作目录里加载源码。当前分支后续的文档改动不会被这次核验导入。工作目录是 `/Users/xinquanwang/8888/var/readonly-worktree`，位于已忽略的 `var/` 下。目录若已存在就停，不覆盖、不重置。
+命令只在当前冻结提交的独立工作目录里加载源码。当前分支后续的文档改动不会被这次核验导入。已有工作树 `/Users/xinquanwang/8888/var/readonly-worktree` 停在历史冻结点 `5b51364`，不得重置。新的工作目录是 `/Users/xinquanwang/8888/var/readonly-worktree-0c23ca1`。目录若已存在就停，不覆盖、不重置。
 
-导入产品模块之前先做三件事：`HEAD` 必须等于完整冻结 SHA；`src` 和 `pyproject.toml` 没有已修改或已暂存的差异；`src` 下没有未跟踪代码。E1 使用这次 `git rev-parse HEAD` 的结果。冻结 SHA 只用来核对，不直接写进证据。
+导入产品模块之前先做三件事：`HEAD` 必须等于完整冻结 SHA `0c23ca1f444090593b5369ef238ddf4be43bc9b3`；`src` 和 `pyproject.toml` 没有已修改或已暂存的差异；`src` 下没有未跟踪代码。E1 使用这次 `git rev-parse HEAD` 的结果。冻结 SHA 只用来核对，不直接写进证据。证据目录若已存在，或等于两份已封存目录之一，就停止。命令里的 `readonly-evidence-pending` 只是未执行草稿中的占位路径，本登记不创建它。
 
-下面的命令现在会停在授权检查。原库还没有绑定，也不要设置 `CTS_READONLY_EXECUTION`。
+下面的命令现在会停在授权检查。不要设置 `CTS_READONLY_EXECUTION`。本段登记不执行它。
 
 ```bash
 git -C /Users/xinquanwang/8888 worktree add --detach \
-  /Users/xinquanwang/8888/var/readonly-worktree \
-  5b51364a52ef935b9f7c014711c637dc127771f3
-cd /Users/xinquanwang/8888/var/readonly-worktree
+  /Users/xinquanwang/8888/var/readonly-worktree-0c23ca1 \
+  0c23ca1f444090593b5369ef238ddf4be43bc9b3
+cd /Users/xinquanwang/8888/var/readonly-worktree-0c23ca1
 env -u PYTHONPATH /Users/xinquanwang/8888/.venv/bin/python - <<'PY'
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-FREEZE = "5b51364a52ef935b9f7c014711c637dc127771f3"
-root = Path("/Users/xinquanwang/8888/var/readonly-worktree")
+FREEZE = "0c23ca1f444090593b5369ef238ddf4be43bc9b3"
+root = Path("/Users/xinquanwang/8888/var/readonly-worktree-0c23ca1")
 
 def git(*args: str) -> str:
     completed = subprocess.run(
@@ -132,6 +135,13 @@ if dirty.strip() or untracked.strip():
 code_sha = git("rev-parse", "HEAD").strip()
 if code_sha != head:
     sys.exit("源码 SHA 在核对后发生了变化")
+evidence_dir = Path("/Users/xinquanwang/8888/var/readonly-evidence-pending")
+sealed = {
+    Path("/Users/xinquanwang/8888/var/readonly-evidence"),
+    Path("/Users/xinquanwang/8888/var/readonly-evidence-r2"),
+}
+if evidence_dir in sealed or evidence_dir.exists():
+    sys.exit("证据目录已封存或已存在，停止")
 
 sys.path.insert(0, str(root / "src"))
 from cts.execution.live import _urllib_opener, credentials_from_env, load_local_env
@@ -148,7 +158,7 @@ for path in (order_db, risk_db):
         sys.exit(f"原库不存在，未新建：{path}")
 print(run_readonly_verification(
     opener=_urllib_opener(),
-    evidence_dir=Path("/Users/xinquanwang/8888/var/readonly-evidence"),
+    evidence_dir=evidence_dir,
     account_id=account_id,
     order_db=order_db,
     risk_db=risk_db,
@@ -166,4 +176,4 @@ PY
 
 ## 6. 仍未做的事
 
-产品源码没有改。第 5 节命令已执行两次，分别写入两个证据目录。第一次在第三次对时的 TLS 握手超时后停止。第二次从第一次对时重新执行，在时钟取样 1 失败后停止。两次都没有重试，也没有把交易所余额写回本地账本。第二次授权已经结束。没有新的书面决定之前，不再执行该命令。TESTNET 试单仍未授权。
+第 5 节里的旧命令已执行两次，分别写入两个已封存证据目录，源码都是历史冻结点 `5b51364`。第一次在第三次对时的 TLS 握手超时后停止。第二次从第一次对时重新执行，在时钟取样 1 失败后停止。两次都没有重试，也没有把交易所余额写回本地账本。CLOCK-R1 的本地通过不把这两次改为通过，也不授权用 `0c23ca1` 重跑。没有新的书面决定之前，不执行更新后的命令。TESTNET 试单仍未授权。
