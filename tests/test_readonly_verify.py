@@ -470,6 +470,67 @@ def test_block_added_during_collection_fails_the_end_snapshot(tmp_path) -> None:
     assert blocks[-1].startswith("风险阻断 FAIL")
 
 
+def _run_books(tmp_path, opener, clock, orders, risk) -> str:
+    return run_readonly_verification(
+        opener=opener,
+        evidence_dir=tmp_path / "evidence",
+        account_id="acct-readonly",
+        order_db=str(orders),
+        risk_db=str(risk),
+        network="TESTNET",
+        credentials=_creds(),
+        code_sha=CODE,
+        clock=clock,
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql", "params", "snapshot", "detail"),
+    [
+        ("DELETE FROM live_session_meta", (), "风险库绑定=缺失", "缺少匹配的账户与风险库路径绑定"),
+        (
+            "UPDATE live_session_meta SET risk_db_path=? WHERE account_id=?",
+            ("/tmp/other-risk.db", "acct-readonly"),
+            "风险库绑定=不匹配",
+            "缺少匹配的账户与风险库路径绑定",
+        ),
+        (
+            "UPDATE account_state SET account_id=? WHERE account_id=?",
+            ("acct-other", "acct-readonly"),
+            "账户=acct-other",
+            "账户与原库归属不一致",
+        ),
+    ],
+)
+def test_binding_drift_during_collection_fails_the_end_snapshot(tmp_path, sql, params, snapshot, detail) -> None:
+    import sqlite3
+
+    orders, risk = _prepare_books(tmp_path)
+    planted = {"done": False}
+    target = orders if "live_session_meta" in sql else risk
+
+    class Plant(FakeOpener):
+        def __call__(self, method: str, url: str, headers: dict[str, str]):
+            if not planted["done"]:
+                planted["done"] = True
+                connection = sqlite3.connect(target)
+                connection.execute(sql, params)
+                connection.commit()
+                connection.close()
+            return super().__call__(method, url, headers)
+
+    clock = SteadyClock()
+    opener = Plant(clock)
+    verdict = _run_books(tmp_path, opener, clock, orders, risk)
+    assert verdict == "只读核验未通过"
+    checks = (tmp_path / "evidence" / "e5_checks.txt").read_text(encoding="utf-8")
+    assert snapshot in checks
+    ownership = [line for line in checks.splitlines() if line.startswith("账户归属 ")]
+    assert ownership[0].startswith("账户归属 PASS")
+    assert ownership[-1].startswith("账户归属 FAIL")
+    assert detail in ownership[-1]
+
+
 def test_caller_ids_do_not_register_open_orders(tmp_path) -> None:
     orders, risk = _prepare_books(tmp_path)
     clock = SteadyClock()

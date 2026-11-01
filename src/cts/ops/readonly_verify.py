@@ -599,19 +599,21 @@ class _Runner:
             self.stopped = True
 
     def recheck_end(self) -> None:
-        """封存前再读一次未决订单和风险阻断，留下结束快照。"""
+        """封存前用结束快照重核账户归属、风险库路径、未决订单和风险阻断。"""
         order_path = Path(self.order_db)
         risk_path = Path(self.risk_db)
         try:
             if not order_path.is_file() or not risk_path.is_file():
-                self.end_snapshot = "结束快照 原库缺失 未决订单=未核对 风险阻断=未核对"
+                self.end_snapshot = "结束快照 原库缺失 账户归属=未核对 未决订单=未核对 风险阻断=未核对"
+                self._check("账户归属", "FAIL", "结束快照时原库缺失，未再放行")
                 self._check("未决订单", "FAIL", "结束快照时原库缺失，未再放行")
                 self._check("风险阻断", "FAIL", "结束快照时原库缺失，未再放行")
                 return
-            orders, _meta = _read_order_db(order_path)
-            _accounts, holds, blockers = _read_risk_db(risk_path)
+            orders, meta = _read_order_db(order_path)
+            accounts, holds, blockers = _read_risk_db(risk_path)
         except Exception:
-            self.end_snapshot = "结束快照 无法只读核对"
+            self.end_snapshot = "结束快照 无法只读核对 账户归属=未核对"
+            self._check("账户归属", "FAIL", "结束快照无法只读核对")
             self._check("未决订单", "FAIL", "结束快照无法只读核对")
             self._check("风险阻断", "FAIL", "结束快照无法只读核对")
             return
@@ -622,8 +624,10 @@ class _Runner:
         identities = [str(row["client_order_id"]) for row in pending]
         self.end_snapshot = (
             f"结束快照 未决订单={len(pending)} clientOrderId={','.join(identities) or '-'} "
-            f"风险持有={holds} 未清除阻断={blockers}"
+            f"风险持有={holds} 未清除阻断={blockers} "
+            f"{_binding_snapshot(meta, accounts, risk_path, self.account_id)}"
         )
+        self._record_ownership(orders, meta, accounts, risk_path)
         if pending:
             self._check("未决订单", "FAIL", "结束快照仍有未决订单")
         else:
@@ -727,6 +731,18 @@ def _finite_original(value: object) -> tuple[str, bool]:
     except Exception:
         return text, False
     return text, bool(number.is_finite())
+
+
+def _binding_snapshot(meta: list, accounts: set[str], risk_path: Path, account_id: str) -> str:
+    owned = [row for row in meta if row["account_id"] == account_id]
+    if len(owned) != 1 or not str(owned[0]["risk_db_path"]).strip():
+        binding = "缺失"
+    elif Path(str(owned[0]["risk_db_path"])).resolve() != risk_path.resolve():
+        binding = "不匹配"
+    else:
+        binding = "匹配"
+    observed = ",".join(sorted(accounts)) or "缺失"
+    return f"账户={observed} 风险库绑定={binding}"
 
 
 def _wallet_lines(rows: list[dict]) -> str:
