@@ -1,10 +1,10 @@
 # 真实只读核验执行材料
 
-状态：**CLOCK-R1 已登记为新的本地冻结点，网络重跑未授权。** 登记见 `docs/READONLY_RUNNER_ACCEPTANCE.md`。第一次摘要见 `docs/READONLY_RUN_SUMMARY.md`。重跑摘要见 `docs/READONLY_RUN_R2_SUMMARY.md`。网络诊断范围见 `docs/READONLY_NETDIAG_SCOPE.md`。初始化证据见 `docs/LOCAL_LEDGER_INIT.md`。
+状态：**当前冻结点上的一轮只读核验已经执行并结束，再一次网络重跑未授权。** 登记见 `docs/READONLY_RUNNER_ACCEPTANCE.md`。第一次摘要见 `docs/READONLY_RUN_SUMMARY.md`。第二次摘要见 `docs/READONLY_RUN_R2_SUMMARY.md`。第三次摘要见 `docs/READONLY_RUN_R3_SUMMARY.md`。网络诊断范围见 `docs/READONLY_NETDIAG_SCOPE.md`。初始化证据见 `docs/LOCAL_LEDGER_INIT.md`。
 
-本文件不是授权。没有另一次书面决定之前，不执行下面的命令，不访问 `https://demo-fapi.binance.com`。TESTNET 试单仍未授权。实盘保持 `HOLD`。`main` 不合并。
+本文件不是另一次授权。没有新的书面决定之前，不执行下面的命令，不访问 `https://demo-fapi.binance.com`。TESTNET 试单仍未授权。实盘保持 `HOLD`。`main` 不合并。
 
-只读运行器的当前本地冻结点是 `0c23ca1f444090593b5369ef238ddf4be43bc9b3`。历史冻结点 `5b51364a52ef935b9f7c014711c637dc127771f3` 保留。两次真实核验仍是未通过。本地验收不覆盖真实网络传输。方案条文以 `4ae24f4ee2293e68d607d26c872e671ff5d442d6` 为准。
+只读运行器的当前本地冻结点是 `0c23ca1f444090593b5369ef238ddf4be43bc9b3`。历史冻结点 `5b51364a52ef935b9f7c014711c637dc127771f3` 保留。三次真实核验都是未通过。本地验收不覆盖真实网络传输。方案条文以 `4ae24f4ee2293e68d607d26c872e671ff5d442d6` 为准。
 
 ## 1. 拟用网络传输器
 
@@ -89,6 +89,7 @@
 
 - `/Users/xinquanwang/8888/var/readonly-evidence`
 - `/Users/xinquanwang/8888/var/readonly-evidence-r2`
+- `/Users/xinquanwang/8888/var/readonly-evidence-r3`
 
 `var/` 已忽略，不提交证据。以后若另有执行决定，必须使用一个新的证据目录。生成并封印之后不再改。证据不写密钥、签名值或完整签名 URL。
 
@@ -96,9 +97,9 @@
 
 命令只在当前冻结提交的独立工作目录里加载源码。当前分支后续的文档改动不会被这次核验导入。已有工作树 `/Users/xinquanwang/8888/var/readonly-worktree` 停在历史冻结点 `5b51364`，不得重置。新的工作目录是 `/Users/xinquanwang/8888/var/readonly-worktree-0c23ca1`。目录若已存在就停，不覆盖、不重置。
 
-导入产品模块之前先做三件事：`HEAD` 必须等于完整冻结 SHA `0c23ca1f444090593b5369ef238ddf4be43bc9b3`；`src` 和 `pyproject.toml` 没有已修改或已暂存的差异；`src` 下没有未跟踪代码。E1 使用这次 `git rev-parse HEAD` 的结果。冻结 SHA 只用来核对，不直接写进证据。证据目录若已存在，或等于两份已封存目录之一，就停止。命令里的 `readonly-evidence-pending` 只是未执行草稿中的占位路径，本登记不创建它。
+导入产品模块之前先做三件事：`HEAD` 必须等于完整冻结 SHA `0c23ca1f444090593b5369ef238ddf4be43bc9b3`；`src` 和 `pyproject.toml` 没有已修改或已暂存的差异；`src` 下没有未跟踪代码。E1 使用这次 `git rev-parse HEAD` 的结果。冻结 SHA 只用来核对，不直接写进证据。证据目录若已存在，或等于已封存目录之一，就停止。
 
-下面的命令现在会停在授权检查。不要设置 `CTS_READONLY_EXECUTION`。本段登记不执行它。
+下面的命令已经按一次书面决定执行过，证据写入 `readonly-evidence-r3`。该目录现在存在，再执行会在导入前停止。不要再设置 `CTS_READONLY_EXECUTION`。新工作树里没有环境文件，这次实际调用按绝对路径读了仓库里原有的环境文件，没有把值写入证据。
 
 ```bash
 git -C /Users/xinquanwang/8888 worktree add --detach \
@@ -135,7 +136,7 @@ if dirty.strip() or untracked.strip():
 code_sha = git("rev-parse", "HEAD").strip()
 if code_sha != head:
     sys.exit("源码 SHA 在核对后发生了变化")
-evidence_dir = Path("/Users/xinquanwang/8888/var/readonly-evidence-pending")
+evidence_dir = Path("/Users/xinquanwang/8888/var/readonly-evidence-r3")
 sealed = {
     Path("/Users/xinquanwang/8888/var/readonly-evidence"),
     Path("/Users/xinquanwang/8888/var/readonly-evidence-r2"),
@@ -176,4 +177,4 @@ PY
 
 ## 6. 仍未做的事
 
-第 5 节里的旧命令已执行两次，分别写入两个已封存证据目录，源码都是历史冻结点 `5b51364`。第一次在第三次对时的 TLS 握手超时后停止。第二次从第一次对时重新执行，在时钟取样 1 失败后停止。两次都没有重试，也没有把交易所余额写回本地账本。CLOCK-R1 的本地通过不把这两次改为通过，也不授权用 `0c23ca1` 重跑。没有新的书面决定之前，不执行更新后的命令。TESTNET 试单仍未授权。
+第 5 节里的命令已执行三次。前两次使用历史冻结点 `5b51364`，分别写入两个已封存证据目录。第一次在第三次对时的 TLS 握手超时后停止。第二次从第一次对时重新执行，在时钟取样 1 失败后停止。第三次使用当前冻结点 `0c23ca1`，写入 `/Users/xinquanwang/8888/var/readonly-evidence-r3`；一次 `GET /fapi/v1/time` 返回 `200` 后，时钟取样 1 因偏移加不确定度超过 1000 毫秒而停止。三次都没有重试，也没有把交易所余额写回本地账本。前两次未通过记录保持不变。这一轮授权已经结束。没有新的书面决定之前，不再执行该命令。TESTNET 试单仍未授权。
