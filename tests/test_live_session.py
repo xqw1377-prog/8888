@@ -1,6 +1,7 @@
 """实盘通道。S1-A：不该发的请求不能到达传输层。签名只出现在已准入的模拟盘开仓。"""
 
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, urlsplit
 import threading
 
 import pytest
@@ -37,7 +38,10 @@ class RecordingOpener:
         self.calls.append((method, url, headers))
         if not self.responses:
             raise AssertionError("unexpected request")
-        return self.responses.pop(0)
+        body = self.responses.pop(0)
+        if method == "POST":
+            body = complete_order_ack(url, body)
+        return body
 
 
 def transport(responses: list) -> tuple[RecordingOpener, object]:
@@ -69,12 +73,38 @@ def grant(**overrides) -> LiveGrant:
     return LiveGrant(**payload)
 
 
+def complete_order_ack(url: str, body):
+    """正常回执补上本次请求里的订单身份。已经写明的字段保持原样。"""
+    if not isinstance(body, dict) or "status" not in body:
+        return body
+    query = parse_qs(urlsplit(url).query)
+
+    def pick(*names: str) -> str | None:
+        for name in names:
+            values = query.get(name)
+            if values:
+                return values[0]
+        return None
+
+    filled = dict(body)
+    defaults = {
+        "clientOrderId": pick("newClientOrderId", "origClientOrderId"),
+        "symbol": pick("symbol"),
+        "side": pick("side"),
+        "origQty": pick("quantity"),
+    }
+    for key, value in defaults.items():
+        if key not in filled and value is not None:
+            filled[key] = value
+    return filled
+
+
 def healthy(symbol: str = "BTCUSDT") -> list:
     return [
         {"dualSidePosition": False},
         {"multiAssetsMargin": False},
         [{"symbol": symbol, "marginType": "isolated"}],
-        {"orderId": 1, "status": "NEW", "executedQty": "0"},
+        {"orderId": 1, "status": "NEW", "executedQty": "0", "symbol": symbol, "side": "BUY"},
     ]
 
 
@@ -372,7 +402,10 @@ def test_order_intent_is_stored_before_the_post(tmp_path) -> None:
         seen.append((method, order.status, order.dispatch_started))
         if not responses:
             raise AssertionError("unexpected request")
-        return responses.pop(0)
+        body = responses.pop(0)
+        if method == "POST":
+            body = complete_order_ack(url, body)
+        return body
 
     session = LiveSession(
         grant(network="TESTNET", account_id=engine.account_id, max_notional=D("100")),
@@ -447,7 +480,7 @@ def test_lost_submit_response_keeps_the_budget_until_query(tmp_path) -> None:
 
     def reconcile(method: str, url: str, headers: dict[str, str]):
         calls.append(method + ":reconcile")
-        return {"status": "NEW", "executedQty": "0", "origQty": "0.6", "clientOrderId": "cid-1"}
+        return {"status": "NEW", "executedQty": "0", "origQty": "0.6", "clientOrderId": "cid-1", "symbol": "BTCUSDT", "side": "BUY"}
 
     restored._transport = open_testnet_transport(reconcile)
     body = restored.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
@@ -471,7 +504,7 @@ def test_partial_fill_releases_only_the_unfilled_notional(tmp_path) -> None:
             {"symbol": "BTCUSDT", "marginType": "isolated"},
             {"symbol": "ETHUSDT", "marginType": "isolated"},
         ],
-        {"status": "NEW", "executedQty": "0", "origQty": "0.6", "clientOrderId": "cid-2"},
+        {"status": "NEW", "executedQty": "0", "origQty": "0.6", "clientOrderId": "cid-2", "symbol": "ETHUSDT", "side": "BUY"},
     ]
     opener, pinned = transport(script)
     session = LiveSession(
@@ -509,7 +542,7 @@ def test_expired_grant_blocks_new_risk_but_keeps_query_and_cancel(tmp_path) -> N
     opener, pinned = transport(
         healthy()
         + [
-            {"status": "NEW", "executedQty": "0", "origQty": "0.01", "clientOrderId": "cid-1"},
+            {"status": "NEW", "executedQty": "0", "origQty": "0.01", "clientOrderId": "cid-1", "symbol": "BTCUSDT", "side": "BUY"},
             {"status": "CANCELED", "executedQty": "0", "origQty": "0.01", "clientOrderId": "cid-1", "symbol": "BTCUSDT", "side": "BUY"},
         ]
     )
@@ -742,7 +775,7 @@ def test_same_client_order_posts_once(tmp_path) -> None:
         def __call__(self, method: str, url: str, headers: dict[str, str]):
             if method == "POST":
                 self.posts += 1
-                return {"orderId": 1, "status": "NEW", "executedQty": "0"}
+                return complete_order_ack(url, {"orderId": 1, "status": "NEW", "executedQty": "0"})
             if "positionSide" in url:
                 return {"dualSidePosition": False}
             if "multiAssetsMargin" in url:
@@ -789,7 +822,7 @@ def test_two_sessions_share_the_account_cap(tmp_path) -> None:
         def __call__(self, method: str, url: str, headers: dict[str, str]):
             if method == "POST":
                 self.posts += 1
-                return {"orderId": 1, "status": "NEW", "executedQty": "0"}
+                return complete_order_ack(url, {"orderId": 1, "status": "NEW", "executedQty": "0"})
             if "positionSide" in url:
                 return {"dualSidePosition": False}
             if "multiAssetsMargin" in url:
@@ -860,7 +893,7 @@ def test_pause_during_preflight_blocks_the_post(tmp_path) -> None:
             return {"dualSidePosition": False}
         if method == "POST":
             posts.append(url)
-            return {"orderId": 1, "status": "NEW", "executedQty": "0"}
+            return complete_order_ack(url, {"orderId": 1, "status": "NEW", "executedQty": "0"})
         if "multiAssetsMargin" in url:
             return {"multiAssetsMargin": False}
         return [{"symbol": "BTCUSDT", "marginType": "isolated"}]
@@ -946,7 +979,7 @@ def test_unknown_order_blocks_new_risk_until_it_is_known(tmp_path) -> None:
         engine.reserve([req("ETHUSDT", "s-after-unknown")], now=NOW)
     assert blocked.value.reason_code == "UNKNOWN_ORDER"
     session._transport = open_testnet_transport(
-        lambda method, url, headers: {"status": "NEW", "executedQty": "0", "origQty": "0.6", "clientOrderId": "cid-1"}
+        lambda method, url, headers: {"status": "NEW", "executedQty": "0", "origQty": "0.6", "clientOrderId": "cid-1", "symbol": "BTCUSDT", "side": "BUY"}
     )
     session.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW, risk=engine)
     created = engine.reserve([req("ETHUSDT", "s-after-known")], now=NOW)
@@ -1061,7 +1094,7 @@ def test_pause_commits_only_before_or_after_the_send_lock(tmp_path) -> None:
             posts.append(url)
             entered.set()
             assert blocked.wait(2)
-            return {"orderId": 1, "status": "NEW", "executedQty": "0"}
+            return complete_order_ack(url, {"orderId": 1, "status": "NEW", "executedQty": "0"})
         if "positionSide" in url:
             return {"dualSidePosition": False}
         if "multiAssetsMargin" in url:
@@ -1329,7 +1362,7 @@ def test_query_interruption_blocks_new_risk(tmp_path) -> None:
         if "multiAssetsMargin" in url:
             return {"multiAssetsMargin": False}
         if method == "POST":
-            return {"orderId": 1, "status": "NEW", "executedQty": "0"}
+            return complete_order_ack(url, {"orderId": 1, "status": "NEW", "executedQty": "0"})
         return [{"symbol": "BTCUSDT", "marginType": "isolated"}]
 
     path = ensure_order_db(tmp_path / "query-hold.db")
@@ -1356,6 +1389,89 @@ def test_query_interruption_blocks_new_risk(tmp_path) -> None:
     with pytest.raises(CtsError) as blocked:
         engine.reserve([req("ETHUSDT", "s-after-restart")], now=NOW)
     assert blocked.value.reason_code == "UNKNOWN_ORDER"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("symbol", "ETHUSDT"),
+        ("side", "SELL"),
+        ("clientOrderId", "cid-other"),
+        ("origQty", "1"),
+    ],
+)
+def test_new_rejects_an_identity_conflict(tmp_path, field: str, value: str) -> None:
+    engine, reservation, session, _opener = admitted(tmp_path, healthy())
+    submit(session, engine, reservation.reservation_id)
+    body = {
+        "status": "NEW",
+        "executedQty": "0",
+        "origQty": "0.01",
+        "clientOrderId": "cid-1",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+    }
+    body[field] = value
+    session._transport = open_testnet_transport(lambda method, url, headers: body)
+    with pytest.raises(CtsError) as err:
+        session.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert err.value.reason_code == "UNKNOWN_ORDER"
+    stored = session.get_order("cid-1")
+    assert stored.status == "UNKNOWN"
+    assert stored.executed_qty == D("0")
+    assert session.reserved_notional == D("1")
+    with pytest.raises(CtsError) as blocked:
+        engine.reserve([req("ETHUSDT", f"s-conflict-{field}")], now=NOW)
+    assert blocked.value.reason_code == "UNKNOWN_ORDER"
+
+
+def test_new_without_identity_is_not_accepted(tmp_path) -> None:
+    engine, reservation, session, _opener = admitted(tmp_path, healthy())
+    submit(session, engine, reservation.reservation_id)
+    session._transport = open_testnet_transport(lambda method, url, headers: {"status": "NEW", "executedQty": "0"})
+    with pytest.raises(CtsError) as err:
+        session.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert err.value.reason_code == "UNKNOWN_ORDER"
+    assert session.get_order("cid-1").status == "UNKNOWN"
+    assert session.reserved_notional == D("1")
+
+
+def test_one_query_cannot_clear_another_orders_hold(tmp_path) -> None:
+    from cts.risk.models import ReservationStatus
+
+    engine, reservation, session, _opener = admitted(tmp_path, healthy() + healthy())
+    submit(session, engine, reservation.reservation_id, qty=D("0.2"), price=D("100"), notional=D("20"), client_order_id="cid-a")
+    submit(session, engine, reservation.reservation_id, qty=D("0.2"), price=D("100"), notional=D("20"), client_order_id="cid-b")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def opener(method: str, url: str, headers: dict[str, str]):
+        if "origClientOrderId=cid-a" in url:
+            entered.set()
+            assert release.wait(2)
+        return complete_order_ack(
+            url,
+            {"status": "NEW", "executedQty": "0", "origQty": "0.2", "side": "BUY"},
+        )
+
+    session._transport = open_testnet_transport(opener)
+    worker = threading.Thread(target=lambda: session.query(symbol="BTCUSDT", client_order_id="cid-a", now=NOW))
+    worker.start()
+    assert entered.wait(2)
+    session.query(symbol="BTCUSDT", client_order_id="cid-b", now=NOW)
+    assert session.get_order("cid-a").status == "QUERYING"
+    assert session.get_order("cid-b").status == "NEW"
+    stored = next(item for item in engine.occupancy().reservations if item.reservation_id == reservation.reservation_id)
+    assert stored.status == ReservationStatus.UNKNOWN
+    with pytest.raises(CtsError) as blocked:
+        engine.reserve([req("ETHUSDT", "s-while-querying")], now=NOW)
+    assert blocked.value.reason_code == "UNKNOWN_ORDER"
+    release.set()
+    worker.join(2)
+    assert worker.is_alive() is False
+    assert session.get_order("cid-a").status == "NEW"
+    created = engine.reserve([req("ETHUSDT", "s-after-both")], now=NOW)
+    assert created[0].qty > 0
 
 
 def test_cancel_identity_must_be_present(tmp_path) -> None:
@@ -1411,7 +1527,7 @@ def test_another_risk_store_cannot_pause_during_the_post(tmp_path) -> None:
             assert attempting.wait(2)
             time.sleep(0.15)
             assert done.is_set() is False
-            return {"orderId": 1, "status": "NEW", "executedQty": "0"}
+            return complete_order_ack(url, {"orderId": 1, "status": "NEW", "executedQty": "0"})
         if "positionSide" in url:
             return {"dualSidePosition": False}
         if "multiAssetsMargin" in url:

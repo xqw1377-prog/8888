@@ -91,6 +91,14 @@ CREATE TABLE IF NOT EXISTS live_fill_cursors (
     reservation_id TEXT NOT NULL,
     cumulative TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS live_risk_holds (
+    hold_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    reservation_id TEXT NOT NULL,
+    client_order_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS blockers (
     blocker_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL,

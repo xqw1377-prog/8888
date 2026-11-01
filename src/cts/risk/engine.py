@@ -329,7 +329,7 @@ class RiskEngine:
             row = self.store.load_account(conn, self.account_id)
             bundle = self.store.load_bundle(row)
             mode = RuntimeMode(row["mode"])
-            self._admit_new_risk(view, bundle, mode)
+            self._admit_new_risk(view, bundle, mode, conn)
             for req in requests:
                 if req.expected_equity_version is not None and req.expected_equity_version != view.equity_version:
                     raise StaleDataError("权益版本已变，旧预算不能批准新仓")
@@ -414,7 +414,7 @@ class RiskEngine:
             row = self.store.load_account(conn, self.account_id)
             bundle = self.store.load_bundle(row)
             mode = RuntimeMode(row["mode"])
-            self._admit_new_risk(view, bundle, mode)
+            self._admit_new_risk(view, bundle, mode, conn)
             try:
                 reservation = self.store.get_reservation(conn, reservation_id)
             except KeyError as exc:
@@ -650,29 +650,116 @@ class RiskEngine:
                 )
             return cumulative
 
-    def hold_live_unknown(self, reservation_id: str, *, now: datetime) -> None:
-        """订单状态未知时，预留本身进入 UNKNOWN，风险引擎不能再生成新预留。"""
+    def hold_live_request(
+        self,
+        reservation_id: str,
+        client_order_id: str,
+        *,
+        hold_id: str,
+        reason: str,
+        now: datetime,
+    ) -> None:
+        """按请求实例记下阻断。预留在仍有阻断时保持 UNKNOWN。"""
         with self.store.txn() as conn:
-            try:
-                reservation = self.store.get_reservation(conn, reservation_id)
-            except KeyError:
-                return
-            if reservation.account_id != self.account_id:
-                return
-            if reservation.status in (ReservationStatus.FILLED, ReservationStatus.RELEASED, ReservationStatus.UNKNOWN):
-                return
-            conn.execute(
-                """
-                UPDATE reservations
-                SET status=?, unknown_since=COALESCE(unknown_since, ?)
-                WHERE reservation_id=?
-                """,
-                (ReservationStatus.UNKNOWN.value, now.isoformat(), reservation_id),
+            self._insert_live_hold(
+                conn,
+                reservation_id=reservation_id,
+                client_order_id=client_order_id,
+                hold_id=hold_id,
+                reason=reason,
+                now=now,
             )
 
-    def clear_live_unknown(self, reservation_id: str) -> None:
-        """订单已经从交易所得到确定状态后，只解除这笔预留的未知标记。"""
+    def hold_live_unknown(self, reservation_id: str, *, client_order_id: str, now: datetime) -> None:
+        """订单状态未知时，为该订单记下稳定阻断，风险引擎不能再生成新预留。"""
+        self.hold_live_request(
+            reservation_id,
+            client_order_id,
+            hold_id=f"unknown:{client_order_id}",
+            reason="UNKNOWN",
+            now=now,
+        )
+
+    def settle_live_request(
+        self,
+        *,
+        hold_id: str,
+        client_order_id: str,
+        reservation_id: str,
+        keep: set[str],
+    ) -> int:
+        """只删除这次请求自己的阻断，以及该订单上已经不在途的旧阻断。"""
         with self.store.txn() as conn:
+            conn.execute(
+                "DELETE FROM live_risk_holds WHERE hold_id=? AND account_id=?",
+                (hold_id, self.account_id),
+            )
+            rows = conn.execute(
+                """
+                SELECT hold_id FROM live_risk_holds
+                WHERE client_order_id=? AND account_id=?
+                """,
+                (client_order_id, self.account_id),
+            ).fetchall()
+            for row in rows:
+                if row["hold_id"] not in keep:
+                    conn.execute("DELETE FROM live_risk_holds WHERE hold_id=?", (row["hold_id"],))
+            return self._live_hold_count(conn, reservation_id)
+
+    def live_hold_count(self, reservation_id: str) -> int:
+        with self.store.txn() as conn:
+            return self._live_hold_count(conn, reservation_id)
+
+    def _insert_live_hold(
+        self,
+        conn,
+        *,
+        reservation_id: str,
+        client_order_id: str,
+        hold_id: str,
+        reason: str,
+        now: datetime,
+    ) -> None:
+        try:
+            reservation = self.store.get_reservation(conn, reservation_id)
+        except KeyError:
+            return
+        if reservation.account_id != self.account_id:
+            return
+        conn.execute(
+            """
+            INSERT INTO live_risk_holds(hold_id, account_id, reservation_id, client_order_id, reason, created_at)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(hold_id) DO NOTHING
+            """,
+            (hold_id, self.account_id, reservation_id, client_order_id, reason, now.isoformat()),
+        )
+        if reservation.status in (ReservationStatus.FILLED, ReservationStatus.RELEASED, ReservationStatus.UNKNOWN):
+            return
+        conn.execute(
+            """
+            UPDATE reservations
+            SET status=?, unknown_since=COALESCE(unknown_since, ?)
+            WHERE reservation_id=?
+            """,
+            (ReservationStatus.UNKNOWN.value, now.isoformat(), reservation_id),
+        )
+
+    def _live_hold_count(self, conn, reservation_id: str) -> int:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM live_risk_holds
+            WHERE account_id=? AND reservation_id=?
+            """,
+            (self.account_id, reservation_id),
+        ).fetchone()
+        return int(row["n"])
+
+    def clear_live_unknown(self, reservation_id: str) -> None:
+        """这条预留已经没有在途阻断时，才解除未知标记。"""
+        with self.store.txn() as conn:
+            if self._live_hold_count(conn, reservation_id):
+                return
             try:
                 reservation = self.store.get_reservation(conn, reservation_id)
             except KeyError:
@@ -705,7 +792,7 @@ class RiskEngine:
         row = self.store.load_account(conn, self.account_id)
         bundle = self.store.load_bundle(row)
         mode = RuntimeMode(row["mode"])
-        self._admit_new_risk(view, bundle, mode)
+        self._admit_new_risk(view, bundle, mode, conn)
         try:
             reservation = self.store.get_reservation(conn, reservation_id)
         except KeyError as exc:
@@ -1189,7 +1276,7 @@ class RiskEngine:
             )
             self.store._trace(conn, self.account_id, ts, "RECOVERY_FAILED", {"attempt_id": attempt_id, "reason_code": reason_code})
 
-    def _admit_new_risk(self, view: OccupancyView, bundle: ParameterBundle, mode: RuntimeMode) -> None:
+    def _admit_new_risk(self, view: OccupancyView, bundle: ParameterBundle, mode: RuntimeMode, conn) -> None:
         admit_parameters(mode, bundle, view.config_hash)
         if view.system_state in NEW_RISK_BLOCKING_STATES:
             raise NewRiskBlockedError(
@@ -1198,6 +1285,12 @@ class RiskEngine:
             )
         if any(r.status == ReservationStatus.UNKNOWN for r in view.reservations):
             raise NewRiskBlockedError("存在 UNKNOWN 预留，禁止新增风险", reason_code="UNKNOWN_ORDER")
+        held = conn.execute(
+            "SELECT COUNT(*) AS n FROM live_risk_holds WHERE account_id=?",
+            (self.account_id,),
+        ).fetchone()
+        if held["n"]:
+            raise NewRiskBlockedError("存在在途订单，禁止新增风险", reason_code="UNKNOWN_ORDER")
 
     def _size_batch(
         self,

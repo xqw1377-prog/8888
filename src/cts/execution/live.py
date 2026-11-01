@@ -162,6 +162,9 @@ class LiveSession:
         self.base_url = TESTNET_BASE
         self.orders_sent = 0
         self._budget_lock = threading.Lock()
+        self._hold_lock = threading.Lock()
+        self._inflight_holds: set[str] = set()
+        self._hold_seq = 0
         self._reserved_notional = sum(
             (budget_notional(order) for order in self.orders.for_account(self.grant.account_id)),
             start=D("0"),
@@ -295,7 +298,7 @@ class LiveSession:
                 raise
             if sent:
                 saved = self._save_order(self.get_order(client_order_id), status="UNKNOWN", dispatch_started=True, now=now)
-                self._hold_risk_unknown(saved.reservation_id, now)
+                self._hold_risk_unknown(saved.reservation_id, now, saved.client_order_id)
                 raise CtsError("下单响应丢失，订单状态未知，额度继续占用", reason_code="UNKNOWN_ORDER") from None
             self._save_order(self.get_order(client_order_id), status="REJECTED", dispatch_started=False, now=now)
             risk.release_live_order(client_order_id)
@@ -309,10 +312,11 @@ class LiveSession:
         if isinstance(risk, RiskEngine):
             self._bind_risk(risk)
         order = self._require_own(client_order_id, symbol)
+        hold_id = None
         if order.status not in ("CANCELED", "EXPIRED", "REJECTED", "FILLED"):
             self._bound_risk(order)
             self._save_order(order, status="QUERYING", dispatch_started=True, now=now)
-            self._hold_risk_unknown(order.reservation_id, now)
+            hold_id = self._begin_request_hold(order, "QUERYING", now)
         try:
             body = self._signed(
                 "GET",
@@ -321,9 +325,11 @@ class LiveSession:
             )
         except Exception:
             saved = self._save_order(self.get_order(client_order_id), status="UNKNOWN", dispatch_started=True, now=now)
-            self._hold_risk_unknown(saved.reservation_id, now)
+            self._hold_risk_unknown(saved.reservation_id, now, saved.client_order_id)
             raise CtsError("查询响应丢失，订单状态未知，额度继续占用", reason_code="UNKNOWN_ORDER") from None
-        self._apply_venue(order.client_order_id, body, now)
+        saved = self._apply_venue(order.client_order_id, body, now)
+        if hold_id is not None:
+            self._settle_request_hold(saved, hold_id)
         return body
 
     def cancel(self, *, symbol: str, client_order_id: str, now: datetime, risk: RiskEngine | None = None) -> dict:
@@ -336,7 +342,7 @@ class LiveSession:
             return order.body
         self._bound_risk(order)
         self._save_order(order, status="CANCELING", dispatch_started=True, now=now)
-        self._hold_risk_unknown(order.reservation_id, now)
+        hold_id = self._begin_request_hold(order, "CANCELING", now)
         try:
             body = self._signed(
                 "DELETE",
@@ -345,9 +351,10 @@ class LiveSession:
             )
         except Exception:
             saved = self._save_order(self.get_order(client_order_id), status="UNKNOWN", dispatch_started=True, now=now)
-            self._hold_risk_unknown(saved.reservation_id, now)
+            self._hold_risk_unknown(saved.reservation_id, now, saved.client_order_id)
             raise CtsError("撤单响应丢失，订单状态未知，额度继续占用", reason_code="UNKNOWN_ORDER") from None
-        self._apply_venue(order.client_order_id, body, now)
+        saved = self._apply_venue(order.client_order_id, body, now)
+        self._settle_request_hold(saved, hold_id)
         return body
 
     def _require_known(self, client_order_id: str, *, allow_missing: bool) -> LiveOrder | None:
@@ -464,10 +471,9 @@ class LiveSession:
             executed = D(str(body["executedQty"])) if "executedQty" in body else None
         except (ArithmeticError, TypeError, ValueError):
             executed = None
-        loose_new = status == "NEW" and executed == 0 and order.executed_qty == 0
-        if status not in definitive or executed is None or (not self._identity_ok(order, body) and not loose_new):
+        if status not in definitive or executed is None or not self._identity_ok(order, body):
             self._save_order(order, status="UNKNOWN", dispatch_started=True, now=now)
-            self._hold_risk_unknown(order.reservation_id, now)
+            self._hold_risk_unknown(order.reservation_id, now, order.client_order_id)
             raise CtsError("交易所订单状态不能确认", reason_code="UNKNOWN_ORDER")
         try:
             if not executed.is_finite() or executed < 0 or executed > order.qty:
@@ -480,7 +486,7 @@ class LiveSession:
                 raise ValueError("partial")
         except (ValueError, ArithmeticError, TypeError):
             self._save_order(order, status="UNKNOWN", dispatch_started=True, now=now)
-            self._hold_risk_unknown(order.reservation_id, now)
+            self._hold_risk_unknown(order.reservation_id, now, order.client_order_id)
             raise CtsError("成交数量与原订单不一致，未释放额度", reason_code="RECONCILIATION_FAILED") from None
         if executed < order.executed_qty:
             raise CtsError("成交数量不能回退", reason_code="RECONCILIATION_FAILED")
@@ -496,7 +502,7 @@ class LiveSession:
                 executed_qty=executed,
                 body=body,
             )
-            self._hold_risk_unknown(order.reservation_id, now)
+            self._hold_risk_unknown(order.reservation_id, now, order.client_order_id)
             raise CtsError("拒绝状态却带有成交数量，未释放额度", reason_code="RECONCILIATION_FAILED")
         self._project_execution(order, executed, str(status), now)
         return self._save_order(
@@ -532,14 +538,6 @@ class LiveSession:
         if status in ("CANCELED", "EXPIRED", "REJECTED", "FILLED"):
             risk.release_live_order(order.client_order_id)
             risk.release_unbound_reservation(order.reservation_id)
-        still_unknown = any(
-            row.client_order_id != order.client_order_id
-            and row.reservation_id == order.reservation_id
-            and row.status == "UNKNOWN"
-        for row in self.orders.for_account(order.account_id)
-        )
-        if status != "UNKNOWN" and not still_unknown:
-            risk.clear_live_unknown(order.reservation_id)
 
     def _bind_risk(self, risk: RiskEngine) -> None:
         if risk.account_id != self.grant.account_id:
@@ -565,12 +563,53 @@ class LiveSession:
 
             self._risk = RiskEngine(RiskStore(path), self.grant.account_id)
         for order in unknown:
-            self._risk.hold_live_unknown(order.reservation_id, now=now)
+            self._risk.hold_live_unknown(order.reservation_id, client_order_id=order.client_order_id, now=now)
 
-    def _hold_risk_unknown(self, reservation_id: str, now: datetime) -> None:
+    def _begin_request_hold(self, order: LiveOrder, reason: str, now: datetime) -> str:
+        risk = self._bound_risk(order)
+        with self._hold_lock:
+            self._hold_seq += 1
+            hold_id = f"{order.client_order_id}:{reason}:{self._hold_seq}"
+            self._inflight_holds.add(hold_id)
+            risk.hold_live_request(
+                order.reservation_id,
+                order.client_order_id,
+                hold_id=hold_id,
+                reason=reason,
+                now=now,
+            )
+        return hold_id
+
+    def _settle_request_hold(self, order: LiveOrder, hold_id: str) -> None:
+        risk = self._risk
+        if not isinstance(risk, RiskEngine) or risk.account_id != order.account_id:
+            return
+        others_blocked = self._other_request_blocked(order)
+        with self._hold_lock:
+            self._inflight_holds.discard(hold_id)
+            keep = set(self._inflight_holds)
+            remaining = risk.settle_live_request(
+                hold_id=hold_id,
+                client_order_id=order.client_order_id,
+                reservation_id=order.reservation_id,
+                keep=keep,
+            )
+            if remaining or others_blocked:
+                return
+            risk.clear_live_unknown(order.reservation_id)
+
+    def _other_request_blocked(self, order: LiveOrder) -> bool:
+        return any(
+            row.client_order_id != order.client_order_id
+            and row.reservation_id == order.reservation_id
+            and row.status in ("UNKNOWN", "QUERYING", "CANCELING")
+            for row in self.orders.for_account(order.account_id)
+        )
+
+    def _hold_risk_unknown(self, reservation_id: str, now: datetime, client_order_id: str) -> None:
         risk = self._risk
         if isinstance(risk, RiskEngine):
-            risk.hold_live_unknown(reservation_id, now=now)
+            risk.hold_live_unknown(reservation_id, client_order_id=client_order_id, now=now)
 
     def _assert_demo_write_closed(self) -> None:
         if self.grant.network != "TESTNET" or self.base_url != TESTNET_BASE or self._transport.base_url != TESTNET_BASE:
