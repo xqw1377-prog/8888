@@ -1,6 +1,6 @@
 # 模拟盘网络诊断范围
 
-状态：**限定诊断已执行一次并停止。** 脱敏摘要见 `docs/READONLY_NETDIAG_SUMMARY.md`。完整只读核验重跑仍未授权。
+状态：**限定诊断已结束。** 脱敏摘要见 `docs/READONLY_NETDIAG_SUMMARY.md`。本机只读排查见 `docs/READONLY_LOCAL_NET_CHECK.md`。新的连接和完整只读核验重跑仍未授权。
 
 本文件不授权任何连接。一次性只读核验授权已经结束。在另一次书面决定之前，不解析主机、不连接 `demo-fapi.binance.com`、不读取账户、不使用密钥。TESTNET 试单未授权。实盘保持 `HOLD`。`main` 不合并。
 
