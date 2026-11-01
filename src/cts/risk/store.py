@@ -159,6 +159,15 @@ CREATE TABLE IF NOT EXISTS recovery_attempts (
     result TEXT,
     reason_code TEXT
 );
+CREATE TABLE IF NOT EXISTS live_order_allocations (
+    client_order_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    reservation_id TEXT NOT NULL,
+    qty TEXT NOT NULL,
+    notional TEXT NOT NULL,
+    price TEXT NOT NULL,
+    released INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS traces (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id TEXT NOT NULL,

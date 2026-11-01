@@ -12,18 +12,18 @@ import hmac
 import json
 import os
 import ssl
-import tempfile
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_opener
 
 from cts import LIVE_TRADING_AUTHORIZATION
 from cts.errors import ConflictError, CtsError, NewRiskBlockedError, UnitValidationError
-from cts.execution.orders import LiveOrder, OrderStore, charged_notional
+from cts.execution.orders import LiveOrder, OrderStore, budget_notional
 from cts.ledger.models import Side
 from cts.money import D
 from cts.risk.engine import RiskEngine
@@ -137,10 +137,19 @@ class LiveSession:
         now: datetime,
         path: str | None = None,
     ) -> None:
-        self.orders = OrderStore(path or _temp_order_db())
+        self._risk: RiskEngine | None = None
+        identity = _admit_identity(grant)
+        has_book = path is not None and str(path).strip() != "" and Path(path).is_file()
+        if not has_book:
+            if grant.expires_at <= now:
+                raise CtsError("本进程实盘授权已过期，未发送请求", reason_code="LIVE_GRANT_EXPIRED")
+            if type(transport) is not PinnedTransport or transport.base_url != TESTNET_BASE or grant.network != "TESTNET":
+                raise CtsError("MAINNET 写单未放行，未发送请求", reason_code="LIVE_VENUE_UNVERIFIED")
+            raise CtsError("找不到原订单库或路径不明确，拒绝开仓", reason_code="RECONCILIATION_FAILED")
+        self.orders = OrderStore(str(path))
         self.orders.promote_inflight(grant.account_id)
         if self.orders.for_account(grant.account_id):
-            self.grant = _admit_identity(grant)
+            self.grant = identity
         else:
             self.grant = _admit_grant(grant, now)
         if type(transport) is not PinnedTransport or transport.base_url != TESTNET_BASE:
@@ -153,12 +162,13 @@ class LiveSession:
         self.orders_sent = 0
         self._budget_lock = threading.Lock()
         self._reserved_notional = sum(
-            (charged_notional(order) for order in self.orders.for_account(self.grant.account_id)),
+            (budget_notional(order) for order in self.orders.for_account(self.grant.account_id)),
             start=D("0"),
         )
 
     @property
     def reserved_notional(self) -> Decimal:
+        self._recompute_reserved()
         return self._reserved_notional
 
     def get_order(self, client_order_id: str) -> LiveOrder:
@@ -197,6 +207,8 @@ class LiveSession:
             client_order_id=client_order_id,
             allowed=self.grant.symbols,
         )
+        if isinstance(risk, RiskEngine) and risk.account_id == self.grant.account_id:
+            self._risk = risk
         if reduce_only:
             raise CtsError("减仓写单不在本批放行，未发送请求", reason_code="LIVE_TRADING_HOLD")
         if computed > self.grant.max_notional:
@@ -218,19 +230,33 @@ class LiveSession:
                 return existing.body
         elif self._has_unknown():
             raise CtsError("存在未知订单，禁止新增风险", reason_code="UNKNOWN_ORDER")
-        self._admit_open(risk, reservation_id, symbol, side, qty, computed)
         if existing is None:
-            self._persist_intent(
+            self._admit_open(risk, reservation_id, symbol, side, D(qty), computed)
+            risk.bind_live_order(
+                reservation_id,
                 client_order_id=client_order_id,
-                reservation_id=reservation_id,
                 symbol=symbol,
                 side=side,
                 qty=D(qty),
-                price=D(price),
                 notional=computed,
-                now=now,
+                price=D(price),
             )
+            try:
+                self._persist_intent(
+                    client_order_id=client_order_id,
+                    reservation_id=reservation_id,
+                    symbol=symbol,
+                    side=side,
+                    qty=D(qty),
+                    price=D(price),
+                    notional=computed,
+                    now=now,
+                )
+            except Exception:
+                risk.release_live_order(client_order_id)
+                raise
         sent = False
+        duplicate = False
         try:
             self._require_isolated_one_way(symbol, now)
             params = [
@@ -245,21 +271,39 @@ class LiveSession:
                 ("recvWindow", "5000"),
                 ("timestamp", _millis(now)),
             ]
-            self._save_order(self.get_order(client_order_id), status="INTENT", dispatch_started=True, now=now)
-            sent = True
-            body = self._signed("POST", "/fapi/v1/order", params)
+            with risk.live_send_guard():
+                risk.recheck_live_open(
+                    reservation_id,
+                    client_order_id=client_order_id,
+                    symbol=symbol,
+                    side=side,
+                    qty=D(qty),
+                    notional=computed,
+                    price=D(price),
+                )
+                if not self.orders.claim_dispatch(client_order_id, self.grant.account_id, now):
+                    duplicate = True
+                    raise CtsError("订单正在发送或已发送，未再次发送", reason_code="UNKNOWN_ORDER")
+                sent = True
+                body = self._signed("POST", "/fapi/v1/order", params)
         except Exception:
+            if duplicate:
+                raise
             if sent:
-                self._save_order(self.get_order(client_order_id), status="UNKNOWN", dispatch_started=True, now=now)
+                saved = self._save_order(self.get_order(client_order_id), status="UNKNOWN", dispatch_started=True, now=now)
+                self._hold_risk_unknown(saved.reservation_id, now)
                 raise CtsError("下单响应丢失，订单状态未知，额度继续占用", reason_code="UNKNOWN_ORDER") from None
             self._save_order(self.get_order(client_order_id), status="REJECTED", dispatch_started=False, now=now)
+            risk.release_live_order(client_order_id)
             self._recompute_reserved()
             raise
         self._apply_venue(client_order_id, body, now)
         self.orders_sent += 1
         return body
 
-    def query(self, *, symbol: str, client_order_id: str, now: datetime) -> dict:
+    def query(self, *, symbol: str, client_order_id: str, now: datetime, risk: RiskEngine | None = None) -> dict:
+        if isinstance(risk, RiskEngine):
+            self._risk = risk
         order = self._require_own(client_order_id, symbol)
         try:
             body = self._signed(
@@ -268,17 +312,21 @@ class LiveSession:
                 [("symbol", symbol), ("origClientOrderId", client_order_id), ("recvWindow", "5000"), ("timestamp", _millis(now))],
             )
         except Exception:
-            self._save_order(self.get_order(client_order_id), status="UNKNOWN", dispatch_started=True, now=now)
+            saved = self._save_order(self.get_order(client_order_id), status="UNKNOWN", dispatch_started=True, now=now)
+            self._hold_risk_unknown(saved.reservation_id, now)
             raise CtsError("查询响应丢失，订单状态未知，额度继续占用", reason_code="UNKNOWN_ORDER") from None
         self._apply_venue(order.client_order_id, body, now)
         return body
 
-    def cancel(self, *, symbol: str, client_order_id: str, now: datetime) -> dict:
+    def cancel(self, *, symbol: str, client_order_id: str, now: datetime, risk: RiskEngine | None = None) -> dict:
+        if isinstance(risk, RiskEngine):
+            self._risk = risk
         order = self._require_own(client_order_id, symbol)
         if order.status == "FILLED":
             raise CtsError("订单已全部成交，未发送撤单", reason_code="RECONCILIATION_FAILED")
         if order.status in ("CANCELED", "EXPIRED", "REJECTED"):
             return order.body
+        self._save_order(order, status="CANCELING", dispatch_started=True, now=now)
         try:
             body = self._signed(
                 "DELETE",
@@ -286,7 +334,8 @@ class LiveSession:
                 [("symbol", symbol), ("origClientOrderId", client_order_id), ("recvWindow", "5000"), ("timestamp", _millis(now))],
             )
         except Exception:
-            self._save_order(self.get_order(client_order_id), status="UNKNOWN", dispatch_started=True, now=now)
+            saved = self._save_order(self.get_order(client_order_id), status="UNKNOWN", dispatch_started=True, now=now)
+            self._hold_risk_unknown(saved.reservation_id, now)
             raise CtsError("撤单响应丢失，订单状态未知，额度继续占用", reason_code="UNKNOWN_ORDER") from None
         self._apply_venue(order.client_order_id, body, now)
         return body
@@ -329,10 +378,7 @@ class LiveSession:
             raise ConflictError("同一订单号的数量、价格或方向不一致")
 
     def _has_unknown(self) -> bool:
-        return any(
-            row.status == "UNKNOWN" or (row.status == "INTENT" and row.dispatch_started)
-            for row in self.orders.for_account(self.grant.account_id)
-        )
+        return any(row.status == "UNKNOWN" for row in self.orders.for_account(self.grant.account_id))
 
     def _persist_intent(
         self,
@@ -360,13 +406,10 @@ class LiveSession:
             dispatch_started=False,
             body={},
         )
-        with self._budget_lock:
-            if self._has_unknown():
-                raise CtsError("存在未知订单，禁止新增风险", reason_code="UNKNOWN_ORDER")
-            if self._reserved_notional + notional > self.grant.max_notional:
-                raise CtsError("累计名义超出本进程限额，未发送请求", reason_code="RISK_LIMIT")
-            self.orders.insert_intent(draft, now)
-            self._reserved_notional += notional
+        if self._has_unknown():
+            raise CtsError("存在未知订单，禁止新增风险", reason_code="UNKNOWN_ORDER")
+        self.orders.insert_intent_within_cap(draft, self.grant.max_notional, now)
+        self._recompute_reserved()
 
     def _save_order(
         self,
@@ -399,7 +442,7 @@ class LiveSession:
     def _recompute_reserved(self) -> None:
         with self._budget_lock:
             self._reserved_notional = sum(
-                (charged_notional(order) for order in self.orders.for_account(self.grant.account_id)),
+                (budget_notional(order) for order in self.orders.for_account(self.grant.account_id)),
                 start=D("0"),
             )
 
@@ -407,11 +450,21 @@ class LiveSession:
         order = self.get_order(client_order_id)
         status = body.get("status")
         definitive = {"NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "REJECTED"}
-        if body.get("clientOrderId") not in (None, client_order_id) or status not in definitive:
+        reported_symbol = body.get("symbol")
+        reported_side = body.get("side")
+        expected_side = "BUY" if order.side == Side.LONG.value else "SELL"
+        if (
+            body.get("clientOrderId") not in (None, client_order_id)
+            or reported_symbol not in (None, order.symbol)
+            or (reported_side is not None and reported_side != expected_side)
+            or status not in definitive
+            or "executedQty" not in body
+        ):
             self._save_order(order, status="UNKNOWN", dispatch_started=True, now=now)
+            self._hold_risk_unknown(order.reservation_id, now)
             raise CtsError("交易所订单状态不能确认", reason_code="UNKNOWN_ORDER")
         try:
-            executed = D(str(body.get("executedQty") or "0"))
+            executed = D(str(body["executedQty"]))
             if "origQty" in body and D(str(body["origQty"])) != order.qty:
                 raise ValueError("origQty")
             if not executed.is_finite() or executed < 0 or executed > order.qty:
@@ -424,7 +477,23 @@ class LiveSession:
                 raise ValueError("partial")
         except (ValueError, ArithmeticError, TypeError):
             self._save_order(order, status="UNKNOWN", dispatch_started=True, now=now)
+            self._hold_risk_unknown(order.reservation_id, now)
             raise CtsError("成交数量与原订单不一致，未释放额度", reason_code="RECONCILIATION_FAILED") from None
+        if executed < order.executed_qty:
+            raise CtsError("成交数量不能回退", reason_code="RECONCILIATION_FAILED")
+        if status == "REJECTED" and executed != 0:
+            self._project_execution(order, executed, "FILLED" if executed == order.qty else "PARTIALLY_FILLED", now)
+            self._save_order(
+                order,
+                status="UNKNOWN",
+                dispatch_started=True,
+                now=now,
+                executed_qty=executed,
+                body=body,
+            )
+            self._hold_risk_unknown(order.reservation_id, now)
+            raise CtsError("拒绝状态却带有成交数量，未释放额度", reason_code="RECONCILIATION_FAILED")
+        self._project_execution(order, executed, str(status), now)
         return self._save_order(
             order,
             status=str(status),
@@ -433,6 +502,34 @@ class LiveSession:
             executed_qty=executed,
             body=body,
         )
+
+    def _project_execution(self, order: LiveOrder, executed: Decimal, status: str, now: datetime) -> None:
+        risk = self._risk
+        if not isinstance(risk, RiskEngine) or risk.account_id != order.account_id:
+            return
+        delta = executed - order.executed_qty
+        if delta > 0:
+            risk.apply_fill(
+                order.reservation_id,
+                delta,
+                fill_id=f"{order.client_order_id}:{format(executed, 'f')}",
+                now=now,
+            )
+        if status in ("CANCELED", "EXPIRED", "REJECTED", "FILLED"):
+            risk.release_live_order(order.client_order_id)
+        still_unknown = any(
+            row.client_order_id != order.client_order_id
+            and row.reservation_id == order.reservation_id
+            and row.status == "UNKNOWN"
+            for row in self.orders.for_account(order.account_id)
+        )
+        if not still_unknown:
+            risk.clear_live_unknown(order.reservation_id)
+
+    def _hold_risk_unknown(self, reservation_id: str, now: datetime) -> None:
+        risk = self._risk
+        if isinstance(risk, RiskEngine):
+            risk.hold_live_unknown(reservation_id, now=now)
 
     def _assert_demo_write_closed(self) -> None:
         if self.grant.network != "TESTNET" or self.base_url != TESTNET_BASE or self._transport.base_url != TESTNET_BASE:
@@ -576,12 +673,6 @@ def _admit_grant(grant: LiveGrant, now: datetime) -> LiveGrant:
     return admitted
 
 
-def _temp_order_db() -> str:
-    handle = tempfile.NamedTemporaryFile(prefix="cts-orders-", suffix=".db", delete=False)
-    handle.close()
-    return handle.name
-
-
 def _sign(params: list[tuple[str, str]], secret: str) -> str:
     query = urlencode(params)
     signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -638,6 +729,8 @@ def _order_notional(
     quantity = _finite_positive(qty, "数量")
     limit = _finite_positive(price, "价格")
     unit = _finite_positive(contract_unit, "合约单位")
+    if unit != D("1"):
+        raise UnitValidationError("合约单位必须是 1，不能用它缩小占用")
     stated = _finite_positive(claimed, "外传名义额")
     computed = quantity * limit * unit
     if stated != computed:

@@ -145,6 +145,9 @@ class ConsoleApp:
         except Exception:
             self.state.books["source"] = "币安模拟盘读取失败"
             self.state.books["wallet"] = "暂无证据"
+            self.state.books["available"] = "暂无证据"
+            self.state.books["unrealized"] = "暂无证据"
+            self.state.metrics["data_freshness"] = "币安模拟盘读取失败"
             self.state.equity = None
 
     def serve(self) -> int:
@@ -441,7 +444,7 @@ def _ledger_report(events, *, fees, funding, drawdown: str) -> dict[str, str]:
 
 
 def apply_venue_wallet(state: ConsoleState, venue: dict[str, str], *, as_of: str) -> None:
-    if state.books.get("source") != "币安模拟盘":
+    if state.books.get("source") == "本地账本":
         state.books["local_equity"] = state.equity or ""
     local = state.books.get("local_equity") or ""
     state.equity = venue["equity"]

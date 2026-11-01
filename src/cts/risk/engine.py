@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional, Sequence
@@ -427,6 +428,217 @@ class RiskEngine:
             if qty > reservation.unfilled_qty or notional > reservation.pending_notional:
                 raise RiskLimitError("订单超出已批准的风险预留")
             return reservation
+
+    def bind_live_order(
+        self,
+        reservation_id: str,
+        *,
+        client_order_id: str,
+        symbol: str,
+        side: Side,
+        qty: Decimal,
+        notional: Decimal,
+        price: Decimal,
+    ) -> Reservation:
+        """把一笔模拟盘订单占用到预留上。同一预留不能被重复用超，旧权益或旧价格也不能再开。"""
+        qty = D(qty)
+        notional = D(notional)
+        price = D(price)
+        with self.store.txn() as conn:
+            reservation = self._require_live_reservation(
+                conn,
+                reservation_id,
+                symbol=symbol,
+                side=side,
+                qty=qty,
+                notional=notional,
+                price=price,
+            )
+            current = conn.execute(
+                "SELECT * FROM live_order_allocations WHERE client_order_id=?",
+                (client_order_id,),
+            ).fetchone()
+            if current is not None and not current["released"]:
+                if (
+                    current["reservation_id"] == reservation_id
+                    and D(current["qty"]) == qty
+                    and D(current["notional"]) == notional
+                    and D(current["price"]) == price
+                ):
+                    return reservation
+                raise ConflictError("订单占用与已绑定的风险预留不一致")
+            allocated_qty, allocated_notional = self._allocated(conn, reservation_id)
+            if (
+                allocated_qty + qty > reservation.unfilled_qty
+                or allocated_notional + notional > reservation.pending_notional
+            ):
+                raise RiskLimitError("订单超出已批准的风险预留")
+            if current is None:
+                conn.execute(
+                    """
+                    INSERT INTO live_order_allocations(
+                        client_order_id, account_id, reservation_id, qty, notional, price, released
+                    ) VALUES (?,?,?,?,?,?,0)
+                    """,
+                    (
+                        client_order_id,
+                        self.account_id,
+                        reservation_id,
+                        format(qty, "f"),
+                        format(notional, "f"),
+                        format(price, "f"),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE live_order_allocations
+                    SET reservation_id=?, qty=?, notional=?, price=?, released=0
+                    WHERE client_order_id=?
+                    """,
+                    (reservation_id, format(qty, "f"), format(notional, "f"), format(price, "f"), client_order_id),
+                )
+            return reservation
+
+    @contextmanager
+    def live_send_guard(self):
+        """暂停落库和发送权抢占共用这把锁，POST 也必须在锁内完成。"""
+        with self.store._lock:
+            yield
+
+    def recheck_live_open(
+        self,
+        reservation_id: str,
+        *,
+        client_order_id: str,
+        symbol: str,
+        side: Side,
+        qty: Decimal,
+        notional: Decimal,
+        price: Decimal,
+    ) -> None:
+        """发送前再核对暂停、权益和价格。不再次占用额度。"""
+        qty = D(qty)
+        notional = D(notional)
+        price = D(price)
+        with self.store.txn() as conn:
+            self._require_live_reservation(
+                conn,
+                reservation_id,
+                symbol=symbol,
+                side=side,
+                qty=qty,
+                notional=notional,
+                price=price,
+            )
+            current = conn.execute(
+                """
+                SELECT * FROM live_order_allocations
+                WHERE client_order_id=? AND released=0
+                """,
+                (client_order_id,),
+            ).fetchone()
+            if (
+                current is None
+                or current["reservation_id"] != reservation_id
+                or D(current["qty"]) != qty
+                or D(current["notional"]) != notional
+                or D(current["price"]) != price
+            ):
+                raise NewRiskBlockedError("发送前风险占用已失效", reason_code="NEW_RISK_BLOCKED")
+
+    def release_live_order(self, client_order_id: str) -> None:
+        with self.store.txn() as conn:
+            conn.execute(
+                "UPDATE live_order_allocations SET released=1 WHERE client_order_id=?",
+                (client_order_id,),
+            )
+
+    def hold_live_unknown(self, reservation_id: str, *, now: datetime) -> None:
+        """订单状态未知时，预留本身进入 UNKNOWN，风险引擎不能再生成新预留。"""
+        with self.store.txn() as conn:
+            try:
+                reservation = self.store.get_reservation(conn, reservation_id)
+            except KeyError:
+                return
+            if reservation.account_id != self.account_id:
+                return
+            if reservation.status in (ReservationStatus.FILLED, ReservationStatus.RELEASED, ReservationStatus.UNKNOWN):
+                return
+            conn.execute(
+                """
+                UPDATE reservations
+                SET status=?, unknown_since=COALESCE(unknown_since, ?)
+                WHERE reservation_id=?
+                """,
+                (ReservationStatus.UNKNOWN.value, now.isoformat(), reservation_id),
+            )
+
+    def clear_live_unknown(self, reservation_id: str) -> None:
+        """订单已经从交易所得到确定状态后，只解除这笔预留的未知标记。"""
+        with self.store.txn() as conn:
+            try:
+                reservation = self.store.get_reservation(conn, reservation_id)
+            except KeyError:
+                return
+            if reservation.account_id != self.account_id or reservation.status != ReservationStatus.UNKNOWN:
+                return
+            if reservation.filled_qty >= reservation.qty:
+                status = ReservationStatus.FILLED
+            elif reservation.filled_qty > 0:
+                status = ReservationStatus.PARTIAL
+            else:
+                status = ReservationStatus.PENDING
+            conn.execute(
+                "UPDATE reservations SET status=? WHERE reservation_id=?",
+                (status.value, reservation_id),
+            )
+
+    def _require_live_reservation(
+        self,
+        conn,
+        reservation_id: str,
+        *,
+        symbol: str,
+        side: Side,
+        qty: Decimal,
+        notional: Decimal,
+        price: Decimal,
+    ) -> Reservation:
+        view = self._view(conn)
+        row = self.store.load_account(conn, self.account_id)
+        bundle = self.store.load_bundle(row)
+        mode = RuntimeMode(row["mode"])
+        self._admit_new_risk(view, bundle, mode)
+        try:
+            reservation = self.store.get_reservation(conn, reservation_id)
+        except KeyError as exc:
+            raise NewRiskBlockedError("没有有效风险批准", reason_code="NEW_RISK_BLOCKED") from exc
+        if reservation.account_id != self.account_id:
+            raise NewRiskBlockedError("风险批准不属于该账户", reason_code="NEW_RISK_BLOCKED")
+        if reservation.status not in (ReservationStatus.PENDING, ReservationStatus.PARTIAL):
+            raise NewRiskBlockedError("风险批准已失效", reason_code="NEW_RISK_BLOCKED")
+        if reservation.symbol != symbol or reservation.side != side:
+            raise NewRiskBlockedError("风险批准与订单不一致", reason_code="NEW_RISK_BLOCKED")
+        if view.equity_version != reservation.equity_version:
+            raise StaleDataError("权益已变化，旧预留不能再开仓")
+        if reservation.qty <= 0 or price != reservation.notional / reservation.qty:
+            raise NewRiskBlockedError("订单价格与风险批准不一致", reason_code="NEW_RISK_BLOCKED")
+        if qty > reservation.unfilled_qty or notional > reservation.pending_notional:
+            raise RiskLimitError("订单超出已批准的风险预留")
+        return reservation
+
+    def _allocated(self, conn, reservation_id: str) -> tuple[Decimal, Decimal]:
+        rows = conn.execute(
+            """
+            SELECT qty, notional FROM live_order_allocations
+            WHERE reservation_id=? AND released=0
+            """,
+            (reservation_id,),
+        ).fetchall()
+        qty = sum((D(row["qty"]) for row in rows), start=D("0"))
+        notional = sum((D(row["notional"]) for row in rows), start=D("0"))
+        return qty, notional
 
     def apply_fill(
         self,

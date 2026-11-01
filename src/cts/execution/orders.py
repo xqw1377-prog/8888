@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
-from cts.errors import ConflictError, CtsError
+from cts.errors import ConflictError, CtsError, RiskLimitError
 from cts.money import D
 
 
@@ -31,6 +31,13 @@ class LiveOrder:
     executed_qty: Decimal
     dispatch_started: bool
     body: dict
+
+
+def budget_notional(order: LiveOrder) -> Decimal:
+    """账户限额占用。未发送的意图也占用，避免两个会话同时穿过上限。"""
+    if order.status == "INTENT" and not order.dispatch_started:
+        return order.notional
+    return charged_notional(order)
 
 
 def charged_notional(order: LiveOrder) -> Decimal:
@@ -82,7 +89,10 @@ class OrderStore:
                     """
                     UPDATE live_orders
                     SET status='UNKNOWN'
-                    WHERE account_id=? AND dispatch_started=1 AND status='INTENT'
+                    WHERE account_id=? AND (
+                        (dispatch_started=1 AND status='INTENT')
+                        OR status='CANCELING'
+                    )
                     """,
                     (account_id,),
                 )
@@ -106,6 +116,62 @@ class OrderStore:
                 (client_order_id,),
             ).fetchone()
         return None if row is None else self._row(row)
+
+    def insert_intent_within_cap(self, order: LiveOrder, max_notional: Decimal, updated_at: datetime) -> None:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    "SELECT * FROM live_orders WHERE client_order_id=?",
+                    (order.client_order_id,),
+                ).fetchone()
+                if existing is not None:
+                    current = self._row(existing)
+                    if not _same_economics(current, order):
+                        raise ConflictError("同一订单号的数量、价格或方向不一致")
+                    self._conn.execute("COMMIT")
+                    return
+                charged = sum(
+                    (budget_notional(self._row(row)) for row in self._conn.execute(
+                        "SELECT * FROM live_orders WHERE account_id=?",
+                        (order.account_id,),
+                    ).fetchall()),
+                    start=D("0"),
+                )
+                if charged + order.notional > D(max_notional):
+                    raise RiskLimitError("累计名义超出本进程限额，未发送请求")
+                self._conn.execute(
+                    """
+                    INSERT INTO live_orders(
+                        client_order_id, account_id, reservation_id, symbol, side, qty, price,
+                        notional, status, executed_qty, dispatch_started, body, updated_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    _values(order, updated_at),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def claim_dispatch(self, client_order_id: str, account_id: str, updated_at: datetime) -> bool:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE live_orders
+                    SET dispatch_started=1, updated_at=?
+                    WHERE client_order_id=? AND account_id=? AND status='INTENT' AND dispatch_started=0
+                    """,
+                    (updated_at.isoformat(), client_order_id, account_id),
+                )
+                won = cursor.rowcount == 1
+                self._conn.execute("COMMIT")
+                return won
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def insert_intent(self, order: LiveOrder, updated_at: datetime) -> None:
         with self._lock:
