@@ -1,6 +1,6 @@
 # 真实只读核验执行材料
 
-状态：**真实只读核验未通过，一次性执行授权已经结束。** 脱敏摘要见 `docs/READONLY_RUN_SUMMARY.md`。网络诊断范围见 `docs/READONLY_NETDIAG_SCOPE.md`，诊断和重跑都还没有授权。初始化证据见 `docs/LOCAL_LEDGER_INIT.md`。
+状态：**第二次真实只读核验未通过，该轮授权已经结束。** 第一次摘要见 `docs/READONLY_RUN_SUMMARY.md`。重跑摘要见 `docs/READONLY_RUN_R2_SUMMARY.md`。网络诊断范围见 `docs/READONLY_NETDIAG_SCOPE.md`。初始化证据见 `docs/LOCAL_LEDGER_INIT.md`。
 
 本文件不是授权。没有另一次书面决定之前，不执行下面的命令，不访问 `https://demo-fapi.binance.com`。TESTNET 试单仍未授权。实盘保持 `HOLD`。`main` 不合并。
 
@@ -166,4 +166,4 @@ PY
 
 ## 6. 仍未做的事
 
-产品源码没有改。第 5 节命令已执行一次。第三次 `GET /fapi/v1/time` 在 TLS 握手超时后停止，证据已封存，没有重试，也没有把交易所余额写回本地账本。一次性执行授权已经结束。限定网络诊断已执行一次，直连 TLS 失败后停止。完整只读核验重跑仍未授权。TESTNET 试单仍未授权。
+产品源码没有改。第 5 节命令已执行两次，分别写入两个证据目录。第一次在第三次对时的 TLS 握手超时后停止。第二次从第一次对时重新执行，在时钟取样 1 失败后停止。两次都没有重试，也没有把交易所余额写回本地账本。第二次授权已经结束。没有新的书面决定之前，不再执行该命令。TESTNET 试单仍未授权。
