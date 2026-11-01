@@ -656,24 +656,25 @@ class RiskEngine:
     def owner_lock_path(self, owner_id: str) -> Path:
         return Path(self.store.path).with_name(f".cts-owner-{owner_id}.lock")
 
-    def register_hold_owner(self, owner_id: str, *, now: datetime) -> None:
-        """所有者先占住锁文件，再写入风险库。另一会话不能把活着的所有者标成已恢复。"""
+    def register_hold_owner(self, owner_id: str, *, lock_dev: int, lock_ino: int, now: datetime) -> None:
+        """所有者先占住锁文件，再写入风险库。登记的是当时的文件身份。"""
         with self.store.txn() as conn:
             conn.execute(
                 """
-                INSERT INTO live_hold_owners(owner_id, account_id, created_at, recovered_at, recovery_evidence)
-                VALUES (?,?,?,NULL,NULL)
+                INSERT INTO live_hold_owners(
+                    owner_id, account_id, created_at, recovered_at, recovery_evidence, lock_dev, lock_ino
+                ) VALUES (?,?,?,NULL,NULL,?,?)
                 ON CONFLICT(owner_id) DO NOTHING
                 """,
-                (owner_id, self.account_id, now.isoformat()),
+                (owner_id, self.account_id, now.isoformat(), lock_dev, lock_ino),
             )
 
     def recover_dead_hold_owners(self, *, now: datetime) -> None:
-        """锁文件能被独占时，记下一份恢复证据。仍被占用的所有者保持有效。"""
+        """只有原锁文件仍在，且能被独占时，才记恢复证据。路径缺失或身份不符保持未知。"""
         with self.store.txn() as conn:
             rows = conn.execute(
                 """
-                SELECT owner_id FROM live_hold_owners
+                SELECT owner_id, lock_dev, lock_ino FROM live_hold_owners
                 WHERE account_id=? AND recovered_at IS NULL
                 """,
                 (self.account_id,),
@@ -681,9 +682,16 @@ class RiskEngine:
         dead: list[tuple[str, str]] = []
         for row in rows:
             owner_id = str(row["owner_id"])
+            if row["lock_dev"] is None or row["lock_ino"] is None:
+                continue
             path = self.owner_lock_path(owner_id)
             if not path.is_file():
-                dead.append((owner_id, "所有者锁缺失"))
+                continue
+            try:
+                current = os.stat(path)
+            except OSError:
+                continue
+            if current.st_dev != row["lock_dev"] or current.st_ino != row["lock_ino"]:
                 continue
             fd = os.open(path, os.O_RDWR)
             try:
@@ -748,17 +756,28 @@ class RiskEngine:
         client_order_id: str,
         reservation_id: str,
         now: datetime,
+        keep_hold_ids: set[str],
     ) -> int:
-        """只删除本次请求。旧请求仅在所有者已有恢复证据时清除。"""
+        """解除本次已结束的请求。同一所有者仍在途的请求保留；其他所有者只在已有恢复证据时清除。"""
         self.recover_dead_hold_owners(now=now)
         with self.store.txn() as conn:
-            conn.execute(
+            rows = conn.execute(
                 """
-                DELETE FROM live_risk_holds
-                WHERE hold_id=? AND account_id=? AND owner_id=?
+                SELECT hold_id FROM live_risk_holds
+                WHERE account_id=? AND client_order_id=? AND owner_id=?
                 """,
-                (hold_id, self.account_id, owner_id),
-            )
+                (self.account_id, client_order_id, owner_id),
+            ).fetchall()
+            for row in rows:
+                if row["hold_id"] != hold_id and row["hold_id"] in keep_hold_ids:
+                    continue
+                conn.execute(
+                    """
+                    DELETE FROM live_risk_holds
+                    WHERE hold_id=? AND account_id=? AND owner_id=?
+                    """,
+                    (row["hold_id"], self.account_id, owner_id),
+                )
             conn.execute(
                 """
                 DELETE FROM live_risk_holds

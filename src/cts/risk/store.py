@@ -105,7 +105,9 @@ CREATE TABLE IF NOT EXISTS live_hold_owners (
     account_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
     recovered_at TEXT,
-    recovery_evidence TEXT
+    recovery_evidence TEXT,
+    lock_dev INTEGER,
+    lock_ino INTEGER
 );
 CREATE TABLE IF NOT EXISTS blockers (
     blocker_id TEXT PRIMARY KEY,
@@ -225,6 +227,11 @@ class RiskStore:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(live_risk_holds)")}
         if "owner_id" not in columns:
             self._conn.execute("ALTER TABLE live_risk_holds ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
+        owners = {row["name"] for row in self._conn.execute("PRAGMA table_info(live_hold_owners)")}
+        if "lock_dev" not in owners:
+            self._conn.execute("ALTER TABLE live_hold_owners ADD COLUMN lock_dev INTEGER")
+        if "lock_ino" not in owners:
+            self._conn.execute("ALTER TABLE live_hold_owners ADD COLUMN lock_ino INTEGER")
 
     def close(self) -> None:
         self._conn.close()

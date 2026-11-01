@@ -1583,6 +1583,126 @@ def test_recovered_owner_hold_clears_after_the_order_is_confirmed(tmp_path) -> N
     assert worker.is_alive() is False
 
 
+def _owner_row(engine, owner_id: str):
+    return engine.store._conn.execute(
+        "SELECT recovered_at, recovery_evidence FROM live_hold_owners WHERE owner_id=?",
+        (owner_id,),
+    ).fetchone()
+
+
+def test_missing_lock_path_does_not_recover_a_live_owner(tmp_path) -> None:
+    engine, reservation, session_a, _opener = admitted(tmp_path, healthy())
+    submit(session_a, engine, reservation.reservation_id)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked(method: str, url: str, headers: dict[str, str]):
+        entered.set()
+        assert release.wait(2)
+        return _ack_new()
+
+    session_a._transport = open_testnet_transport(blocked)
+    session_b = _open_peer(session_a, engine, open_testnet_transport(lambda method, url, headers: _ack_new()))
+    worker = threading.Thread(target=lambda: session_a.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW))
+    worker.start()
+    assert entered.wait(2)
+    os.unlink(engine.owner_lock_path(session_a._owner_id))
+    session_b.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert engine.live_hold_count(reservation.reservation_id) == 1
+    assert _owner_row(engine, session_a._owner_id)["recovered_at"] is None
+    with pytest.raises(CtsError) as blocked_risk:
+        engine.reserve([req("ETHUSDT", "s-lock-missing")], now=NOW)
+    assert blocked_risk.value.reason_code == "UNKNOWN_ORDER"
+    release.set()
+    worker.join(2)
+    assert worker.is_alive() is False
+
+
+def test_replaced_lock_file_does_not_recover_a_live_owner(tmp_path) -> None:
+    engine, reservation, session_a, _opener = admitted(tmp_path, healthy())
+    submit(session_a, engine, reservation.reservation_id)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked(method: str, url: str, headers: dict[str, str]):
+        entered.set()
+        assert release.wait(2)
+        return _ack_new()
+
+    session_a._transport = open_testnet_transport(blocked)
+    session_b = _open_peer(session_a, engine, open_testnet_transport(lambda method, url, headers: _ack_new()))
+    worker = threading.Thread(target=lambda: session_a.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW))
+    worker.start()
+    assert entered.wait(2)
+    path = engine.owner_lock_path(session_a._owner_id)
+    os.unlink(path)
+    os.close(os.open(path, os.O_CREAT | os.O_RDWR, 0o600))
+    session_b.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert engine.live_hold_count(reservation.reservation_id) == 1
+    assert _owner_row(engine, session_a._owner_id)["recovered_at"] is None
+    with pytest.raises(CtsError) as blocked_risk:
+        engine.reserve([req("ETHUSDT", "s-lock-replaced")], now=NOW)
+    assert blocked_risk.value.reason_code == "UNKNOWN_ORDER"
+    release.set()
+    worker.join(2)
+    assert worker.is_alive() is False
+
+
+@pytest.mark.parametrize("failed_call", ["query", "cancel"])
+def test_finished_timeout_clears_after_a_confirmed_query(tmp_path, failed_call: str) -> None:
+    engine, reservation, session, _opener = admitted(tmp_path, healthy())
+    submit(session, engine, reservation.reservation_id)
+
+    def lose(method: str, url: str, headers: dict[str, str]):
+        raise TimeoutError("response lost")
+
+    session._transport = open_testnet_transport(lose)
+    with pytest.raises(CtsError) as lost:
+        if failed_call == "query":
+            session.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+        else:
+            session.cancel(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert lost.value.reason_code == "UNKNOWN_ORDER"
+    with pytest.raises(CtsError) as blocked:
+        engine.reserve([req("ETHUSDT", f"s-timeout-{failed_call}")], now=NOW)
+    assert blocked.value.reason_code == "UNKNOWN_ORDER"
+    session._transport = open_testnet_transport(lambda method, url, headers: _ack_new())
+    session.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert session.get_order("cid-1").status == "NEW"
+    assert engine.live_hold_count(reservation.reservation_id) == 0
+    created = engine.reserve([req("ETHUSDT", f"s-timeout-cleared-{failed_call}")], now=NOW)
+    assert created[0].qty > 0
+
+
+def test_same_session_keeps_the_other_inflight_request(tmp_path) -> None:
+    engine, reservation, session, _opener = admitted(tmp_path, healthy())
+    submit(session, engine, reservation.reservation_id)
+    entered = threading.Event()
+    release = threading.Event()
+    state = {"held": False}
+
+    def opener(method: str, url: str, headers: dict[str, str]):
+        if method == "GET" and not state["held"]:
+            state["held"] = True
+            entered.set()
+            assert release.wait(2)
+        return _ack_new()
+
+    session._transport = open_testnet_transport(opener)
+    worker = threading.Thread(target=lambda: session.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW))
+    worker.start()
+    assert entered.wait(2)
+    session.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert engine.live_hold_count(reservation.reservation_id) == 1
+    with pytest.raises(CtsError) as blocked:
+        engine.reserve([req("ETHUSDT", "s-same-session-inflight")], now=NOW)
+    assert blocked.value.reason_code == "UNKNOWN_ORDER"
+    release.set()
+    worker.join(2)
+    assert worker.is_alive() is False
+    assert engine.live_hold_count(reservation.reservation_id) == 0
+
+
 def test_cancel_identity_must_be_present(tmp_path) -> None:
     engine, reservation, session, _opener = admitted(tmp_path, healthy())
     submit(session, engine, reservation.reservation_id, qty=D("0.6"), price=D("100"), notional=D("60"))
