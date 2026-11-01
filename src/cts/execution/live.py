@@ -7,12 +7,14 @@ S1-A 收口发单入口。S1-B 只补模拟盘订单生命周期：意图先落�
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import json
 import os
 import ssl
 import threading
+from uuid import uuid4
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -162,15 +164,14 @@ class LiveSession:
         self.base_url = TESTNET_BASE
         self.orders_sent = 0
         self._budget_lock = threading.Lock()
-        self._hold_lock = threading.Lock()
-        self._inflight_holds: set[str] = set()
-        self._hold_seq = 0
+        self._owner_id: str | None = None
+        self._owner_lock_fd: int | None = None
         self._reserved_notional = sum(
             (budget_notional(order) for order in self.orders.for_account(self.grant.account_id)),
             start=D("0"),
         )
         if isinstance(risk, RiskEngine):
-            self._bind_risk(risk)
+            self._bind_risk(risk, now)
         self._recover_unknown_orders(now)
 
     @property
@@ -215,7 +216,7 @@ class LiveSession:
             allowed=self.grant.symbols,
         )
         if isinstance(risk, RiskEngine):
-            self._bind_risk(risk)
+            self._bind_risk(risk, now)
         if reduce_only:
             raise CtsError("减仓写单不在本批放行，未发送请求", reason_code="LIVE_TRADING_HOLD")
         if computed > self.grant.max_notional:
@@ -310,7 +311,7 @@ class LiveSession:
 
     def query(self, *, symbol: str, client_order_id: str, now: datetime, risk: RiskEngine | None = None) -> dict:
         if isinstance(risk, RiskEngine):
-            self._bind_risk(risk)
+            self._bind_risk(risk, now)
         order = self._require_own(client_order_id, symbol)
         hold_id = None
         if order.status not in ("CANCELED", "EXPIRED", "REJECTED", "FILLED"):
@@ -329,12 +330,12 @@ class LiveSession:
             raise CtsError("查询响应丢失，订单状态未知，额度继续占用", reason_code="UNKNOWN_ORDER") from None
         saved = self._apply_venue(order.client_order_id, body, now)
         if hold_id is not None:
-            self._settle_request_hold(saved, hold_id)
+            self._settle_request_hold(saved, hold_id, now)
         return body
 
     def cancel(self, *, symbol: str, client_order_id: str, now: datetime, risk: RiskEngine | None = None) -> dict:
         if isinstance(risk, RiskEngine):
-            self._bind_risk(risk)
+            self._bind_risk(risk, now)
         order = self._require_own(client_order_id, symbol)
         if order.status == "FILLED":
             raise CtsError("订单已全部成交，未发送撤单", reason_code="RECONCILIATION_FAILED")
@@ -354,7 +355,7 @@ class LiveSession:
             self._hold_risk_unknown(saved.reservation_id, now, saved.client_order_id)
             raise CtsError("撤单响应丢失，订单状态未知，额度继续占用", reason_code="UNKNOWN_ORDER") from None
         saved = self._apply_venue(order.client_order_id, body, now)
-        self._settle_request_hold(saved, hold_id)
+        self._settle_request_hold(saved, hold_id, now)
         return body
 
     def _require_known(self, client_order_id: str, *, allow_missing: bool) -> LiveOrder | None:
@@ -539,11 +540,12 @@ class LiveSession:
             risk.release_live_order(order.client_order_id)
             risk.release_unbound_reservation(order.reservation_id)
 
-    def _bind_risk(self, risk: RiskEngine) -> None:
+    def _bind_risk(self, risk: RiskEngine, now: datetime) -> None:
         if risk.account_id != self.grant.account_id:
             raise CtsError("风险引擎不属于该账户", reason_code="RECONCILIATION_FAILED")
         self._risk = risk
         self.orders.set_risk_path(self.grant.account_id, risk.store.path)
+        self._ensure_hold_owner(now)
 
     def _bound_risk(self, order: LiveOrder) -> RiskEngine:
         risk = self._risk
@@ -562,41 +564,63 @@ class LiveSession:
             from cts.risk.store import RiskStore
 
             self._risk = RiskEngine(RiskStore(path), self.grant.account_id)
+        self._ensure_hold_owner(now)
         for order in unknown:
-            self._risk.hold_live_unknown(order.reservation_id, client_order_id=order.client_order_id, now=now)
+            self._risk.hold_live_unknown(
+                order.reservation_id,
+                client_order_id=order.client_order_id,
+                owner_id=self._owner_id or "",
+                now=now,
+            )
+
+    def _ensure_hold_owner(self, now: datetime) -> str:
+        if self._owner_id is not None:
+            return self._owner_id
+        risk = self._risk
+        if not isinstance(risk, RiskEngine):
+            raise CtsError("风险引擎未绑定，未写入成交或释放", reason_code="RECONCILIATION_FAILED")
+        owner_id = str(uuid4())
+        fd = os.open(risk.owner_lock_path(owner_id), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise CtsError("风险阻断所有者未能占锁", reason_code="RECONCILIATION_FAILED") from None
+        self._owner_lock_fd = fd
+        self._owner_id = owner_id
+        risk.register_hold_owner(owner_id, now=now)
+        return owner_id
 
     def _begin_request_hold(self, order: LiveOrder, reason: str, now: datetime) -> str:
         risk = self._bound_risk(order)
-        with self._hold_lock:
-            self._hold_seq += 1
-            hold_id = f"{order.client_order_id}:{reason}:{self._hold_seq}"
-            self._inflight_holds.add(hold_id)
-            risk.hold_live_request(
-                order.reservation_id,
-                order.client_order_id,
-                hold_id=hold_id,
-                reason=reason,
-                now=now,
-            )
+        owner_id = self._ensure_hold_owner(now)
+        hold_id = f"{order.client_order_id}:{reason}:{uuid4()}"
+        risk.hold_live_request(
+            order.reservation_id,
+            order.client_order_id,
+            hold_id=hold_id,
+            reason=reason,
+            owner_id=owner_id,
+            now=now,
+        )
         return hold_id
 
-    def _settle_request_hold(self, order: LiveOrder, hold_id: str) -> None:
+    def _settle_request_hold(self, order: LiveOrder, hold_id: str, now: datetime) -> None:
         risk = self._risk
-        if not isinstance(risk, RiskEngine) or risk.account_id != order.account_id:
+        owner_id = self._owner_id
+        if not isinstance(risk, RiskEngine) or risk.account_id != order.account_id or not owner_id:
             return
         others_blocked = self._other_request_blocked(order)
-        with self._hold_lock:
-            self._inflight_holds.discard(hold_id)
-            keep = set(self._inflight_holds)
-            remaining = risk.settle_live_request(
-                hold_id=hold_id,
-                client_order_id=order.client_order_id,
-                reservation_id=order.reservation_id,
-                keep=keep,
-            )
-            if remaining or others_blocked:
-                return
-            risk.clear_live_unknown(order.reservation_id)
+        remaining = risk.settle_live_request(
+            hold_id=hold_id,
+            owner_id=owner_id,
+            client_order_id=order.client_order_id,
+            reservation_id=order.reservation_id,
+            now=now,
+        )
+        if remaining or others_blocked:
+            return
+        risk.clear_live_unknown(order.reservation_id)
 
     def _other_request_blocked(self, order: LiveOrder) -> bool:
         return any(
@@ -609,7 +633,12 @@ class LiveSession:
     def _hold_risk_unknown(self, reservation_id: str, now: datetime, client_order_id: str) -> None:
         risk = self._risk
         if isinstance(risk, RiskEngine):
-            risk.hold_live_unknown(reservation_id, client_order_id=client_order_id, now=now)
+            risk.hold_live_unknown(
+                reservation_id,
+                client_order_id=client_order_id,
+                owner_id=self._ensure_hold_owner(now),
+                now=now,
+            )
 
     def _assert_demo_write_closed(self) -> None:
         if self.grant.network != "TESTNET" or self.base_url != TESTNET_BASE or self._transport.base_url != TESTNET_BASE:

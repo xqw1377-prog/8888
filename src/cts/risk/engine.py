@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Optional, Sequence
 from uuid import uuid4
 
@@ -650,6 +653,60 @@ class RiskEngine:
                 )
             return cumulative
 
+    def owner_lock_path(self, owner_id: str) -> Path:
+        return Path(self.store.path).with_name(f".cts-owner-{owner_id}.lock")
+
+    def register_hold_owner(self, owner_id: str, *, now: datetime) -> None:
+        """所有者先占住锁文件，再写入风险库。另一会话不能把活着的所有者标成已恢复。"""
+        with self.store.txn() as conn:
+            conn.execute(
+                """
+                INSERT INTO live_hold_owners(owner_id, account_id, created_at, recovered_at, recovery_evidence)
+                VALUES (?,?,?,NULL,NULL)
+                ON CONFLICT(owner_id) DO NOTHING
+                """,
+                (owner_id, self.account_id, now.isoformat()),
+            )
+
+    def recover_dead_hold_owners(self, *, now: datetime) -> None:
+        """锁文件能被独占时，记下一份恢复证据。仍被占用的所有者保持有效。"""
+        with self.store.txn() as conn:
+            rows = conn.execute(
+                """
+                SELECT owner_id FROM live_hold_owners
+                WHERE account_id=? AND recovered_at IS NULL
+                """,
+                (self.account_id,),
+            ).fetchall()
+        dead: list[tuple[str, str]] = []
+        for row in rows:
+            owner_id = str(row["owner_id"])
+            path = self.owner_lock_path(owner_id)
+            if not path.is_file():
+                dead.append((owner_id, "所有者锁缺失"))
+                continue
+            fd = os.open(path, os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                continue
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+            dead.append((owner_id, "所有者锁已释放"))
+        if not dead:
+            return
+        with self.store.txn() as conn:
+            for owner_id, evidence in dead:
+                conn.execute(
+                    """
+                    UPDATE live_hold_owners
+                    SET recovered_at=?, recovery_evidence=?
+                    WHERE owner_id=? AND account_id=? AND recovered_at IS NULL
+                    """,
+                    (now.isoformat(), evidence, owner_id, self.account_id),
+                )
+
     def hold_live_request(
         self,
         reservation_id: str,
@@ -657,6 +714,7 @@ class RiskEngine:
         *,
         hold_id: str,
         reason: str,
+        owner_id: str,
         now: datetime,
     ) -> None:
         """按请求实例记下阻断。预留在仍有阻断时保持 UNKNOWN。"""
@@ -667,16 +725,18 @@ class RiskEngine:
                 client_order_id=client_order_id,
                 hold_id=hold_id,
                 reason=reason,
+                owner_id=owner_id,
                 now=now,
             )
 
-    def hold_live_unknown(self, reservation_id: str, *, client_order_id: str, now: datetime) -> None:
+    def hold_live_unknown(self, reservation_id: str, *, client_order_id: str, owner_id: str, now: datetime) -> None:
         """订单状态未知时，为该订单记下稳定阻断，风险引擎不能再生成新预留。"""
         self.hold_live_request(
             reservation_id,
             client_order_id,
             hold_id=f"unknown:{client_order_id}",
             reason="UNKNOWN",
+            owner_id=owner_id,
             now=now,
         )
 
@@ -684,26 +744,38 @@ class RiskEngine:
         self,
         *,
         hold_id: str,
+        owner_id: str,
         client_order_id: str,
         reservation_id: str,
-        keep: set[str],
+        now: datetime,
     ) -> int:
-        """只删除这次请求自己的阻断，以及该订单上已经不在途的旧阻断。"""
+        """只删除本次请求。旧请求仅在所有者已有恢复证据时清除。"""
+        self.recover_dead_hold_owners(now=now)
         with self.store.txn() as conn:
             conn.execute(
-                "DELETE FROM live_risk_holds WHERE hold_id=? AND account_id=?",
-                (hold_id, self.account_id),
-            )
-            rows = conn.execute(
                 """
-                SELECT hold_id FROM live_risk_holds
-                WHERE client_order_id=? AND account_id=?
+                DELETE FROM live_risk_holds
+                WHERE hold_id=? AND account_id=? AND owner_id=?
                 """,
-                (client_order_id, self.account_id),
-            ).fetchall()
-            for row in rows:
-                if row["hold_id"] not in keep:
-                    conn.execute("DELETE FROM live_risk_holds WHERE hold_id=?", (row["hold_id"],))
+                (hold_id, self.account_id, owner_id),
+            )
+            conn.execute(
+                """
+                DELETE FROM live_risk_holds
+                WHERE account_id=? AND client_order_id=? AND owner_id IN (
+                    SELECT owner_id FROM live_hold_owners
+                    WHERE account_id=? AND recovered_at IS NOT NULL
+                )
+                """,
+                (self.account_id, client_order_id, self.account_id),
+            )
+            conn.execute(
+                """
+                DELETE FROM live_risk_holds
+                WHERE hold_id=? AND account_id=?
+                """,
+                (f"unknown:{client_order_id}", self.account_id),
+            )
             return self._live_hold_count(conn, reservation_id)
 
     def live_hold_count(self, reservation_id: str) -> int:
@@ -718,6 +790,7 @@ class RiskEngine:
         client_order_id: str,
         hold_id: str,
         reason: str,
+        owner_id: str,
         now: datetime,
     ) -> None:
         try:
@@ -728,11 +801,12 @@ class RiskEngine:
             return
         conn.execute(
             """
-            INSERT INTO live_risk_holds(hold_id, account_id, reservation_id, client_order_id, reason, created_at)
-            VALUES (?,?,?,?,?,?)
+            INSERT INTO live_risk_holds(
+                hold_id, account_id, reservation_id, client_order_id, reason, created_at, owner_id
+            ) VALUES (?,?,?,?,?,?,?)
             ON CONFLICT(hold_id) DO NOTHING
             """,
-            (hold_id, self.account_id, reservation_id, client_order_id, reason, now.isoformat()),
+            (hold_id, self.account_id, reservation_id, client_order_id, reason, now.isoformat(), owner_id),
         )
         if reservation.status in (ReservationStatus.FILLED, ReservationStatus.RELEASED, ReservationStatus.UNKNOWN):
             return

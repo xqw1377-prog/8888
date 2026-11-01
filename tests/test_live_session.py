@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
+import os
 import threading
 
 import pytest
@@ -1472,6 +1473,114 @@ def test_one_query_cannot_clear_another_orders_hold(tmp_path) -> None:
     assert session.get_order("cid-a").status == "NEW"
     created = engine.reserve([req("ETHUSDT", "s-after-both")], now=NOW)
     assert created[0].qty > 0
+
+
+def _ack_new(qty: str = "0.01", client: str = "cid-1", symbol: str = "BTCUSDT") -> dict:
+    return _identified("NEW", "0", qty, client, symbol)
+
+
+def _open_peer(session: LiveSession, engine, transport) -> LiveSession:
+    return LiveSession(
+        grant(network="TESTNET", account_id=engine.account_id, max_notional=D("100000")),
+        VenueCredentials("key-id", SECRET),
+        transport,
+        now=NOW,
+        path=session.orders.path,
+        risk=engine,
+    )
+
+
+def test_other_session_keeps_an_inflight_hold(tmp_path) -> None:
+    engine, reservation, session_a, _opener = admitted(tmp_path, healthy())
+    submit(session_a, engine, reservation.reservation_id)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked(method: str, url: str, headers: dict[str, str]):
+        entered.set()
+        assert release.wait(2)
+        return _ack_new()
+
+    session_a._transport = open_testnet_transport(blocked)
+    session_b = _open_peer(session_a, engine, open_testnet_transport(lambda method, url, headers: _ack_new()))
+    worker = threading.Thread(target=lambda: session_a.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW))
+    worker.start()
+    assert entered.wait(2)
+    session_b.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert engine.live_hold_count(reservation.reservation_id) == 1
+    with pytest.raises(CtsError) as blocked_risk:
+        engine.reserve([req("ETHUSDT", "s-peer-query")], now=NOW)
+    assert blocked_risk.value.reason_code == "UNKNOWN_ORDER"
+    release.set()
+    worker.join(2)
+    assert worker.is_alive() is False
+    assert session_a.get_order("cid-1").status == "NEW"
+    assert engine.live_hold_count(reservation.reservation_id) == 0
+    created = engine.reserve([req("ETHUSDT", "s-peer-query-done")], now=NOW)
+    assert created[0].qty > 0
+
+
+def test_other_session_cancel_keeps_an_inflight_query(tmp_path) -> None:
+    engine, reservation, session_a, _opener = admitted(tmp_path, healthy())
+    submit(session_a, engine, reservation.reservation_id)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked(method: str, url: str, headers: dict[str, str]):
+        entered.set()
+        assert release.wait(2)
+        return _ack_new()
+
+    session_a._transport = open_testnet_transport(blocked)
+    session_b = _open_peer(
+        session_a,
+        engine,
+        open_testnet_transport(lambda method, url, headers: _identified("CANCELED", "0", "0.01")),
+    )
+    worker = threading.Thread(target=lambda: session_a.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW))
+    worker.start()
+    assert entered.wait(2)
+    session_b.cancel(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert engine.live_hold_count(reservation.reservation_id) == 1
+    with pytest.raises(CtsError) as blocked_risk:
+        engine.reserve([req("ETHUSDT", "s-peer-cancel")], now=NOW)
+    assert blocked_risk.value.reason_code == "UNKNOWN_ORDER"
+    release.set()
+    worker.join(2)
+    assert worker.is_alive() is False
+
+
+def test_recovered_owner_hold_clears_after_the_order_is_confirmed(tmp_path) -> None:
+    engine, reservation, session_a, _opener = admitted(tmp_path, healthy())
+    submit(session_a, engine, reservation.reservation_id)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked(method: str, url: str, headers: dict[str, str]):
+        entered.set()
+        assert release.wait(2)
+        return _ack_new()
+
+    session_a._transport = open_testnet_transport(blocked)
+    session_b = _open_peer(session_a, engine, open_testnet_transport(lambda method, url, headers: _ack_new()))
+    worker = threading.Thread(target=lambda: session_a.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW))
+    worker.start()
+    assert entered.wait(2)
+    assert session_a._owner_lock_fd is not None
+    os.close(session_a._owner_lock_fd)
+    session_a._owner_lock_fd = None
+    session_b.query(symbol="BTCUSDT", client_order_id="cid-1", now=NOW)
+    assert engine.live_hold_count(reservation.reservation_id) == 0
+    evidence = engine.store._conn.execute(
+        "SELECT recovery_evidence FROM live_hold_owners WHERE owner_id=?",
+        (session_a._owner_id,),
+    ).fetchone()
+    assert evidence["recovery_evidence"] == "所有者锁已释放"
+    created = engine.reserve([req("ETHUSDT", "s-owner-recovered")], now=NOW)
+    assert created[0].qty > 0
+    release.set()
+    worker.join(2)
+    assert worker.is_alive() is False
 
 
 def test_cancel_identity_must_be_present(tmp_path) -> None:

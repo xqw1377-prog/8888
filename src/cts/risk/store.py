@@ -97,7 +97,15 @@ CREATE TABLE IF NOT EXISTS live_risk_holds (
     reservation_id TEXT NOT NULL,
     client_order_id TEXT NOT NULL,
     reason TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    owner_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS live_hold_owners (
+    owner_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    recovered_at TEXT,
+    recovery_evidence TEXT
 );
 CREATE TABLE IF NOT EXISTS blockers (
     blocker_id TEXT PRIMARY KEY,
@@ -211,6 +219,12 @@ class RiskStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        self._migrate_live_holds()
+
+    def _migrate_live_holds(self) -> None:
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(live_risk_holds)")}
+        if "owner_id" not in columns:
+            self._conn.execute("ALTER TABLE live_risk_holds ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
 
     def close(self) -> None:
         self._conn.close()
