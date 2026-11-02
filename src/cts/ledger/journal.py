@@ -35,6 +35,28 @@ def _lines(asset: str, debit: AccountBucket, credit: AccountBucket, amount: Deci
     )
 
 
+REVERSIBLE_FLOW_EVENTS = (
+    LedgerEventType.MARGIN_LOCK,
+    LedgerEventType.MARGIN_RELEASE,
+    LedgerEventType.FEE,
+    LedgerEventType.FUNDING,
+)
+
+
+def _isolated_debit(event: LedgerEvent) -> Decimal:
+    return sum(
+        (line.debit for line in event.lines if line.bucket == AccountBucket.ISOLATED_MARGIN),
+        Decimal("0"),
+    )
+
+
+def _isolated_credit(event: LedgerEvent) -> Decimal:
+    return sum(
+        (line.credit for line in event.lines if line.bucket == AccountBucket.ISOLATED_MARGIN),
+        Decimal("0"),
+    )
+
+
 @dataclass
 class AccountBooks:
     balances: dict[tuple[str, AccountBucket], Decimal] = field(default_factory=dict)
@@ -55,15 +77,9 @@ class Ledger:
         self._loading = False
         self._store: Optional[LedgerStore] = LedgerStore(path) if path else None
         if self._store is not None:
-            self._loading = True
-            try:
-                for event in self._store.load(account_id):
-                    self.post_journal(event)
-                    self._project_position(event)
-                    if not self._has_open_position():
-                        self._refresh_nav(unrealized=Decimal("0"))
-            finally:
-                self._loading = False
+            for event in self._store.load(account_id):
+                self._load_event(event)
+            self._overlay_books_state(self._store)
 
     def append_event(self, event: LedgerEvent) -> LedgerEvent:
         if event.account_id != self.account_id:
@@ -96,6 +112,38 @@ class Ledger:
         if not self._loading and not self._has_open_position():
             self._refresh_nav(unrealized=Decimal("0"))
 
+    def _load_event(self, event: LedgerEvent) -> None:
+        self._loading = True
+        try:
+            self.post_journal(event)
+            self._project_position(event)
+            if not self._has_open_position():
+                self._refresh_nav(unrealized=Decimal("0"))
+        finally:
+            self._loading = False
+
+    def _overlay_books_state(self, store: LedgerStore) -> None:
+        state = store.load_books_state(self.account_id)
+        if state is None:
+            return
+        anchor_seq, last_unit_nav, high_water_mark = state
+        max_seq = store.max_event_seq(self.account_id)
+        if anchor_seq > max_seq:
+            # 锚点不属于本账户当前事件范围，整行不可信，按事件推导
+            return
+        if high_water_mark > self._books.high_water_mark:
+            self._books.high_water_mark = high_water_mark
+        if anchor_seq == max_seq:
+            self._books.last_unit_nav = last_unit_nav
+
+    def _nav_for_share_mutation(self, event: LedgerEvent) -> Decimal:
+        nav_text = event.metadata.get("nav_at_issue")
+        if nav_text is not None:
+            return D(nav_text)
+        if self._books.shares > 0:
+            return self._books.last_unit_nav
+        return Decimal("1")
+
     def _assert_share_ok(self, event: LedgerEvent) -> None:
         if event.event_type not in (LedgerEventType.TRANSFER_IN, LedgerEventType.TRANSFER_OUT):
             return
@@ -104,8 +152,10 @@ class Ledger:
             if amount <= 0:
                 raise UnitValidationError("空账本不能先出金")
             return
+        nav = self._nav_for_share_mutation(event)
+        if nav <= 0:
+            raise LedgerImbalanceError("单位净值为零或为负，暂停出入金，先冲正或人工处理")
         if amount < 0:
-            nav = self._books.last_unit_nav if self._books.last_unit_nav > 0 else Decimal("1")
             if self._books.shares - (-amount) / nav < 0:
                 raise LedgerImbalanceError("份额不能为负")
 
@@ -122,7 +172,8 @@ class Ledger:
         as_of: Optional[datetime] = None,
     ) -> LedgerEvent:
         amount = require_positive(D(amount), "amount")
-        self._prepare_nav_for_transfer(mark_prices=mark_prices, as_of=as_of or event_time)
+        if (venue, external_id) not in self._by_external:
+            self._prepare_nav_for_transfer(mark_prices=mark_prices, as_of=as_of or event_time)
         return self.append_event(
             LedgerEvent(
                 event_id=uuid4().hex,
@@ -135,6 +186,7 @@ class Ledger:
                 external_id=external_id,
                 source=source,
                 lines=_lines(self.asset, AccountBucket.WALLET, AccountBucket.EXTERNAL, amount, "deposit"),
+                metadata={"nav_at_issue": format(self._books.last_unit_nav, "f")},
             )
         )
 
@@ -151,9 +203,10 @@ class Ledger:
         as_of: Optional[datetime] = None,
     ) -> LedgerEvent:
         amount = require_positive(D(amount), "amount")
-        if self.balance(AccountBucket.WALLET) < amount:
-            raise LedgerImbalanceError("可用钱包余额不足以出金")
-        self._prepare_nav_for_transfer(mark_prices=mark_prices, as_of=as_of or event_time)
+        if (venue, external_id) not in self._by_external:
+            if self.balance(AccountBucket.WALLET) < amount:
+                raise LedgerImbalanceError("可用钱包余额不足以出金")
+            self._prepare_nav_for_transfer(mark_prices=mark_prices, as_of=as_of or event_time)
         return self.append_event(
             LedgerEvent(
                 event_id=uuid4().hex,
@@ -166,6 +219,7 @@ class Ledger:
                 external_id=external_id,
                 source=source,
                 lines=_lines(self.asset, AccountBucket.EXTERNAL, AccountBucket.WALLET, amount, "withdraw"),
+                metadata={"nav_at_issue": format(self._books.last_unit_nav, "f")},
             )
         )
 
@@ -370,6 +424,7 @@ class Ledger:
                 "venue_trade_id": venue_trade_id,
                 "realized": format(realized, "f"),
                 "note": note,
+                "credit_isolated": str(credit_isolated),
                 **({"price_source": price_source} if price_source else {}),
                 **({"quote_grade": quote_grade} if quote_grade else {}),
                 **({"price_event_time": price_event_time.isoformat()} if price_event_time is not None else {}),
@@ -400,6 +455,9 @@ class Ledger:
         existing = self._by_external.get((venue, external_id))
         if existing is not None:
             _require_same_lines(existing, LedgerEventType.FEE, lines)
+            prior_isolated = existing.metadata.get("from_isolated")
+            if (prior_isolated is not None and prior_isolated != str(from_isolated)) or existing.symbol != symbol:
+                raise ConflictError(f"重复流水内容冲突: {(venue, external_id)}")
             return existing
         if self.balance(src) < amount:
             raise LedgerImbalanceError("手续费扣款账户余额不足")
@@ -418,6 +476,7 @@ class Ledger:
                 source="venue",
                 symbol=symbol,
                 lines=lines,
+                metadata={"from_isolated": str(from_isolated)},
             )
         )
         if from_isolated and symbol:
@@ -481,9 +540,17 @@ class Ledger:
     def reverse(self, event_id: str, *, event_time: datetime, received_at: datetime, external_id: str) -> LedgerEvent:
         original = next((e for e in self._events if e.event_id == event_id), None)
         if original is None:
-            raise UnitValidationError("冲正目标不存在")
+            raise UnitValidationError("冲正目标不存在", reason_code="REVERSAL_TARGET_MISSING")
+        if original.event_type == LedgerEventType.REVERSAL:
+            raise UnitValidationError("冲正不能再次冲正，另用新记录标记", reason_code="REVERSAL_OF_REVERSAL")
+        if original.event_type not in REVERSIBLE_FLOW_EVENTS:
+            raise UnitValidationError(
+                "冲正只覆盖划转、手续费与资金费；成交与出入金另用新记录标记",
+                reason_code="REVERSAL_TARGET_NOT_FLOW",
+            )
         if not original.lines:
-            raise UnitValidationError("无资金分录的事件用新记录标记，不覆盖原 FILL")
+            raise UnitValidationError("无资金分录的事件用新记录标记，不覆盖原 FILL", reason_code="REVERSAL_TARGET_NO_LINES")
+        self._validate_reversal_position_effect(original)
         reversed_lines = tuple(
             JournalLine(
                 asset=line.asset,
@@ -494,7 +561,7 @@ class Ledger:
             )
             for line in original.lines
         )
-        return self.append_event(
+        event = self.append_event(
             LedgerEvent(
                 event_id=uuid4().hex,
                 account_id=self.account_id,
@@ -510,6 +577,46 @@ class Ledger:
                 reversed_event_id=original.event_id,
             )
         )
+        self._apply_reversal_position_effect(original)
+        return event
+
+    def _validate_reversal_position_effect(self, original: LedgerEvent) -> None:
+        if original.symbol is None:
+            return
+        if original.event_type == LedgerEventType.MARGIN_LOCK:
+            if self.position(original.symbol).isolated_margin - _isolated_debit(original) < 0:
+                raise LedgerImbalanceError(
+                    "冲正后逐仓保证金为负，先处理后续占用",
+                    reason_code="REVERSAL_MARGIN_UNDERFLOW",
+                )
+        if original.event_type == LedgerEventType.FUNDING and original.metadata.get("from_isolated") == "True":
+            if self.position(original.symbol).isolated_margin - D(original.metadata.get("payment", "0")) < 0:
+                raise LedgerImbalanceError(
+                    "冲正后逐仓保证金为负，先处理后续占用",
+                    reason_code="REVERSAL_MARGIN_UNDERFLOW",
+                )
+
+    def _apply_reversal_position_effect(self, original: LedgerEvent) -> None:
+        if original.symbol is None:
+            return
+        pos = self.position(original.symbol)
+        if original.event_type == LedgerEventType.MARGIN_LOCK:
+            pos.isolated_margin -= _isolated_debit(original)
+            pos.version += 1
+        elif original.event_type == LedgerEventType.MARGIN_RELEASE:
+            pos.isolated_margin += _isolated_credit(original)
+            pos.version += 1
+        elif original.event_type == LedgerEventType.FEE:
+            amount = _isolated_credit(original)
+            if amount > 0:
+                pos.isolated_margin += amount
+                pos.version += 1
+        elif original.event_type == LedgerEventType.FUNDING:
+            payment = D(original.metadata.get("payment", "0"))
+            pos.funding_cum -= payment
+            if original.metadata.get("from_isolated") == "True":
+                pos.isolated_margin -= payment
+            pos.version += 1
 
     def balance(self, bucket: AccountBucket, asset: Optional[str] = None) -> Decimal:
         return self._books.balances.get((asset or self.asset, bucket), Decimal("0"))
@@ -533,9 +640,10 @@ class Ledger:
         return list(self._events)
 
     def set_reserved_budget(self, amount: Decimal) -> None:
-        self._books.reserved_budget = D(amount)
-        if self._books.reserved_budget < 0:
+        value = D(amount)
+        if value < 0:
             raise UnitValidationError("预留不能为负")
+        self._books.reserved_budget = value
 
     def equity_snapshot(
         self,
@@ -556,9 +664,16 @@ class Ledger:
         equity = self.cash_equity() + upnl
         shares = self._books.shares
         unit_nav = (equity / shares) if shares > 0 else Decimal("1")
-        if unit_nav > self._books.high_water_mark:
-            self._books.high_water_mark = unit_nav
-        self._books.last_unit_nav = unit_nav
+        next_hwm = self._books.high_water_mark if self._books.high_water_mark >= unit_nav else unit_nav
+        if unit_nav != self._books.last_unit_nav or next_hwm != self._books.high_water_mark:
+            if self._store is not None:
+                self._store.save_books_state(
+                    self.account_id,
+                    last_unit_nav=unit_nav,
+                    high_water_mark=next_hwm,
+                )
+            self._books.last_unit_nav = unit_nav
+            self._books.high_water_mark = next_hwm
         return EquitySnapshot(
             account_id=self.account_id,
             as_of=as_of,
@@ -631,7 +746,7 @@ class Ledger:
     def replay(self) -> "Ledger":
         clone = Ledger(self.account_id, self.asset)
         for event in self._events:
-            clone.append_event(
+            clone._load_event(
                 LedgerEvent(
                     event_id=event.event_id,
                     account_id=event.account_id,
@@ -649,9 +764,13 @@ class Ledger:
                     reversed_event_id=event.reversed_event_id,
                 )
             )
-            clone._project_position(event)
         clone._books.reserved_budget = self._books.reserved_budget
-        clone._books.high_water_mark = max(clone._books.high_water_mark, self._books.high_water_mark)
+        if self._store is not None:
+            clone._overlay_books_state(self._store)
+        else:
+            clone._books.last_unit_nav = self._books.last_unit_nav
+            if self._books.high_water_mark > clone._books.high_water_mark:
+                clone._books.high_water_mark = self._books.high_water_mark
         return clone
 
     def _project_position(self, event: LedgerEvent) -> None:
@@ -661,12 +780,28 @@ class Ledger:
             self.position(event.symbol).funding_cum += D(event.metadata.get("payment", "0"))
         if event.event_type == LedgerEventType.MARGIN_LOCK and event.symbol:
             amt = sum(line.debit for line in event.lines if line.bucket == AccountBucket.ISOLATED_MARGIN)
-            self.position(event.symbol).isolated_margin += amt
+            pos = self.position(event.symbol)
+            pos.isolated_margin += amt
+            pos.version += 1
         if event.event_type == LedgerEventType.MARGIN_RELEASE and event.symbol:
             amt = sum(line.credit for line in event.lines if line.bucket == AccountBucket.ISOLATED_MARGIN)
-            self.position(event.symbol).isolated_margin -= amt
+            pos = self.position(event.symbol)
+            pos.isolated_margin -= amt
+            pos.version += 1
+        if event.event_type == LedgerEventType.FEE and event.symbol:
+            amt = _isolated_credit(event)
+            if amt > 0:
+                pos = self.position(event.symbol)
+                pos.isolated_margin -= amt
+                pos.version += 1
+        if event.event_type == LedgerEventType.REVERSAL and event.reversed_event_id:
+            original = next((e for e in self._events if e.event_id == event.reversed_event_id), None)
+            if original is not None:
+                self._apply_reversal_position_effect(original)
         if event.symbol and event.event_type == LedgerEventType.FUNDING and event.metadata.get("from_isolated") == "True":
-            self.position(event.symbol).isolated_margin += D(event.metadata["payment"])
+            pos = self.position(event.symbol)
+            pos.isolated_margin += D(event.metadata["payment"])
+            pos.version += 1
 
     def _has_open_position(self) -> bool:
         return any(pos.qty > 0 for pos in self._positions.values())
@@ -684,7 +819,7 @@ class Ledger:
 
     def _apply_share_mutation(self, event: LedgerEvent) -> None:
         amount = sum(line.debit - line.credit for line in event.lines if line.bucket == AccountBucket.WALLET)
-        nav = self._books.last_unit_nav if self._books.shares > 0 else Decimal("1")
+        nav = self._nav_for_share_mutation(event)
         if self._books.shares == 0:
             if amount <= 0:
                 raise UnitValidationError("空账本不能先出金")
@@ -737,6 +872,67 @@ class LedgerStore:
             )
             """
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS books_state (
+                account_id TEXT PRIMARY KEY,
+                anchor_seq INTEGER NOT NULL,
+                last_unit_nav TEXT NOT NULL,
+                high_water_mark TEXT NOT NULL
+            )
+            """
+        )
+
+    def save_books_state(self, account_id: str, *, last_unit_nav: Decimal, high_water_mark: Decimal) -> None:
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            anchor = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM ledger_events WHERE account_id=?",
+                (account_id,),
+            ).fetchone()[0]
+            self._conn.execute(
+                """
+                INSERT INTO books_state(account_id, anchor_seq, last_unit_nav, high_water_mark)
+                VALUES (?,?,?,?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    anchor_seq=excluded.anchor_seq,
+                    last_unit_nav=excluded.last_unit_nav,
+                    high_water_mark=excluded.high_water_mark
+                """,
+                (account_id, int(anchor), format(last_unit_nav, "f"), format(high_water_mark, "f")),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def load_books_state(self, account_id: str) -> Optional[tuple[int, Decimal, Decimal]]:
+        row = self._conn.execute(
+            "SELECT anchor_seq, last_unit_nav, high_water_mark FROM books_state WHERE account_id=?",
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            anchor, nav, hwm = int(row[0]), D(row[1]), D(row[2])
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise SnapshotInconsistentError(
+                f"账本状态行损坏，拒绝覆盖净值与高水位: {account_id}",
+                reason_code="BOOKS_STATE_CORRUPT",
+            ) from exc
+        if nav < 0 or hwm < 0:
+            raise SnapshotInconsistentError(
+                f"账本状态行数值非法，拒绝覆盖净值与高水位: {account_id}",
+                reason_code="BOOKS_STATE_CORRUPT",
+            )
+        return anchor, nav, hwm
+
+    def max_event_seq(self, account_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM ledger_events WHERE account_id=?",
+            (account_id,),
+        ).fetchone()
+        return int(row[0])
 
     def append(self, event: LedgerEvent) -> None:
         if self.fail_appends:
@@ -884,7 +1080,15 @@ def _restore_position_from_fill(ledger: Ledger, event: LedgerEvent) -> None:
         pos.qty -= qty
         pos.realized_pnl_cum += realized
         if realized != 0:
-            pos.isolated_margin += realized
+            # 入账账户以分录为事实判定；新旧事件同规则，缺证据时不默默取默认值
+            targets = {line.bucket for line in event.lines} - {AccountBucket.REALIZED_PNL}
+            if targets == {AccountBucket.ISOLATED_MARGIN}:
+                pos.isolated_margin += realized
+            elif targets != {AccountBucket.WALLET}:
+                raise LedgerImbalanceError(
+                    f"成交盈亏分录无法判定入账账户: {event.external_id}",
+                    reason_code="EVIDENCE_INSUFFICIENT",
+                )
         if pos.qty == 0:
             pos.side = None
             pos.avg_price = Decimal("0")
