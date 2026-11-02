@@ -559,7 +559,7 @@ def test_legacy_fill_realized_without_lines_is_evidence_insufficient(tmp_path) -
 # ---------- books_state：只补净值与高水位，不掩盖事件重放 ----------
 
 
-def test_books_state_stale_anchor_keeps_event_derived_nav(tmp_path) -> None:
+def test_books_state_stale_anchor_keeps_last_observation(tmp_path) -> None:
     path = tmp_path / "ledger.db"
     ledger = Ledger("acct-1", path=str(path))
     ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
@@ -569,10 +569,17 @@ def test_books_state_stale_anchor_keeps_event_derived_nav(tmp_path) -> None:
     assert ledger._store.load_books_state("acct-1") == (3, D("1.0031"), D("1.0031"))
     ledger.post_fee(amount=D("1"), event_time=TS2, received_at=TS2, external_id="fee-1", venue="SIM")
 
+    assert ledger._books.last_unit_nav == D("1.0031")
+    assert ledger._nav_observation_seq == 3
+    assert ledger._store.max_event_seq("acct-1") == 4
+    assert ledger._store.load_books_state("acct-1") == (3, D("1.0031"), D("1.0031"))
     reopened = Ledger("acct-1", path=str(path))
-    assert reopened._books.last_unit_nav == D("1")
-    assert reopened._books.high_water_mark == D("1.0031")
-    assert reopened.position("BTCUSDT").isolated_margin == D("500")
+    replayed = ledger.replay()
+    for book in (reopened, replayed):
+        assert book._books.last_unit_nav == D("1.0031")
+        assert book._books.high_water_mark == D("1.0031")
+        assert book._nav_observation_seq == 3
+        assert book.position("BTCUSDT").isolated_margin == D("500")
 
 
 def test_books_state_supplies_only_nav_and_hwm_never_shares(tmp_path) -> None:
@@ -806,6 +813,78 @@ def test_deposit_while_holding_restores_mark_nav_on_every_path(tmp_path) -> None
     )
     assert volatile._books.last_unit_nav == D("1.0031")
     assert full_state(volatile.replay()) == full_state(volatile)
+
+
+def test_reversal_uniqueness_is_enforced_for_a_stale_ledger(tmp_path) -> None:
+    path = tmp_path / "ledger.db"
+    first = Ledger("acct-1", path=str(path))
+    first.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
+    first.lock_margin(amount=D("500"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-1", venue="SIM")
+    open_long(first)
+    fee = first.post_fee(
+        amount=D("2"), event_time=TS, received_at=TS, external_id="fee-1", venue="SIM", symbol="BTCUSDT", from_isolated=True
+    )
+    stale = Ledger("acct-1", path=str(path))
+    first.reverse(fee.event_id, event_time=TS2, received_at=TS2, external_id="rev-1")
+    before = full_state(stale)
+
+    with pytest.raises(UnitValidationError) as exc:
+        stale.reverse(fee.event_id, event_time=TS2, received_at=TS2, external_id="rev-2")
+    assert exc.value.reason_code == "REVERSAL_ALREADY_APPLIED"
+    assert full_state(stale) == before
+
+    reopened = Ledger("acct-1", path=str(path))
+    reversals = [event for event in reopened.events() if event.event_type == LedgerEventType.REVERSAL]
+    assert len(reversals) == 1
+    assert reversals[0].reversed_event_id == fee.event_id
+    assert reopened.position("BTCUSDT").isolated_margin == D("500")
+
+
+def test_funding_credit_balance_can_be_partially_reversed(tmp_path) -> None:
+    path = tmp_path / "ledger.db"
+    ledger = Ledger("acct-1", path=str(path))
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
+    first = ledger.post_funding(
+        payment=D("5"), event_time=TS, received_at=TS, external_id="fund-1", venue="SIM", symbol="BTCUSDT"
+    )
+    ledger.post_funding(
+        payment=D("5"), event_time=TS, received_at=TS, external_id="fund-2", venue="SIM", symbol="BTCUSDT"
+    )
+    assert ledger.balance(AccountBucket.FUNDING) == D("-10")
+
+    ledger.reverse(first.event_id, event_time=TS2, received_at=TS2, external_id="rev-1")
+    assert ledger.balance(AccountBucket.FUNDING) == D("-5")
+    assert ledger.balance(AccountBucket.WALLET) == D("10005")
+    expected = full_state(ledger)
+    assert full_state(ledger.replay()) == expected
+    assert full_state(Ledger("acct-1", path=str(path))) == expected
+
+
+def test_fee_after_holding_deposit_keeps_observed_nav_and_its_seq(tmp_path) -> None:
+    path = tmp_path / "ledger.db"
+    ledger = Ledger("acct-1", path=str(path))
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
+    ledger.lock_margin(amount=D("500"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-1", venue="SIM")
+    open_long(ledger)
+    ledger.transfer_in(
+        amount=D("100"), event_time=TS2, received_at=TS2, external_id="dep-2", mark_prices={"BTCUSDT": D("131")}
+    )
+    observed_seq = ledger._nav_observation_seq
+    assert ledger._books.last_unit_nav == D("1.0031")
+    assert observed_seq == 4
+    ledger.post_fee(amount=D("1"), event_time=TS2, received_at=TS2, external_id="fee-1", venue="SIM")
+
+    assert ledger._books.last_unit_nav == D("1.0031")
+    assert ledger._nav_observation_seq == observed_seq
+    assert ledger._store.max_event_seq("acct-1") == 5
+    assert ledger._store.load_books_state("acct-1")[0] == observed_seq
+    expected = full_state(ledger)
+    reopened = Ledger("acct-1", path=str(path))
+    replayed = ledger.replay()
+    assert full_state(reopened) == expected
+    assert full_state(replayed) == expected
+    assert reopened._nav_observation_seq == observed_seq
+    assert replayed._nav_observation_seq == observed_seq
 
 
 def test_books_state_rejects_non_finite_values(tmp_path) -> None:

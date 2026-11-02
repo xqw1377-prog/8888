@@ -75,6 +75,8 @@ class Ledger:
         self._books = AccountBooks()
         self._positions: dict[str, PositionState] = {}
         self._loading = False
+        self._last_nav_refresh_seq = 0
+        self._nav_observation_seq: Optional[int] = None
         self._store: Optional[LedgerStore] = LedgerStore(path) if path else None
         if self._store is not None:
             for event in self._store.load(account_id):
@@ -123,6 +125,7 @@ class Ledger:
             unit_nav, high_water_mark = observation
             self._books.last_unit_nav = unit_nav
             self._books.high_water_mark = high_water_mark
+            self._nav_observation_seq = len(self._events)
         elif not self._loading and not self._has_open_position():
             self._refresh_nav(unrealized=Decimal("0"))
 
@@ -147,8 +150,11 @@ class Ledger:
             return
         if high_water_mark > self._books.high_water_mark:
             self._books.high_water_mark = high_water_mark
-        if anchor_seq == max_seq:
+        # 锚点之后若没有新的净值刷新，最后一次观察仍然有效，但时点保持原锚点。
+        # 平仓等后续刷新产生的净值更新，不用旧观察覆盖，也不把旧锚点改到后续事件。
+        if anchor_seq == max_seq or self._last_nav_refresh_seq <= anchor_seq:
             self._books.last_unit_nav = last_unit_nav
+            self._nav_observation_seq = anchor_seq
 
     def _nav_for_share_mutation(self, event: LedgerEvent) -> Decimal:
         nav_text = event.metadata.get("nav_at_issue")
@@ -638,14 +644,17 @@ class Ledger:
                 )
 
     def _validate_reversal_balances(self, reversed_lines: tuple[JournalLine, ...]) -> None:
+        cash_buckets = {AccountBucket.WALLET, AccountBucket.ISOLATED_MARGIN}
         deltas: dict[tuple[str, AccountBucket], Decimal] = {}
         for line in reversed_lines:
+            if line.bucket not in cash_buckets:
+                continue
             key = (line.asset, line.bucket)
             deltas[key] = deltas.get(key, Decimal("0")) + line.signed
         for key, delta in deltas.items():
             if self._books.balances.get(key, Decimal("0")) + delta < 0:
                 raise LedgerImbalanceError(
-                    "冲正后账户余额为负，钱包与逐仓资金不能透支",
+                    "冲正后钱包或逐仓资金为负",
                     reason_code="REVERSAL_BALANCE_UNDERFLOW",
                 )
 
@@ -725,6 +734,9 @@ class Ledger:
                     last_unit_nav=unit_nav,
                     high_water_mark=next_hwm,
                 )
+                self._nav_observation_seq = self._store.max_event_seq(self.account_id)
+            else:
+                self._nav_observation_seq = len(self._events)
             self._books.last_unit_nav = unit_nav
             self._books.high_water_mark = next_hwm
         return EquitySnapshot(
@@ -822,6 +834,7 @@ class Ledger:
             clone._overlay_books_state(self._store)
         else:
             clone._books.last_unit_nav = self._books.last_unit_nav
+            clone._nav_observation_seq = self._nav_observation_seq
             if self._books.high_water_mark > clone._books.high_water_mark:
                 clone._books.high_water_mark = self._books.high_water_mark
         return clone
@@ -905,6 +918,8 @@ class Ledger:
         self._books.last_unit_nav = (self.cash_equity() + unrealized) / self._books.shares
         if self._books.last_unit_nav > self._books.high_water_mark:
             self._books.high_water_mark = self._books.last_unit_nav
+        self._last_nav_refresh_seq = len(self._events)
+        self._nav_observation_seq = None
 
 
 class LedgerStore:
@@ -945,6 +960,13 @@ class LedgerStore:
                 last_unit_nav TEXT NOT NULL,
                 high_water_mark TEXT NOT NULL
             )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ledger_reversal_once
+            ON ledger_events(account_id, reversed_event_id)
+            WHERE event_type = 'REVERSAL' AND reversed_event_id IS NOT NULL
             """
         )
 
@@ -1017,6 +1039,19 @@ class LedgerStore:
         ]
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            if event.event_type == LedgerEventType.REVERSAL and event.reversed_event_id:
+                prior = self._conn.execute(
+                    """
+                    SELECT 1 FROM ledger_events
+                    WHERE account_id=? AND event_type=? AND reversed_event_id=?
+                    """,
+                    (event.account_id, LedgerEventType.REVERSAL.value, event.reversed_event_id),
+                ).fetchone()
+                if prior is not None:
+                    raise UnitValidationError(
+                        "原事件已被冲正，不能再次经济冲正",
+                        reason_code="REVERSAL_ALREADY_APPLIED",
+                    )
             self._conn.execute(
                 """
                 INSERT INTO ledger_events(
@@ -1059,8 +1094,16 @@ class LedgerStore:
                     (event.account_id, int(anchor), format(unit_nav, "f"), format(high_water_mark, "f")),
                 )
             self._conn.execute("COMMIT")
+        except UnitValidationError:
+            self._conn.execute("ROLLBACK")
+            raise
         except sqlite3.IntegrityError as exc:
             self._conn.execute("ROLLBACK")
+            if "reversed_event_id" in str(exc):
+                raise UnitValidationError(
+                    "原事件已被冲正，不能再次经济冲正",
+                    reason_code="REVERSAL_ALREADY_APPLIED",
+                ) from exc
             raise ConflictError(f"账本已存在不同流水: {(event.venue, event.external_id)}") from exc
         except Exception:
             self._conn.execute("ROLLBACK")

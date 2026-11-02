@@ -1,14 +1,15 @@
 # 账本恢复一致性修复 R1 登记簿
 
-状态：**e359204 复审 CHANGES-REQUIRED**。本提交只修复审指出的五组边界，不签发 PASS，不登记新冻结点。
+状态：**8069d52 复审 CHANGES-REQUIRED**。本提交只收口剩余三组，不签发 PASS，不登记新冻结点。隐式估值随转账原子提交的方向保持不变。
 
 | 项 | 值 |
 |---|---|
 | 修复基线（修复前 HEAD） | `7108eb48682c2a2a51725e2e71ccfc4f11d60a2a` |
 | R1 提交 | `e3592049ea41d1e07fdd28ece7d7bb646d719a23`（复审 CHANGES-REQUIRED，不是冻结点） |
+| 上一轮边界 | `8069d5257ad9ecbd628e5ef21fe0b8f62ca71a54`（复审 CHANGES-REQUIRED，不是冻结点） |
 | 本轮提交 | 本文档此次更新所在提交 |
 | 改动 | `src/cts/ledger/journal.py`，`tests/test_ledger_recovery.py`，本文档 |
-| 测试 | 全量通过：228 项（e359204 的 222 项保持，本轮新增 6 项边界回归） |
+| 测试 | 全量通过：231 项（8069d52 的 228 项保持，本轮新增 3 项） |
 | 范围外（本轮不动） | UTC 规范哈希及历史兼容、杠杆参数合同、交易能力（`reduce_only` 禁令、UNKNOWN TTL、发单事务边界） |
 | 网络与授权 | 未访问币安。网络重跑暂停，TESTNET 试单未授权，实盘 `HOLD`，`main` 不合并 |
 
@@ -33,9 +34,9 @@
 | 目标无资金分录 | `REVERSAL_TARGET_NO_LINES` |
 | 逆投影后逐仓保证金为负 | `REVERSAL_MARGIN_UNDERFLOW` |
 | 同一原事件已被经济冲正 | `REVERSAL_ALREADY_APPLIED` |
-| 冲正后钱包或逐仓等账户余额为负 | `REVERSAL_BALANCE_UNDERFLOW` |
+| 冲正后钱包或逐仓资金为负 | `REVERSAL_BALANCE_UNDERFLOW` |
 
-可冲正类型：`MARGIN_LOCK`、`MARGIN_RELEASE`、`FEE`、`FUNDING`。产品代码中 `reverse()` 无调用方。所有拒绝在持久化之前发生，拒绝前后流水与内存不变（有测试钉住）。
+可冲正类型：`MARGIN_LOCK`、`MARGIN_RELEASE`、`FEE`、`FUNDING`。产品代码中 `reverse()` 无调用方。同一账户对同一原事件的经济冲正在持久化事务里只允许一次（部分唯一索引，陈旧实例写盘时拒绝）。透支检查只覆盖钱包、逐仓资金和相关仓位保证金；资金费等会计桶可以保持正常贷方余额。所有拒绝在持久化之前发生，拒绝前后本实例流水与内存不变。
 
 ## 3. 旧事件恢复规则：按分录事实，缺证据要明示
 
@@ -49,7 +50,7 @@
 
 - 行结构：`(account_id, anchor_seq, last_unit_nav, high_water_mark)`，`anchor_seq` 为写入时该账户最后事件 seq（按账户隔离）。
 - 只提供净值与高水位，永不提供份额、余额或仓位；份额与余额一律由事件推导。
-- 覆盖规则：锚点等于当前最大 seq 时，净值取行内观察值；锚点小于时净值按事件推导，高水位取两者最大；**锚点大于当前范围时整行忽略**。
+- 覆盖规则：锚点大于当前最大 seq 时整行忽略。锚点等于最大 seq 时，净值取该观察。锚点更旧时，高水位仍取较大值；若此后没有新的净值刷新，恢复这次观察的净值，锚点保持原时点，不把旧估值改记到后续事件上。若此后已有事件刷新净值（例如平仓），使用刷新后的净值，不用旧观察覆盖。
 - 行损坏、负数或非有限值（含 `Infinity` 与 `NaN`）：`BOOKS_STATE_CORRUPT`（`SNAPSHOT_INCONSISTENT`），拒绝打开覆盖路径，不静默回退，也不把 `NaN` 比较抛成裸 `InvalidOperation`。
 
 ## 5. 拒绝不变性原子性合同
@@ -66,6 +67,7 @@
 - 三路径等价与继续操作：`test_three_path_equivalence_with_continued_operations`、`test_same_deposit_issues_same_shares_on_every_path`、`test_deposit_while_holding_issues_same_shares_on_every_path`。
 - 六项复现：`test_isolated_fee_survives_replay_and_reopen`、`test_fill_credit_to_wallet_survives_replay_and_reopen`、`test_zero_nav_transfer_rejected_before_persistence_and_reopen_still_opens`、`test_observed_hwm_survives_reopen_replay_and_flat_close`、`test_reversal_syncs_position_margin_on_every_path`、`test_reversal_of_fee_and_funding_restores_position_and_counters`。
 - 旧事件事实恢复与证据不足：`test_legacy_isolated_fee_recovers_margin_from_lines`、`test_legacy_fill_pnl_target_inferred_from_lines`、`test_legacy_fill_realized_without_lines_is_evidence_insufficient`。
-- `books_state`：`test_books_state_stale_anchor_keeps_event_derived_nav`、`test_books_state_supplies_only_nav_and_hwm_never_shares`、`test_books_state_out_of_range_anchor_is_ignored_entirely`、`test_books_state_corrupt_row_fails_closed`。
+- `books_state`：`test_books_state_stale_anchor_keeps_last_observation`、`test_books_state_supplies_only_nav_and_hwm_never_shares`、`test_books_state_out_of_range_anchor_is_ignored_entirely`、`test_books_state_corrupt_row_fails_closed`、`test_fee_after_holding_deposit_keeps_observed_nav_and_its_seq`。
 - 原子性合同：`test_transfer_out_rejected_by_balance_takes_no_snapshot`、`test_transfer_disk_failure_rolls_back_implicit_observation`、`test_explicit_snapshot_survives_failed_transfer`、`test_rejected_events_change_neither_journal_nor_memory`、`test_unreversable_or_insufficient_reversal_changes_nothing`。
 - 五组复审边界：`test_same_reversal_delivery_does_not_reproject`、`test_second_external_id_cannot_reverse_same_event`、`test_reversal_of_release_after_withdrawal_does_not_overdraw_wallet`、`test_deposit_while_holding_restores_mark_nav_on_every_path`、`test_books_state_rejects_non_finite_values`、`test_transfer_disk_failure_rolls_back_implicit_observation`。
+- 三组收口：`test_reversal_uniqueness_is_enforced_for_a_stale_ledger`、`test_funding_credit_balance_can_be_partially_reversed`、`test_books_state_stale_anchor_keeps_last_observation`、`test_fee_after_holding_deposit_keeps_observed_nav_and_its_seq`。
