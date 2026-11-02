@@ -1,13 +1,14 @@
 # 账本恢复一致性修复 R1 登记簿
 
-状态：**IMPLEMENTED / PENDING INDEPENDENT REVIEW**。本文是修复完成申报，不签发 PASS，不登记新冻结点。独立复审在本提交上复跑全部测试并裁定。
+状态：**e359204 复审 CHANGES-REQUIRED**。本提交只修复审指出的五组边界，不签发 PASS，不登记新冻结点。
 
 | 项 | 值 |
 |---|---|
 | 修复基线（修复前 HEAD） | `7108eb48682c2a2a51725e2e71ccfc4f11d60a2a` |
-| 修复提交 | 本文档所在提交 |
-| 改动 | `src/cts/ledger/journal.py`，`tests/test_ledger_recovery.py`（新增） |
-| 测试 | 全量通过：222 项（原 201 项不变，新增 21 项） |
+| R1 提交 | `e3592049ea41d1e07fdd28ece7d7bb646d719a23`（复审 CHANGES-REQUIRED，不是冻结点） |
+| 本轮提交 | 本文档此次更新所在提交 |
+| 改动 | `src/cts/ledger/journal.py`，`tests/test_ledger_recovery.py`，本文档 |
+| 测试 | 全量通过：228 项（e359204 的 222 项保持，本轮新增 6 项边界回归） |
 | 范围外（本轮不动） | UTC 规范哈希及历史兼容、杠杆参数合同、交易能力（`reduce_only` 禁令、UNKNOWN TTL、发单事务边界） |
 | 网络与授权 | 未访问币安。网络重跑暂停，TESTNET 试单未授权，实盘 `HOLD`，`main` 不合并 |
 
@@ -31,6 +32,8 @@
 | 目标不是资金流事件（成交类、出入金） | `REVERSAL_TARGET_NOT_FLOW` |
 | 目标无资金分录 | `REVERSAL_TARGET_NO_LINES` |
 | 逆投影后逐仓保证金为负 | `REVERSAL_MARGIN_UNDERFLOW` |
+| 同一原事件已被经济冲正 | `REVERSAL_ALREADY_APPLIED` |
+| 冲正后钱包或逐仓等账户余额为负 | `REVERSAL_BALANCE_UNDERFLOW` |
 
 可冲正类型：`MARGIN_LOCK`、`MARGIN_RELEASE`、`FEE`、`FUNDING`。产品代码中 `reverse()` 无调用方。所有拒绝在持久化之前发生，拒绝前后流水与内存不变（有测试钉住）。
 
@@ -47,14 +50,16 @@
 - 行结构：`(account_id, anchor_seq, last_unit_nav, high_water_mark)`，`anchor_seq` 为写入时该账户最后事件 seq（按账户隔离）。
 - 只提供净值与高水位，永不提供份额、余额或仓位；份额与余额一律由事件推导。
 - 覆盖规则：锚点等于当前最大 seq 时，净值取行内观察值；锚点小于时净值按事件推导，高水位取两者最大；**锚点大于当前范围时整行忽略**。
-- 行损坏或数值非法：`BOOKS_STATE_CORRUPT`（`SNAPSHOT_INCONSISTENT`），拒绝打开覆盖路径，不静默回退。
+- 行损坏、负数或非有限值（含 `Infinity` 与 `NaN`）：`BOOKS_STATE_CORRUPT`（`SNAPSHOT_INCONSISTENT`），拒绝打开覆盖路径，不静默回退，也不把 `NaN` 比较抛成裸 `InvalidOperation`。
 
 ## 5. 拒绝不变性原子性合同
 
-- **事件原子性**：任何被拒绝或写盘失败的事件，不改变余额、仓位、份额与事件数（含 `books_state` 之外的持久层）。
-- **观察原子性**：估值快照（净值/高水位 + `books_state` 行）随观察即时提交，独立于后续事件成败；行与内存始终一致，重开与 `replay()` 复现内存值。
-- 余额不足的出金在快照之前检查：被拒时不产生新观察。
-- 写盘失败的持仓转账：事件状态不变，观察按上述合同提交；重试成功后三路径仍等价。
+- **事件原子性**：任何被拒绝或写盘失败的事件，不改变余额、仓位、份额与事件数。
+- **显式观察**：`equity_snapshot()` 可以独立提交净值与高水位；该观察不随随后失败的转账回滚。
+- **转账内部的隐式估值**：必须与该笔转账在同一事务提交。写盘失败时事件、`books_state` 与内存净值／高水位全部保持原样。不能靠改写本条合同把失败转账的观察留在盘上。
+- 余额不足的出金在估值之前检查：被拒时不产生新观察。
+- 持仓入金成功后，即时净值、`replay()` 与重开使用同一观察（锚点等于该转账 seq）。
+- 冲正：同一外部编号重复投递不重复投影；换编号不能再次经济冲正同一原事件；钱包与逐仓余额不能透支。拒绝不落盘。
 
 ## 6. 验收测试映射（`tests/test_ledger_recovery.py`）
 
@@ -62,4 +67,5 @@
 - 六项复现：`test_isolated_fee_survives_replay_and_reopen`、`test_fill_credit_to_wallet_survives_replay_and_reopen`、`test_zero_nav_transfer_rejected_before_persistence_and_reopen_still_opens`、`test_observed_hwm_survives_reopen_replay_and_flat_close`、`test_reversal_syncs_position_margin_on_every_path`、`test_reversal_of_fee_and_funding_restores_position_and_counters`。
 - 旧事件事实恢复与证据不足：`test_legacy_isolated_fee_recovers_margin_from_lines`、`test_legacy_fill_pnl_target_inferred_from_lines`、`test_legacy_fill_realized_without_lines_is_evidence_insufficient`。
 - `books_state`：`test_books_state_stale_anchor_keeps_event_derived_nav`、`test_books_state_supplies_only_nav_and_hwm_never_shares`、`test_books_state_out_of_range_anchor_is_ignored_entirely`、`test_books_state_corrupt_row_fails_closed`。
-- 原子性合同：`test_transfer_out_rejected_by_balance_takes_no_snapshot`、`test_transfer_disk_failure_commits_observation_but_not_event`、`test_rejected_events_change_neither_journal_nor_memory`、`test_unreversable_or_insufficient_reversal_changes_nothing`。
+- 原子性合同：`test_transfer_out_rejected_by_balance_takes_no_snapshot`、`test_transfer_disk_failure_rolls_back_implicit_observation`、`test_explicit_snapshot_survives_failed_transfer`、`test_rejected_events_change_neither_journal_nor_memory`、`test_unreversable_or_insufficient_reversal_changes_nothing`。
+- 五组复审边界：`test_same_reversal_delivery_does_not_reproject`、`test_second_external_id_cannot_reverse_same_event`、`test_reversal_of_release_after_withdrawal_does_not_overdraw_wallet`、`test_deposit_while_holding_restores_mark_nav_on_every_path`、`test_books_state_rejects_non_finite_values`、`test_transfer_disk_failure_rolls_back_implicit_observation`。

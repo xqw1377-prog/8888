@@ -654,38 +654,171 @@ def test_transfer_out_rejected_by_balance_takes_no_snapshot(tmp_path) -> None:
     assert len(ledger.events()) == 3
 
 
-def test_transfer_disk_failure_commits_observation_but_not_event(tmp_path) -> None:
+def test_transfer_disk_failure_rolls_back_implicit_observation(tmp_path) -> None:
     path = tmp_path / "ledger.db"
     ledger = Ledger("acct-1", path=str(path))
     ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
     ledger.lock_margin(amount=D("500"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-1", venue="SIM")
     open_long(ledger)
+    assert ledger._books.last_unit_nav == D("1")
+    assert ledger._store.load_books_state("acct-1") is None
 
     ledger._store.fail_appends = 1
     with pytest.raises(LedgerImbalanceError):
-        ledger.transfer_in(amount=D("100"), event_time=TS2, received_at=TS2, external_id="dep-2", mark_prices={"BTCUSDT": D("131")})
+        ledger.transfer_in(amount=D("100"), event_time=TS2, received_at=TS2, external_id="dep-2", mark_prices={"BTCUSDT": D("200")})
 
-    # 事件原子性：被拒事件不改变余额、仓位、份额与流水
     assert len(ledger.events()) == 3
     assert ledger._books.shares == D("10000")
     assert ledger.balance(AccountBucket.WALLET) == D("9500")
     assert ledger.balance(AccountBucket.ISOLATED_MARGIN) == D("500")
     assert ledger.position("BTCUSDT").qty == D("1")
+    assert ledger._books.last_unit_nav == D("1")
+    assert ledger._books.high_water_mark == D("1")
+    assert ledger._store.load_books_state("acct-1") is None
 
-    # 观察原子性：快照净值与高水位随观察提交，行与内存一致
+    reopened = Ledger("acct-1", path=str(path))
+    assert reopened._books.last_unit_nav == D("1")
+    assert reopened._books.high_water_mark == D("1")
+    assert len(reopened.events()) == 3
+
+    ledger.transfer_in(amount=D("100"), event_time=TS2, received_at=TS2, external_id="dep-2", mark_prices={"BTCUSDT": D("200")})
+    assert ledger._books.last_unit_nav == D("1.01")
+    assert ledger._books.high_water_mark == D("1.01")
+    expected = full_state(ledger)
+    assert full_state(ledger.replay()) == expected
+    assert full_state(Ledger("acct-1", path=str(path))) == expected
+
+
+def test_explicit_snapshot_survives_failed_transfer(tmp_path) -> None:
+    path = tmp_path / "ledger.db"
+    ledger = Ledger("acct-1", path=str(path))
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
+    ledger.lock_margin(amount=D("500"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-1", venue="SIM")
+    open_long(ledger)
+    ledger.equity_snapshot(as_of=TS2, mark_prices={"BTCUSDT": D("131")})
+    assert ledger._store.load_books_state("acct-1") == (3, D("1.0031"), D("1.0031"))
+
+    ledger._store.fail_appends = 1
+    with pytest.raises(LedgerImbalanceError):
+        ledger.transfer_in(amount=D("100"), event_time=TS2, received_at=TS2, external_id="dep-2", mark_prices={"BTCUSDT": D("200")})
+
+    assert len(ledger.events()) == 3
     assert ledger._books.last_unit_nav == D("1.0031")
     assert ledger._books.high_water_mark == D("1.0031")
     assert ledger._store.load_books_state("acct-1") == (3, D("1.0031"), D("1.0031"))
-
     reopened = Ledger("acct-1", path=str(path))
     assert reopened._books.last_unit_nav == D("1.0031")
     assert reopened._books.high_water_mark == D("1.0031")
-    assert reopened._books.shares == D("10000")
-    assert len(reopened.events()) == 3
 
-    # 重试成功后三路径仍等价
-    ledger.transfer_in(amount=D("100"), event_time=TS2, received_at=TS2, external_id="dep-2", mark_prices={"BTCUSDT": D("131")})
-    expected_shares = D("10000") + D("100") / D("1.0031")
-    assert ledger._books.shares == expected_shares
-    assert Ledger("acct-1", path=str(path))._books.shares == expected_shares
-    assert ledger.replay()._books.shares == expected_shares
+
+# ---------- 复审边界：冲正幂等、余额、持仓净值、非有限状态 ----------
+
+
+def test_same_reversal_delivery_does_not_reproject(tmp_path) -> None:
+    path = tmp_path / "ledger.db"
+    ledger = Ledger("acct-1", path=str(path))
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
+    ledger.lock_margin(amount=D("500"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-1", venue="SIM")
+    open_long(ledger)
+    fee = ledger.post_fee(
+        amount=D("2"), event_time=TS, received_at=TS, external_id="fee-1", venue="SIM", symbol="BTCUSDT", from_isolated=True
+    )
+    first = ledger.reverse(fee.event_id, event_time=TS2, received_at=TS2, external_id="rev-1")
+    assert ledger.position("BTCUSDT").isolated_margin == D("500")
+    count = len(ledger.events())
+
+    again = ledger.reverse(fee.event_id, event_time=TS2, received_at=TS2, external_id="rev-1")
+    assert again.event_id == first.event_id
+    assert len(ledger.events()) == count
+    assert ledger.position("BTCUSDT").isolated_margin == D("500")
+    expected = full_state(ledger)
+    assert full_state(ledger.replay()) == expected
+    assert full_state(Ledger("acct-1", path=str(path))) == expected
+
+
+def test_second_external_id_cannot_reverse_same_event(tmp_path) -> None:
+    path = tmp_path / "ledger.db"
+    ledger = Ledger("acct-1", path=str(path))
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
+    ledger.lock_margin(amount=D("500"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-1", venue="SIM")
+    open_long(ledger)
+    first_fee = ledger.post_fee(
+        amount=D("2"), event_time=TS, received_at=TS, external_id="fee-1", venue="SIM", symbol="BTCUSDT", from_isolated=True
+    )
+    ledger.post_fee(
+        amount=D("2"), event_time=TS, received_at=TS, external_id="fee-2", venue="SIM", symbol="BTCUSDT", from_isolated=True
+    )
+    ledger.reverse(first_fee.event_id, event_time=TS2, received_at=TS2, external_id="rev-1")
+    assert ledger.position("BTCUSDT").isolated_margin == D("498")
+    before = full_state(ledger)
+
+    with pytest.raises(UnitValidationError) as exc:
+        ledger.reverse(first_fee.event_id, event_time=TS2, received_at=TS2, external_id="rev-2")
+    assert exc.value.reason_code == "REVERSAL_ALREADY_APPLIED"
+    assert full_state(ledger) == before
+    assert ledger.position("BTCUSDT").isolated_margin == D("498")
+    assert full_state(Ledger("acct-1", path=str(path))) == before
+
+
+def test_reversal_of_release_after_withdrawal_does_not_overdraw_wallet(tmp_path) -> None:
+    path = tmp_path / "ledger.db"
+    ledger = Ledger("acct-1", path=str(path))
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
+    ledger.lock_margin(amount=D("500"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-1", venue="SIM")
+    released = ledger.release_margin(
+        amount=D("500"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="rel-1", venue="SIM"
+    )
+    ledger.transfer_out(amount=D("10000"), event_time=TS, received_at=TS, external_id="wd-1")
+    assert ledger.balance(AccountBucket.WALLET) == D("0")
+    assert ledger.balance(AccountBucket.ISOLATED_MARGIN) == D("0")
+    before = full_state(ledger)
+
+    with pytest.raises(LedgerImbalanceError) as exc:
+        ledger.reverse(released.event_id, event_time=TS2, received_at=TS2, external_id="rev-1")
+    assert exc.value.reason_code == "REVERSAL_BALANCE_UNDERFLOW"
+    assert full_state(ledger) == before
+    assert ledger.balance(AccountBucket.WALLET) == D("0")
+    assert full_state(Ledger("acct-1", path=str(path))) == before
+
+
+def test_deposit_while_holding_restores_mark_nav_on_every_path(tmp_path) -> None:
+    path = tmp_path / "ledger.db"
+    ledger = Ledger("acct-1", path=str(path))
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
+    ledger.lock_margin(amount=D("500"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-1", venue="SIM")
+    open_long(ledger)
+    assert ledger._books.last_unit_nav == D("1")
+    ledger.transfer_in(
+        amount=D("100"), event_time=TS2, received_at=TS2, external_id="dep-2", mark_prices={"BTCUSDT": D("131")}
+    )
+    assert ledger._books.last_unit_nav == D("1.0031")
+    assert ledger._books.high_water_mark == D("1.0031")
+    expected = full_state(ledger)
+    assert full_state(ledger.replay()) == expected
+    assert full_state(Ledger("acct-1", path=str(path))) == expected
+
+    volatile = Ledger("acct-1")
+    volatile.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
+    volatile.lock_margin(amount=D("500"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-1", venue="SIM")
+    open_long(volatile)
+    volatile.transfer_in(
+        amount=D("100"), event_time=TS2, received_at=TS2, external_id="dep-2", mark_prices={"BTCUSDT": D("131")}
+    )
+    assert volatile._books.last_unit_nav == D("1.0031")
+    assert full_state(volatile.replay()) == full_state(volatile)
+
+
+def test_books_state_rejects_non_finite_values(tmp_path) -> None:
+    for raw in ("Infinity", "NaN"):
+        path = tmp_path / f"{raw}.db"
+        Ledger("acct-1", path=str(path))
+        conn = sqlite3.connect(str(path))
+        conn.execute(
+            "INSERT INTO books_state(account_id, anchor_seq, last_unit_nav, high_water_mark) VALUES (?,?,?,?)",
+            ("acct-1", 0, raw, "1"),
+        )
+        conn.commit()
+        conn.close()
+        with pytest.raises(SnapshotInconsistentError) as exc:
+            Ledger("acct-1", path=str(path))
+        assert exc.value.reason_code == "BOOKS_STATE_CORRUPT"
