@@ -1,10 +1,10 @@
 # 模拟盘网络诊断范围
 
-状态：**限定诊断已结束。第三次只读核验也已结束。** 脱敏摘要见 `docs/READONLY_NETDIAG_SUMMARY.md`。本机只读排查见 `docs/READONLY_LOCAL_NET_CHECK.md`。urllib 实际选择的代理路径见 `docs/READONLY_URLLIB_PROXY_PATH.md`。一次代理隧道 TLS 诊断见 `docs/READONLY_PROXY_NETDIAG_SUMMARY.md`。Python 信任库检查见 `docs/READONLY_TRUST_STORE_CHECK.md`。一次代理路径证书链取证见 `docs/READONLY_PROXY_CHAIN_SUMMARY.md`。第二次摘要见 `docs/READONLY_RUN_R2_SUMMARY.md`。第三次摘要见 `docs/READONLY_RUN_R3_SUMMARY.md`。新的连接和再一次完整核验仍未授权。
+状态：**限定诊断已结束。第三次只读核验也已结束。一次有界公开对时诊断也已结束。** 脱敏摘要见 `docs/READONLY_NETDIAG_SUMMARY.md`。本机只读排查见 `docs/READONLY_LOCAL_NET_CHECK.md`。urllib 实际选择的代理路径见 `docs/READONLY_URLLIB_PROXY_PATH.md`。一次代理隧道 TLS 诊断见 `docs/READONLY_PROXY_NETDIAG_SUMMARY.md`。Python 信任库检查见 `docs/READONLY_TRUST_STORE_CHECK.md`。一次代理路径证书链取证见 `docs/READONLY_PROXY_CHAIN_SUMMARY.md`。第二次摘要见 `docs/READONLY_RUN_R2_SUMMARY.md`。第三次摘要见 `docs/READONLY_RUN_R3_SUMMARY.md`。对时质量见 `docs/READONLY_TIME_QUALITY.md`。新的连接和再一次完整核验仍未授权。
 
 本文件不授权任何连接。一次性只读核验授权已经结束。在另一次书面决定之前，不解析主机、不连接 `demo-fapi.binance.com`、不读取账户、不使用密钥。TESTNET 试单未授权。实盘保持 `HOLD`。`main` 不合并。
 
-已封存的核验证据留在 `/Users/xinquanwang/8888/var/readonly-evidence`。诊断和以后的完整核验都不得修改或覆盖这个目录。E11 重算通过只说明该目录封存一致，不说明核验通过。运行器当前 **PASS-LOCAL** 是 `0c23ca1f444090593b5369ef238ddf4be43bc9b3`。历史冻结点 `5b51364a52ef935b9f7c014711c637dc127771f3` 保留。这两次真实核验都不因此改为通过。
+已封存的核验证据留在 `/Users/xinquanwang/8888/var/readonly-evidence`。诊断和以后的完整核验都不得修改或覆盖这个目录。E11 重算通过只说明该目录封存一致，不说明核验通过。运行器当前 **PASS-LOCAL** 是 `0c23ca1f444090593b5369ef238ddf4be43bc9b3`。历史冻结点 `5b51364a52ef935b9f7c014711c637dc127771f3` 保留。三次真实核验都不因此改为通过。公开对时诊断也不签发核验通过。
 
 ## 1. 允许检查的内容
 
