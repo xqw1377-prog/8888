@@ -360,13 +360,15 @@ class RiskEngine:
                 if existing:
                     raise ConflictError(f"重复信号 {req.signal_key}")
                 reservation_id = uuid4().hex
+                bound_leverage = parse_contract_leverage(bundle.values)
                 conn.execute(
                     """
                     INSERT INTO reservations(
                         reservation_id, account_id, symbol, side, signal_key, qty, filled_qty,
                         notional, risk_amount, stress_loss_ratio, status, risk_version,
-                        equity_version, account_state_version, config_hash, unknown_since, created_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        equity_version, account_state_version, config_hash, unknown_since, created_at,
+                        leverage
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         reservation_id,
@@ -386,6 +388,7 @@ class RiskEngine:
                         view.config_hash,
                         None,
                         ts.isoformat(),
+                        format(bound_leverage, "f"),
                     ),
                 )
                 created.append(self.store.get_reservation(conn, reservation_id))
@@ -1532,7 +1535,7 @@ class RiskEngine:
         pos = positions.get(res.symbol)
         if pos and pos.side and pos.side != res.side and pos.qty > 0:
             raise UnitValidationError("预留成交方向与已有仓位相反，禁止翻仓")
-        leverage = self._contract_leverage(conn)
+        leverage = res.leverage
         if pos is None:
             qty = fill_qty
             notional = fill_notional
@@ -1578,8 +1581,7 @@ class RiskEngine:
         position_risk = sum((p.risk_amount for p in positions), start=D("0"))
         position_notional = sum((p.notional for p in positions), start=D("0"))
         isolated = sum((p.isolated_margin for p in positions), start=D("0"))
-        leverage = parse_contract_leverage(json.loads(row["param_payload"]))
-        pending_margin = pending_notional / leverage
+        pending_margin = sum((r.pending_notional / r.leverage for r in reservations), start=D("0"))
         return OccupancyView(
             equity=D(row["equity"]),
             equity_version=row["equity_version"],

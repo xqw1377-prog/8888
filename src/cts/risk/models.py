@@ -112,6 +112,7 @@ class Reservation:
     config_hash: str
     unknown_since: Optional[datetime]
     created_at: datetime
+    leverage: Decimal
 
     @property
     def unfilled_qty(self) -> Decimal:

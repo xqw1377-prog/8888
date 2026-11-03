@@ -11,8 +11,10 @@ from decimal import Decimal
 from typing import Iterator, Optional
 
 from cts.clock import UTC, require_utc
+from cts.errors import ParameterAdmissionError
 from cts.ledger.models import Side
 from cts.money import D
+from cts.risk.parameters import parse_contract_leverage
 from cts.risk.models import (
     Blocker,
     ParameterBundle,
@@ -77,6 +79,7 @@ CREATE TABLE IF NOT EXISTS reservations (
     config_hash TEXT NOT NULL,
     unknown_since TEXT,
     created_at TEXT NOT NULL,
+    leverage TEXT,
     venue_cumulative_filled TEXT NOT NULL DEFAULT '0',
     UNIQUE (account_id, signal_key)
 );
@@ -206,6 +209,15 @@ def _iso(ts: datetime) -> str:
     return require_utc(ts, "ts").isoformat()
 
 
+def _bound_leverage(raw: Optional[str]) -> Decimal:
+    if raw is None or raw == "":
+        raise ParameterAdmissionError(
+            "预留没有绑定原杠杆合同，不能改用当前参数",
+            reason_code="LEVERAGE_CONTRACT_MISMATCH",
+        )
+    return parse_contract_leverage({"leverage": raw})
+
+
 def _parse_ts(value: Optional[str]) -> Optional[datetime]:
     if value is None:
         return None
@@ -222,6 +234,7 @@ class RiskStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
         self._migrate_live_holds()
+        self._migrate_reservation_leverage()
 
     def _migrate_live_holds(self) -> None:
         columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(live_risk_holds)")}
@@ -232,6 +245,11 @@ class RiskStore:
             self._conn.execute("ALTER TABLE live_hold_owners ADD COLUMN lock_dev INTEGER")
         if "lock_ino" not in owners:
             self._conn.execute("ALTER TABLE live_hold_owners ADD COLUMN lock_ino INTEGER")
+
+    def _migrate_reservation_leverage(self) -> None:
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(reservations)")}
+        if "leverage" not in columns:
+            self._conn.execute("ALTER TABLE reservations ADD COLUMN leverage TEXT")
 
     def close(self) -> None:
         self._conn.close()
@@ -386,6 +404,7 @@ class RiskStore:
             config_hash=r["config_hash"],
             unknown_since=_parse_ts(r["unknown_since"]),
             created_at=datetime.fromisoformat(r["created_at"]).astimezone(UTC),
+            leverage=_bound_leverage(r["leverage"]),
         )
 
     def _blocker(self, r: sqlite3.Row) -> Blocker:

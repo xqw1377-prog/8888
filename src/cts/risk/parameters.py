@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from typing import Mapping, Optional
 
 from cts.checksum import sha256_hex
@@ -64,11 +65,20 @@ def parse_contract_leverage(values: Mapping[str, str]) -> Decimal:
         raise ParameterAdmissionError("参数合同缺少 leverage", reason_code="LEVERAGE_CONTRACT_MISMATCH")
     try:
         leverage = D(raw)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, InvalidOperation) as exc:
         raise ParameterAdmissionError(
             "参数合同的 leverage 无法解析",
             reason_code="LEVERAGE_CONTRACT_MISMATCH",
         ) from exc
+    try:
+        finite = bool(leverage.is_finite())
+    except InvalidOperation:
+        finite = False
+    if not finite:
+        raise ParameterAdmissionError(
+            "杠杆必须是有限正数",
+            reason_code="LEVERAGE_CONTRACT_MISMATCH",
+        )
     if leverage <= 0 or leverage > RESEARCH_LEVERAGE_CAP:
         raise ParameterAdmissionError(
             "杠杆超出合同：初始保证金 2 倍，研究上限 3 倍",

@@ -236,7 +236,7 @@ class Executor:
             intent = self._intent(signal_key, symbol, side, "RISK_REJECTED", reason=exc.reason_code)
             self._save()
             return intent
-        isolated = reserved.notional / self.risk.contract_leverage()
+        isolated = reserved.notional / reserved.leverage
         model = model_liq_price(
             side=side,
             avg_price=D(entry_price),

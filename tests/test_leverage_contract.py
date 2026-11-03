@@ -12,7 +12,7 @@ from cts.ledger.journal import Ledger
 from cts.ledger.models import Side
 from cts.money import D
 from cts.risk.models import ParameterBundle, ParameterStatus, RuntimeMode
-from cts.risk.parameters import PROPOSED_VALUES, bundle_hash
+from cts.risk.parameters import PROPOSED_VALUES, bundle_hash, parse_contract_leverage
 from cts.strategy.replay import ReplayConfig, replay_t1
 from cts.strategy.t1 import T1Params
 from tests.test_execution import world
@@ -80,6 +80,60 @@ def test_executor_isolated_margin_follows_the_same_contract(tmp_path) -> None:
     )
     assert "isolated" in intent
     assert D(intent["isolated"]) == D(intent["qty"]) * D("100") / D("3")
+
+
+def test_pending_margin_stays_on_the_bound_leverage(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    engine.install_parameters(leverage_bundle("1"), now=NOW)
+    reserved = engine.reserve([req("BTCUSDT", "s-bound")], now=NOW)[0]
+    bound = reserved.notional / D("1")
+    assert engine.occupancy().pending_margin == bound
+    engine.install_parameters(leverage_bundle("3"), now=NOW)
+    view = engine.occupancy()
+    assert view.pending_margin == bound
+    assert view.reservations[0].leverage == D("1")
+    assert view.pending_margin != reserved.notional / D("3")
+
+
+def test_partial_fill_keeps_original_margin_after_leverage_change(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    engine.install_parameters(leverage_bundle("2"), now=NOW)
+    reserved = engine.reserve([req("BTCUSDT", "s-half")], now=NOW)[0]
+    half = reserved.qty / D("2")
+    engine.apply_fill(reserved.reservation_id, half, fill_id="fill-half", now=NOW)
+    engine.install_parameters(leverage_bundle("3"), now=NOW)
+    midway = engine.occupancy()
+    assert midway.isolated_margin + midway.pending_margin == reserved.notional / D("2")
+    engine.apply_fill(reserved.reservation_id, reserved.qty - half, fill_id="fill-rest", now=NOW)
+    done = engine.occupancy()
+    assert done.pending_margin == D("0")
+    assert done.isolated_margin == reserved.notional / D("2")
+    assert done.positions[0].qty == reserved.qty
+
+
+def test_production_late_fill_uses_the_reserved_leverage(tmp_path) -> None:
+    engine = make_engine(tmp_path / "prod-fill.db", mode=RuntimeMode.PRODUCTION)
+    engine.install_parameters(leverage_bundle("2", approved=True), now=NOW)
+    reserved = engine.reserve([req("BTCUSDT", "s-prod-fill")], now=NOW)[0]
+    engine.install_parameters(leverage_bundle("3", approved=True), now=NOW)
+    engine.apply_fill(reserved.reservation_id, reserved.qty, fill_id="fill-prod", now=NOW)
+    assert engine.occupancy().isolated_margin == reserved.notional / D("2")
+    assert engine.occupancy().positions[0].qty == reserved.qty
+
+
+@pytest.mark.parametrize("raw", ["NaN", "sNaN", "Infinity", "-Infinity"])
+def test_non_finite_leverage_is_contract_mismatch(raw: str) -> None:
+    with pytest.raises(ParameterAdmissionError) as err:
+        parse_contract_leverage({"leverage": raw})
+    assert err.value.reason_code == "LEVERAGE_CONTRACT_MISMATCH"
+
+
+def test_non_finite_leverage_is_rejected_on_reserve(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    engine.install_parameters(leverage_bundle("sNaN"), now=NOW)
+    with pytest.raises(ParameterAdmissionError) as err:
+        engine.reserve([req("BTCUSDT", "s-snan")], now=NOW)
+    assert err.value.reason_code == "LEVERAGE_CONTRACT_MISMATCH"
 
 
 def test_replay_rejects_leverage_above_research_cap(tmp_path) -> None:
