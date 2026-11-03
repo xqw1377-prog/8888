@@ -1,15 +1,16 @@
 # 账本恢复一致性修复 R1 登记簿
 
-状态：**8069d52 复审 CHANGES-REQUIRED**。本提交只收口剩余三组，不签发 PASS，不登记新冻结点。隐式估值随转账原子提交的方向保持不变。
+状态：**3799af1 复审 CHANGES-REQUIRED**。本提交只对齐观察锚点与净值刷新的 `seq` 口径，不签发 PASS，不登记新冻结点。
 
 | 项 | 值 |
 |---|---|
 | 修复基线（修复前 HEAD） | `7108eb48682c2a2a51725e2e71ccfc4f11d60a2a` |
 | R1 提交 | `e3592049ea41d1e07fdd28ece7d7bb646d719a23`（复审 CHANGES-REQUIRED，不是冻结点） |
 | 上一轮边界 | `8069d5257ad9ecbd628e5ef21fe0b8f62ca71a54`（复审 CHANGES-REQUIRED，不是冻结点） |
+| 三组收口 | `3799af1d503e0b4f28dbae823ee12405183260f8`（复审 CHANGES-REQUIRED，不是冻结点，保留不改写） |
 | 本轮提交 | 本文档此次更新所在提交 |
 | 改动 | `src/cts/ledger/journal.py`，`tests/test_ledger_recovery.py`，本文档 |
-| 测试 | 全量通过：231 项（8069d52 的 228 项保持，本轮新增 3 项） |
+| 测试 | 全量通过：233 项（3799af1 的 231 项保持，本轮新增 2 项） |
 | 范围外（本轮不动） | UTC 规范哈希及历史兼容、杠杆参数合同、交易能力（`reduce_only` 禁令、UNKNOWN TTL、发单事务边界） |
 | 网络与授权 | 未访问币安。网络重跑暂停，TESTNET 试单未授权，实盘 `HOLD`，`main` 不合并 |
 
@@ -50,7 +51,7 @@
 
 - 行结构：`(account_id, anchor_seq, last_unit_nav, high_water_mark)`，`anchor_seq` 为写入时该账户最后事件 seq（按账户隔离）。
 - 只提供净值与高水位，永不提供份额、余额或仓位；份额与余额一律由事件推导。
-- 覆盖规则：锚点大于当前最大 seq 时整行忽略。锚点等于最大 seq 时，净值取该观察。锚点更旧时，高水位仍取较大值；若此后没有新的净值刷新，恢复这次观察的净值，锚点保持原时点，不把旧估值改记到后续事件上。若此后已有事件刷新净值（例如平仓），使用刷新后的净值，不用旧观察覆盖。
+- 覆盖规则：锚点大于当前最大 seq 时整行忽略。锚点等于最大 seq 时，净值取该观察。锚点更旧时，高水位仍取较大值；若此后没有新的净值刷新，恢复这次观察的净值，锚点保持原时点，不把旧估值改记到后续事件上。若此后已有事件刷新净值（例如平仓），使用刷新后的净值，不用旧观察覆盖。观察锚点与净值刷新时点都用 `ledger_events.seq`，不用本账户事件数；其他账户插入流水后，两者仍然可比。
 - 行损坏、负数或非有限值（含 `Infinity` 与 `NaN`）：`BOOKS_STATE_CORRUPT`（`SNAPSHOT_INCONSISTENT`），拒绝打开覆盖路径，不静默回退，也不把 `NaN` 比较抛成裸 `InvalidOperation`。
 
 ## 5. 拒绝不变性原子性合同
@@ -71,3 +72,4 @@
 - 原子性合同：`test_transfer_out_rejected_by_balance_takes_no_snapshot`、`test_transfer_disk_failure_rolls_back_implicit_observation`、`test_explicit_snapshot_survives_failed_transfer`、`test_rejected_events_change_neither_journal_nor_memory`、`test_unreversable_or_insufficient_reversal_changes_nothing`。
 - 五组复审边界：`test_same_reversal_delivery_does_not_reproject`、`test_second_external_id_cannot_reverse_same_event`、`test_reversal_of_release_after_withdrawal_does_not_overdraw_wallet`、`test_deposit_while_holding_restores_mark_nav_on_every_path`、`test_books_state_rejects_non_finite_values`、`test_transfer_disk_failure_rolls_back_implicit_observation`。
 - 三组收口：`test_reversal_uniqueness_is_enforced_for_a_stale_ledger`、`test_funding_credit_balance_can_be_partially_reversed`、`test_books_state_stale_anchor_keeps_last_observation`、`test_fee_after_holding_deposit_keeps_observed_nav_and_its_seq`。
+- 多账户 `seq`：`test_prior_account_does_not_let_old_observation_cover_close_nav`、`test_close_nav_survives_when_account_count_equals_global_anchor`。

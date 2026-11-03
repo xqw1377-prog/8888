@@ -75,12 +75,13 @@ class Ledger:
         self._books = AccountBooks()
         self._positions: dict[str, PositionState] = {}
         self._loading = False
+        self._event_seqs: dict[str, int] = {}
         self._last_nav_refresh_seq = 0
         self._nav_observation_seq: Optional[int] = None
         self._store: Optional[LedgerStore] = LedgerStore(path) if path else None
         if self._store is not None:
-            for event in self._store.load(account_id):
-                self._load_event(event)
+            for seq, event in self._store.load(account_id):
+                self._load_event(event, seq=seq)
             self._overlay_books_state(self._store)
 
     def append_event(
@@ -112,8 +113,9 @@ class Ledger:
         if key in self._by_external:
             raise ConflictError("post_journal 收到已存在事件，应走 append_event 幂等路径")
         self._assert_share_ok(event)
+        seq: Optional[int] = None
         if self._store is not None and not self._loading:
-            self._store.append(event, observation=observation)
+            seq = self._store.append(event, observation=observation)
         if event.event_type in (LedgerEventType.TRANSFER_IN, LedgerEventType.TRANSFER_OUT):
             self._apply_share_mutation(event)
         for line in event.lines:
@@ -121,21 +123,28 @@ class Ledger:
             self._books.balances[bal_key] = self._books.balances.get(bal_key, Decimal("0")) + line.signed
         self._events.append(event)
         self._by_external[key] = event
+        if seq is None:
+            seq = self._event_seqs.get(event.event_id)
+        if seq is None:
+            seq = len(self._events)
+        self._event_seqs[event.event_id] = seq
         if observation is not None and not self._loading:
             unit_nav, high_water_mark = observation
             self._books.last_unit_nav = unit_nav
             self._books.high_water_mark = high_water_mark
-            self._nav_observation_seq = len(self._events)
+            self._nav_observation_seq = seq
         elif not self._loading and not self._has_open_position():
-            self._refresh_nav(unrealized=Decimal("0"))
+            self._refresh_nav(unrealized=Decimal("0"), seq=seq)
 
-    def _load_event(self, event: LedgerEvent) -> None:
+    def _load_event(self, event: LedgerEvent, *, seq: Optional[int] = None) -> None:
+        if seq is not None:
+            self._event_seqs[event.event_id] = seq
         self._loading = True
         try:
             self.post_journal(event)
             self._project_position(event)
             if not self._has_open_position():
-                self._refresh_nav(unrealized=Decimal("0"))
+                self._refresh_nav(unrealized=Decimal("0"), seq=self._event_seqs.get(event.event_id, len(self._events)))
         finally:
             self._loading = False
 
@@ -150,6 +159,7 @@ class Ledger:
             return
         if high_water_mark > self._books.high_water_mark:
             self._books.high_water_mark = high_water_mark
+        # 刷新时点与锚点都是 ledger_events.seq，不用本账户事件数。
         # 锚点之后若没有新的净值刷新，最后一次观察仍然有效，但时点保持原锚点。
         # 平仓等后续刷新产生的净值更新，不用旧观察覆盖，也不把旧锚点改到后续事件。
         if anchor_seq == max_seq or self._last_nav_refresh_seq <= anchor_seq:
@@ -827,7 +837,8 @@ class Ledger:
                     position_id=event.position_id,
                     metadata=dict(event.metadata),
                     reversed_event_id=event.reversed_event_id,
-                )
+                ),
+                seq=self._event_seqs.get(event.event_id),
             )
         clone._books.reserved_budget = self._books.reserved_budget
         if self._store is not None:
@@ -912,13 +923,13 @@ class Ledger:
         if self._books.shares < 0:
             raise LedgerImbalanceError("份额不能为负")
 
-    def _refresh_nav(self, unrealized: Decimal) -> None:
+    def _refresh_nav(self, unrealized: Decimal, *, seq: Optional[int] = None) -> None:
         if self._books.shares <= 0:
             return
         self._books.last_unit_nav = (self.cash_equity() + unrealized) / self._books.shares
         if self._books.last_unit_nav > self._books.high_water_mark:
             self._books.high_water_mark = self._books.last_unit_nav
-        self._last_nav_refresh_seq = len(self._events)
+        self._last_nav_refresh_seq = seq if seq is not None else len(self._events)
         self._nav_observation_seq = None
 
 
@@ -1023,7 +1034,7 @@ class LedgerStore:
         ).fetchone()
         return int(row[0])
 
-    def append(self, event: LedgerEvent, *, observation: Optional[tuple[Decimal, Decimal]] = None) -> None:
+    def append(self, event: LedgerEvent, *, observation: Optional[tuple[Decimal, Decimal]] = None) -> int:
         if self.fail_appends:
             self.fail_appends -= 1
             raise LedgerImbalanceError("账本磁盘提交失败，内存保持原样")
@@ -1076,6 +1087,7 @@ class LedgerStore:
                     json.dumps(event.metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
                 ),
             )
+            inserted_seq = int(self._conn.execute("SELECT last_insert_rowid()").fetchone()[0])
             if observation is not None:
                 unit_nav, high_water_mark = observation
                 anchor = self._conn.execute(
@@ -1094,6 +1106,7 @@ class LedgerStore:
                     (event.account_id, int(anchor), format(unit_nav, "f"), format(high_water_mark, "f")),
                 )
             self._conn.execute("COMMIT")
+            return inserted_seq
         except UnitValidationError:
             self._conn.execute("ROLLBACK")
             raise
@@ -1109,16 +1122,16 @@ class LedgerStore:
             self._conn.execute("ROLLBACK")
             raise
 
-    def load(self, account_id: str) -> list[LedgerEvent]:
+    def load(self, account_id: str) -> list[tuple[int, LedgerEvent]]:
         rows = self._conn.execute(
             """
-            SELECT event_id, account_id, venue, external_id, event_type, event_time, received_at,
+            SELECT seq, event_id, account_id, venue, external_id, event_type, event_time, received_at,
                    asset, source, symbol, position_id, reversed_event_id, lines_json, metadata_json
             FROM ledger_events WHERE account_id=? ORDER BY seq
             """,
             (account_id,),
         ).fetchall()
-        return [_event_from_row(row) for row in rows]
+        return [(int(row[0]), _event_from_row(row[1:])) for row in rows]
 
 
 def _event_from_row(row: tuple) -> LedgerEvent:

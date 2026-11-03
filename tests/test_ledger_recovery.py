@@ -887,6 +887,58 @@ def test_fee_after_holding_deposit_keeps_observed_nav_and_its_seq(tmp_path) -> N
     assert replayed._nav_observation_seq == observed_seq
 
 
+def _open_marked_book(path) -> Ledger:
+    ledger = Ledger("acct-1", path=str(path))
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
+    ledger.lock_margin(amount=D("500"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-1", venue="SIM")
+    open_long(ledger)
+    ledger.equity_snapshot(as_of=TS2, mark_prices={"BTCUSDT": D("131")})
+    return ledger
+
+
+def test_prior_account_does_not_let_old_observation_cover_close_nav(tmp_path) -> None:
+    path = tmp_path / "ledger.db"
+    other = Ledger("acct-2", path=str(path))
+    other.transfer_in(amount=D("1"), event_time=TS, received_at=TS, external_id="other-1")
+    other.transfer_in(amount=D("1"), event_time=TS, received_at=TS, external_id="other-2")
+    ledger = _open_marked_book(path)
+    assert ledger._books.last_unit_nav == D("1.0031")
+    anchor = ledger._store.load_books_state("acct-1")[0]
+    assert anchor > len(ledger.events())
+
+    close_short(ledger, price="102", external_id="f2", trade_id="t2")
+    assert ledger._books.last_unit_nav == D("1.0002")
+    assert ledger._books.high_water_mark == D("1.0031")
+    assert ledger._store.load_books_state("acct-1")[0] == anchor
+    assert ledger.replay()._books.last_unit_nav == D("1.0002")
+    assert ledger.replay()._books.high_water_mark == D("1.0031")
+    reopened = Ledger("acct-1", path=str(path))
+    assert reopened._books.last_unit_nav == D("1.0002")
+    assert reopened._books.high_water_mark == D("1.0031")
+
+
+def test_close_nav_survives_when_account_count_equals_global_anchor(tmp_path) -> None:
+    path = tmp_path / "ledger.db"
+    ledger = Ledger("acct-1", path=str(path))
+    ledger.transfer_in(amount=D("10000"), event_time=TS, received_at=TS, external_id="dep-1")
+    other = Ledger("acct-2", path=str(path))
+    other.transfer_in(amount=D("1"), event_time=TS, received_at=TS, external_id="other-1")
+    ledger.lock_margin(amount=D("500"), symbol="BTCUSDT", event_time=TS, received_at=TS, external_id="im-1", venue="SIM")
+    open_long(ledger)
+    ledger.equity_snapshot(as_of=TS2, mark_prices={"BTCUSDT": D("131")})
+    assert ledger._books.last_unit_nav == D("1.0031")
+    anchor = ledger._store.load_books_state("acct-1")[0]
+    assert anchor == len(ledger.events()) + 1
+
+    close_short(ledger, price="102", external_id="f2", trade_id="t2")
+    assert ledger._books.last_unit_nav == D("1.0002")
+    assert ledger._store.load_books_state("acct-1")[0] == anchor
+    assert ledger.replay()._books.last_unit_nav == D("1.0002")
+    reopened = Ledger("acct-1", path=str(path))
+    assert reopened._books.last_unit_nav == D("1.0002")
+    assert reopened._books.high_water_mark == D("1.0031")
+
+
 def test_books_state_rejects_non_finite_values(tmp_path) -> None:
     for raw in ("Infinity", "NaN"):
         path = tmp_path / f"{raw}.db"
