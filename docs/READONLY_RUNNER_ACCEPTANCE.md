@@ -15,7 +15,8 @@ CLOCK-R1 在这一提交通过。独立复跑是全库 201 项通过，独立回
 | S1-B | **PASS-LOCAL**，`e68675d0590cd5f57e920250a532d0ea92d1fd7c`，不扩展 |
 | 验证方案 | **DESIGN PASS / FROZEN**，内容基线 `4ae24f4ee2293e68d607d26c872e671ff5d442d6` |
 | 只读运行器 | **PASS-LOCAL**，`0c23ca1f444090593b5369ef238ddf4be43bc9b3`。历史记录仍是 `5b51364a52ef935b9f7c014711c637dc127771f3` |
-| 账本恢复 | **PASS-LOCAL**，`b983a76cad637999d337b18fd461e8ad3766f654`。只覆盖账本恢复，见 `docs/LEDGER_RECOVERY_ACCEPTANCE.md`。UTC 规范哈希与杠杆合同未关闭 |
+| 账本恢复 | **PASS-LOCAL**，`b983a76cad637999d337b18fd461e8ad3766f654`。只覆盖账本恢复，见 `docs/LEDGER_RECOVERY_ACCEPTANCE.md` |
+| UTC 规范哈希及历史兼容 | **PASS-LOCAL**，`98317bc0de009db657065cdea0d5bee022788722`。见 `docs/UTC_CANONICAL_HASH_ACCEPTANCE.md`。杠杆合同未关闭 |
 | 真实网络、币安账户、实际采集证据 | **未验收**。已有三次未通过记录 |
 | 执行材料 | `docs/READONLY_EXECUTION_PREP.md`。材料不等于执行决定，也不授权重跑 |
 | 币安模拟盘网络请求、TESTNET 试单 | **未授权** |
