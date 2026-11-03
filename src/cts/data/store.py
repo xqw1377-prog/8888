@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Iterable, Optional, Protocol, TypeVar
+from typing import Iterable, Mapping, Optional, Protocol, TypeVar
 
-from cts.checksum import sha256_hex
+from cts.checksum import checksum_matches, sha256_hex
 from cts.clock import require_utc
 from cts.errors import ConflictError, LookaheadError
 
@@ -26,14 +26,15 @@ class DataStore:
 
     def put(self, record: T) -> T:
         key = record.identity()
-        digest = _content_digest(record)
-        if digest != record.checksum:
+        payload = _payload_of(record)
+        if payload is None or not checksum_matches(payload, record.checksum):
             raise ConflictError("checksum 与内容不一致，不能用旧校验和包装新内容")
         existing = self._records.get(key)
         if existing is None:
             self._records[key] = record
             return record
-        if _content_digest(existing) != digest:
+        existing_payload = _payload_of(existing)
+        if existing_payload is None or sha256_hex(existing_payload) != sha256_hex(payload):
             raise ConflictError(
                 f"同标识异容冲突: {key}",
                 reason_code="IDEMPOTENCY_CONFLICT",
@@ -64,11 +65,15 @@ class DataStore:
             )
 
 
-def _content_digest(record: Identified) -> str:
+def _payload_of(record: Identified) -> Optional[Mapping]:
     payload = getattr(record, "payload", None)
     if callable(payload):
-        return sha256_hex(payload())
-    compute = getattr(record, "compute_checksum", None)
-    if callable(compute):
-        return compute()
-    return record.checksum
+        body = payload()
+        if isinstance(body, Mapping):
+            return body
+    nested = getattr(record, "checksum_payload", None)
+    if callable(nested):
+        body = nested()
+        if isinstance(body, Mapping):
+            return body
+    return None
