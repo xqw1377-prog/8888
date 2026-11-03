@@ -63,7 +63,6 @@ class Executor:
         self.mmr = D("0.005")
         self.fee_rate = D("0.0005")
         self.adverse_exit = D("0.0005")
-        self.leverage = D("2")
         self.multiplier = D("1")
         self.lot_size = D("0.001")
         self.state = store.load(account_id) or _empty_state(clock.boot_id)
@@ -237,7 +236,7 @@ class Executor:
             intent = self._intent(signal_key, symbol, side, "RISK_REJECTED", reason=exc.reason_code)
             self._save()
             return intent
-        isolated = reserved.notional / self.leverage
+        isolated = reserved.notional / self.risk.contract_leverage()
         model = model_liq_price(
             side=side,
             avg_price=D(entry_price),

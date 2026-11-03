@@ -42,7 +42,7 @@ from cts.risk.models import (
     RuntimeMode,
     SystemState,
 )
-from cts.risk.parameters import admit_parameters, proposed_bundle
+from cts.risk.parameters import admit_parameters, parse_contract_leverage, proposed_bundle
 from cts.risk.store import RiskStore
 from cts.strategy.sizing import SizedPosition, size_position
 
@@ -99,6 +99,14 @@ class RiskEngine:
 
     def close(self) -> None:
         self.store.close()
+
+    def contract_leverage(self) -> Decimal:
+        with self.store.txn() as conn:
+            return self._contract_leverage(conn)
+
+    def _contract_leverage(self, conn) -> Decimal:
+        row = self.store.load_account(conn, self.account_id)
+        return parse_contract_leverage(json.loads(row["param_payload"]))
 
     def occupancy(self) -> OccupancyView:
         with self.store.txn() as conn:
@@ -1524,18 +1532,19 @@ class RiskEngine:
         pos = positions.get(res.symbol)
         if pos and pos.side and pos.side != res.side and pos.qty > 0:
             raise UnitValidationError("预留成交方向与已有仓位相反，禁止翻仓")
+        leverage = self._contract_leverage(conn)
         if pos is None:
             qty = fill_qty
             notional = fill_notional
             risk = fill_risk
-            margin = fill_notional / D("2")
+            margin = fill_notional / leverage
             version = 1
             side = res.side
         else:
             qty = pos.qty + fill_qty
             notional = pos.notional + fill_notional
             risk = pos.risk_amount + fill_risk
-            margin = pos.isolated_margin + fill_notional / D("2")
+            margin = pos.isolated_margin + fill_notional / leverage
             version = pos.position_version + 1
             side = pos.side or res.side
         conn.execute(
@@ -1569,8 +1578,8 @@ class RiskEngine:
         position_risk = sum((p.risk_amount for p in positions), start=D("0"))
         position_notional = sum((p.notional for p in positions), start=D("0"))
         isolated = sum((p.isolated_margin for p in positions), start=D("0"))
-        leverage = D(json.loads(row["param_payload"])["leverage"])
-        pending_margin = pending_notional / leverage if leverage > 0 else D("0")
+        leverage = parse_contract_leverage(json.loads(row["param_payload"]))
+        pending_margin = pending_notional / leverage
         return OccupancyView(
             equity=D(row["equity"]),
             equity_version=row["equity_version"],

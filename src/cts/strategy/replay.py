@@ -14,6 +14,7 @@ from cts.execution.liq import model_liq_price
 from cts.ledger.journal import Ledger
 from cts.ledger.models import Side
 from cts.money import D
+from cts.risk.parameters import INITIAL_MARGIN_LEVERAGE, parse_contract_leverage
 from cts.strategy.sizing import SizedPosition, size_position
 from cts.strategy.t1 import (
     OpenPosition,
@@ -36,7 +37,7 @@ class ReplayConfig:
     adverse_cost: Decimal = Decimal("0.0005")
     stress_slippage: Decimal = Decimal("0.001")
     funding_reserve_ratio: Decimal = Decimal("0")
-    leverage: Decimal = Decimal("2")
+    leverage: Decimal = INITIAL_MARGIN_LEVERAGE
     remaining_margin_budget_pct: Decimal = Decimal("0.50")
 
 
@@ -133,6 +134,7 @@ def replay_t1(
     venue: str,
     fundings: Sequence[FundingSettlement] = (),
 ) -> ReplayResult:
+    parse_contract_leverage({"leverage": format(D(config.leverage), "f")})
     closed = [c for c in candles if c.is_closed and c.symbol == symbol]
     closed = sorted(closed, key=lambda c: c.event_time)
     position: Optional[OpenPosition] = None

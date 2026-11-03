@@ -8,6 +8,7 @@ from typing import Optional
 
 from cts.ledger.models import Side
 from cts.money import D, floor_to_lot, require_positive
+from cts.risk.parameters import INITIAL_MARGIN_LEVERAGE
 
 
 @dataclass(frozen=True)
@@ -36,7 +37,7 @@ def size_position(
     used_symbol_notional: Decimal = Decimal("0"),
     total_abs_notional_pct: Decimal = Decimal("1.50"),
     used_abs_notional: Decimal = Decimal("0"),
-    leverage: Decimal = Decimal("2"),
+    leverage: Decimal = INITIAL_MARGIN_LEVERAGE,
     remaining_margin_budget: Decimal,
     fee_rate_one_way: Decimal,
     stress_slippage: Decimal,
