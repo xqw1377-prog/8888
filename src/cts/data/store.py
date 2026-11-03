@@ -5,8 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Iterable, Mapping, Optional, Protocol, TypeVar
 
-from cts.checksum import checksum_matches, sha256_hex
+from cts.checksum import assess_checksum, sha256_hex
 from cts.clock import require_utc
+from cts.data.models import record_payload
 from cts.errors import ConflictError, LookaheadError
 
 
@@ -26,14 +27,15 @@ class DataStore:
 
     def put(self, record: T) -> T:
         key = record.identity()
-        payload = _payload_of(record)
-        if payload is None or not checksum_matches(payload, record.checksum):
+        payload = record_payload(record)
+        if payload is None:
             raise ConflictError("checksum 与内容不一致，不能用旧校验和包装新内容")
+        _require_verified_checksum(payload, record.checksum)
         existing = self._records.get(key)
         if existing is None:
             self._records[key] = record
             return record
-        existing_payload = _payload_of(existing)
+        existing_payload = record_payload(existing)
         if existing_payload is None or sha256_hex(existing_payload) != sha256_hex(payload):
             raise ConflictError(
                 f"同标识异容冲突: {key}",
@@ -65,15 +67,13 @@ class DataStore:
             )
 
 
-def _payload_of(record: Identified) -> Optional[Mapping]:
-    payload = getattr(record, "payload", None)
-    if callable(payload):
-        body = payload()
-        if isinstance(body, Mapping):
-            return body
-    nested = getattr(record, "checksum_payload", None)
-    if callable(nested):
-        body = nested()
-        if isinstance(body, Mapping):
-            return body
-    return None
+def _require_verified_checksum(payload: Mapping, stored: str) -> None:
+    status = assess_checksum(payload, stored)
+    if status in ("current", "legacy"):
+        return
+    if status == "insufficient":
+        raise ConflictError(
+            "旧校验和的生产时区未配置，证据不足，保留原哈希",
+            reason_code="EVIDENCE_INSUFFICIENT",
+        )
+    raise ConflictError("checksum 与内容不一致，不能用旧校验和包装新内容")

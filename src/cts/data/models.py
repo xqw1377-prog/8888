@@ -8,7 +8,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Mapping, Optional, Sequence
 
-from cts.checksum import checksum_matches, sha256_hex
+from cts.checksum import assess_checksum, sha256_hex
 from cts.clock import require_utc
 from cts.errors import ConflictError, UnitValidationError
 from cts.money import D, require_non_negative, require_positive
@@ -21,13 +21,33 @@ def _ts(value: datetime, name: str) -> datetime:
     return require_utc(value, name)
 
 
+def record_payload(record: object) -> Optional[Mapping[str, Any]]:
+    payload = getattr(record, "payload", None)
+    if callable(payload):
+        body = payload()
+        if isinstance(body, Mapping):
+            return body
+    nested = getattr(record, "checksum_payload", None)
+    if callable(nested):
+        body = nested()
+        if isinstance(body, Mapping):
+            return body
+    return None
+
+
 def _bind_checksum(obj: object, payload: Mapping[str, Any]) -> None:
     supplied = getattr(obj, "checksum", "")
     if not supplied:
         object.__setattr__(obj, "checksum", sha256_hex(payload))
         return
-    if checksum_matches(payload, supplied):
+    status = assess_checksum(payload, supplied)
+    if status in ("current", "legacy"):
         return
+    if status == "insufficient":
+        raise ConflictError(
+            "旧校验和的生产时区未配置，证据不足，保留原哈希",
+            reason_code="EVIDENCE_INSUFFICIENT",
+        )
     raise ConflictError("checksum 与内容不一致，不能用旧校验和包装新内容")
 
 
