@@ -1,6 +1,6 @@
 # 账本恢复一致性修复 R1 登记簿
 
-状态：**3799af1 复审 CHANGES-REQUIRED**。本提交只对齐观察锚点与净值刷新的 `seq` 口径，不签发 PASS，不登记新冻结点。
+状态：**账本恢复 PASS-LOCAL**，冻结于 `b983a76cad637999d337b18fd461e8ad3766f654`。登记见 `docs/LEDGER_RECOVERY_ACCEPTANCE.md`。该冻结不包含 UTC 规范哈希和杠杆合同。
 
 | 项 | 值 |
 |---|---|
