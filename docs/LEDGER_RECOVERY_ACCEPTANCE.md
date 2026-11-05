@@ -6,13 +6,13 @@
 
 独立复跑：全库 233 项通过，账本独立回归 20 项通过。多账户交错后，即时、回放、重开的净值都是 `1.0002`，高水位保留 `1.0031`。观察锚点与净值刷新使用同一套数据库 `seq`。
 
-通过范围只有账本恢复修复。UTC 规范哈希及历史兼容已另行冻结，见 `docs/UTC_CANONICAL_HASH_ACCEPTANCE.md`，不并入本冻结点。杠杆参数合同尚未关闭。本登记不授权自动修复历史坏账，也不授权迁移真实数据库。
+通过范围只有账本恢复修复。UTC 规范哈希及历史兼容已另行冻结，见 `docs/UTC_CANONICAL_HASH_ACCEPTANCE.md`，不并入本冻结点。杠杆参数合同随后单独冻结于 `a7f756c0c4195e22d00dcf8c5facd75f9be24236`，见 `docs/LEVERAGE_ACCEPTANCE.md`。本登记不授权自动修复历史坏账，也不授权迁移真实数据库。
 
 | 项目 | 裁定 |
 |---|---|
 | 账本恢复 | **PASS-LOCAL**，`b983a76cad637999d337b18fd461e8ad3766f654` |
 | UTC 规范哈希及历史兼容 | **PASS-LOCAL**，`98317bc0de009db657065cdea0d5bee022788722`，见 `docs/UTC_CANONICAL_HASH_ACCEPTANCE.md` |
-| 杠杆参数合同 | **未关闭** |
+| 杠杆参数合同 | **PASS-LOCAL**，`a7f756c0c4195e22d00dcf8c5facd75f9be24236`，见 `docs/LEVERAGE_ACCEPTANCE.md` |
 | 历史坏账修复、真实数据库迁移 | **未授权** |
 | 只读运行器 | **PASS-LOCAL**，仍是 `0c23ca1f444090593b5369ef238ddf4be43bc9b3` |
 | 网络重跑 | **暂停** |
