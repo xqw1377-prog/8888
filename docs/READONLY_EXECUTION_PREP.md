@@ -1,6 +1,6 @@
 # 真实只读核验执行材料
 
-状态：**当前冻结点上的一轮只读核验已经执行并结束，再一次网络重跑未授权。** 登记见 `docs/READONLY_RUNNER_ACCEPTANCE.md`。第一次摘要见 `docs/READONLY_RUN_SUMMARY.md`。第二次摘要见 `docs/READONLY_RUN_R2_SUMMARY.md`。第三次摘要见 `docs/READONLY_RUN_R3_SUMMARY.md`。网络诊断范围见 `docs/READONLY_NETDIAG_SCOPE.md`。初始化证据见 `docs/LOCAL_LEDGER_INIT.md`。
+状态：**2026-11-05 的一次只读核验已经执行并结束，再一次网络重跑未授权。** 第五次摘要见 `docs/READONLY_RUN_R5_SUMMARY.md`。 登记见 `docs/READONLY_RUNNER_ACCEPTANCE.md`。第一次摘要见 `docs/READONLY_RUN_SUMMARY.md`。第二次摘要见 `docs/READONLY_RUN_R2_SUMMARY.md`。第三次摘要见 `docs/READONLY_RUN_R3_SUMMARY.md`。网络诊断范围见 `docs/READONLY_NETDIAG_SCOPE.md`。初始化证据见 `docs/LOCAL_LEDGER_INIT.md`。
 
 本文件不是另一次授权。没有新的书面决定之前，不执行下面的命令，不访问 `https://demo-fapi.binance.com`。TESTNET 试单仍未授权。实盘保持 `HOLD`。`main` 不合并。
 
@@ -91,6 +91,7 @@
 - `/Users/xinquanwang/8888/var/readonly-evidence-r2`
 - `/Users/xinquanwang/8888/var/readonly-evidence-r3`
 - `/Users/xinquanwang/8888/var/readonly-evidence-r4`
+- `/Users/xinquanwang/8888/var/readonly-evidence-r5`
 
 `var/` 已忽略，不提交证据。以后若另有执行决定，必须使用一个新的证据目录。生成并封印之后不再改。证据不写密钥、签名值或完整签名 URL。
 
@@ -178,4 +179,4 @@ PY
 
 ## 6. 仍未做的事
 
-第 5 节里的命令已执行三次。前两次使用历史冻结点 `5b51364`，分别写入两个已封存证据目录。第一次在第三次对时的 TLS 握手超时后停止。第二次从第一次对时重新执行，在时钟取样 1 失败后停止。第三次使用当前冻结点 `0c23ca1`，写入 `/Users/xinquanwang/8888/var/readonly-evidence-r3`；一次 `GET /fapi/v1/time` 返回 `200` 后，时钟取样 1 因偏移加不确定度超过 1000 毫秒而停止。三次都没有重试，也没有把交易所余额写回本地账本。前两次未通过记录保持不变。这一轮授权已经结束。其后一次公开对时质量诊断只保存了五次 `/fapi/v1/time` 观测，见 `docs/READONLY_TIME_QUALITY.md`；它不签发通过，也不授权再执行第 5 节的命令。后来一次书面决定准备把证据写入 `/Users/xinquanwang/8888/var/readonly-evidence-r4`，但该目录已经存在，`076b60b` 在发送请求前停止，登记为 NOT_RUN，不计为第四次失败，也没有覆盖目录。目录内既有文件的只读核对见 `docs/READONLY_RUN_R4_SUMMARY.md`，追溯见 `docs/READONLY_R4_TRACE.md`。没有新的书面决定之前，不再执行该命令。TESTNET 试单仍未授权。
+第 5 节里的命令已执行三次。前两次使用历史冻结点 `5b51364`，分别写入两个已封存证据目录。第一次在第三次对时的 TLS 握手超时后停止。第二次从第一次对时重新执行，在时钟取样 1 失败后停止。第三次使用当前冻结点 `0c23ca1`，写入 `/Users/xinquanwang/8888/var/readonly-evidence-r3`；一次 `GET /fapi/v1/time` 返回 `200` 后，时钟取样 1 因偏移加不确定度超过 1000 毫秒而停止。三次都没有重试，也没有把交易所余额写回本地账本。前两次未通过记录保持不变。这一轮授权已经结束。其后一次公开对时质量诊断只保存了五次 `/fapi/v1/time` 观测，见 `docs/READONLY_TIME_QUALITY.md`；它不签发通过，也不授权再执行第 5 节的命令。后来一次书面决定准备把证据写入 `/Users/xinquanwang/8888/var/readonly-evidence-r4`，但该目录已经存在，`076b60b` 在发送请求前停止，登记为 NOT_RUN，不计为失败，也没有覆盖目录。目录内既有文件的只读核对见 `docs/READONLY_RUN_R4_SUMMARY.md`，追溯见 `docs/READONLY_R4_TRACE.md`。2026-11-05 的书面授权使用新目录 `/Users/xinquanwang/8888/var/readonly-evidence-r5`，在冻结工作树 `readonly-worktree-0c23ca1` 上执行了一次。一次 `GET /fapi/v1/time` 返回 `200` 后，时钟取样 1 因无法解释的时间跳变停止。没有重试，没有覆盖旧证据。该次授权已经结束。没有新的书面决定之前，不再执行该命令。TESTNET 试单仍未授权。
