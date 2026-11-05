@@ -92,6 +92,7 @@
 - `/Users/xinquanwang/8888/var/readonly-evidence-r3`
 - `/Users/xinquanwang/8888/var/readonly-evidence-r4`
 - `/Users/xinquanwang/8888/var/readonly-evidence-r5`
+- `/Users/xinquanwang/8888/var/readonly-evidence-r5`
 
 `var/` 已忽略，不提交证据。以后若另有执行决定，必须使用一个新的证据目录。生成并封印之后不再改。证据不写密钥、签名值或完整签名 URL。
 
