@@ -154,15 +154,21 @@ def judge_clock(sample: ClockSample) -> ClockJudgement:
     return _clock_result(sample, "PASS", "")
 
 
+# UTC 时钟与单调时钟是两个独立振荡源，速率差在 ±100ppm 内属正常规格。
+# 量化容差只覆盖读数精度；经过时间还允许按速率差漂移，超过即仍判跳变。
+MAX_INTERCLOCK_DRIFT_PPM = 100
+
+
 def _elapsed_compatible(sample: ClockSample) -> bool:
     utc_slack = sample.utc_quantum_ns - 1
     mono_slack = sample.mono_quantum_ns - 1
     utc_elapsed = sample.t1 - sample.t0
+    drift_ns = utc_elapsed * MAX_INTERCLOCK_DRIFT_PPM // 1_000_000 + 1
     utc_low = utc_elapsed - utc_slack
     utc_high = utc_elapsed + utc_slack
     mono_low = (sample.m1_before - sample.m0_after) - mono_slack
     mono_high = (sample.m1_after - sample.m0_before) + mono_slack
-    return utc_low <= mono_high and mono_low <= utc_high
+    return utc_low - drift_ns <= mono_high and mono_low <= utc_high + drift_ns
 
 
 def _max_span_ns(sample: ClockSample) -> int:

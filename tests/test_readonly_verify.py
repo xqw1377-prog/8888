@@ -480,7 +480,7 @@ def test_server_millisecond_is_inside_the_offset_budget() -> None:
 
 
 def test_monotonic_quantization_keeps_equal_elapsed_time() -> None:
-    """两种时钟各自量化后，相同经过时间不能只因为单调端点被当成精确值而拒绝。"""
+    """量化容差加时钟间漂移预算之内接受；超出两个预算之和仍拒绝。"""
     quantum = 1_000_000
     kept = judge_clock(
         _sample(
@@ -499,7 +499,7 @@ def test_monotonic_quantization_keeps_equal_elapsed_time() -> None:
     rejected = judge_clock(
         _sample(
             t0=0,
-            t1=(quantum - 1) + (quantum - 1) + 1,
+            t1=(quantum - 1) + (quantum - 1) + 100_001,
             m0_before=0,
             m0_after=0,
             m1_before=0,
@@ -940,3 +940,58 @@ def test_json_signature_field_is_redacted(tmp_path) -> None:
     blob = str(raised.value) + "\n" + _text(tmp_path)
     assert secret not in blob
     assert KEY not in blob
+
+
+def test_r5_sample_drift_no_longer_reads_as_unexplained_jump() -> None:
+    """R5 取样 1 的原始记录：0.5ppm 时钟间速率差不再是时间跳变，环境超预算照实失败。"""
+    judgement = judge_clock(
+        _sample(
+            t0=1_793_840_860_294_423_000,
+            t1=1_793_840_862_164_983_000,
+            m0_before=398_130_402_903_166,
+            m0_after=398_130_402_903_708,
+            m1_before=398_132_273_465_625,
+            m1_after=398_132_273_470_916,
+            server_time=1_793_840_861_941,
+            utc_quantum_ns=1001,
+            mono_quantum_ns=42,
+            server_quantum_ns=1_000_000,
+        )
+    )
+    assert judgement.verdict == "FAIL"
+    assert judgement.reason == "偏移加不确定度超过1000毫秒"
+
+
+def test_sub_ppm_interclock_drift_passes_elapsed_compatibility() -> None:
+    """独立振荡源的亚 ppm 速率差属正常规格，不该判跳变。"""
+    t0 = 1_000_000_000_000
+    judgement = judge_clock(
+        _sample(
+            t0=t0,
+            t1=t0 + 100_000_000,
+            m0_before=500_000,
+            m0_after=500_100,
+            m1_before=500_100 + 100_000_900,
+            m1_after=500_200 + 100_000_900,
+            server_time=1_000_050,
+        )
+    )
+    assert judgement.verdict == "PASS"
+    assert judgement.reason == ""
+
+
+def test_millisecond_mono_excess_still_fails_as_jump() -> None:
+    """1 毫秒级经过时间差远超 100ppm 漂移预算，仍判无法解释的时间跳变。"""
+    judgement = judge_clock(
+        _sample(
+            t0=0,
+            t1=2_000_000_000,
+            m0_before=0,
+            m0_after=42,
+            m1_before=2_001_000_000,
+            m1_after=2_001_000_042,
+            server_time=1000,
+        )
+    )
+    assert judgement.verdict == "FAIL"
+    assert judgement.reason == "无法解释的时间跳变"
