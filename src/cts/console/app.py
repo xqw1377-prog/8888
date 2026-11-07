@@ -49,6 +49,7 @@ class ConsoleState:
     last_reconcile_at: str = ""
     approvals: list[str] = field(default_factory=list)
     marks: dict[str, str] = field(default_factory=dict)
+    klines: dict[str, list[str]] = field(default_factory=dict)
 
     @classmethod
     def from_ledger(cls, ledger, *, occupancy=None, mode: str = "SIMULATION") -> "ConsoleState":
@@ -159,6 +160,23 @@ class ConsoleApp:
             self.state.marks = read_demo_marks()
         except Exception:
             self.state.marks = {}
+        try:
+            from cts.data.binance_feed import BinanceDataFeed, DataPullAuthorization
+            from cts.data.store import DataStore
+            from cts.clock import utc_now
+            from datetime import timedelta
+
+            feed = BinanceDataFeed(
+                DataStore(),
+                DataPullAuthorization(granted_by="console", expires_at=utc_now() + timedelta(minutes=30), max_requests=8),
+            )
+            klines: dict[str, list[str]] = {}
+            for symbol in ("BTCUSDT", "ETHUSDT"):
+                bars = feed.fetch_candles(symbol, "1m", 90)
+                klines[symbol] = [format(bar.close, "f") for bar in bars[-90:]]
+            self.state.klines = klines
+        except Exception:
+            self.state.klines = {}
 
     def serve(self) -> int:
         app = self
@@ -590,7 +608,7 @@ def overview_payload(state: ConsoleState) -> dict:
         "curve": state.curve,
         "traces": list(state.traces.values()),
         "approvals": state.approvals,
-        "marks": dict(state.marks),
+        "marks": dict(state.marks), "klines": dict(state.klines),
         "risk_coefficient": state.risk_coefficient,
         "last_reconcile_at": state.last_reconcile_at or "暂无证据",
     }
@@ -977,7 +995,11 @@ function board(data) {
   if (heading) heading.textContent = connected ? "市场走势 · 标记价格" : "市场走势 · 模拟行情";
   document.getElementById("market-board").innerHTML = `
     <div class="quotes">${names.map(symbol => `<div>${coin(symbol)}<b>${esc(symbol)}</b><strong>${esc(markOf(data, symbol))}</strong><em>${connected ? "标记价格" : "未接行情"}</em></div>`).join("") || `<div><strong>暂无证据</strong></div>`}</div>
-    <div class="empty-plot">${connected ? "标记价格来自币安模拟盘公开行情，这里不绘制历史曲线" : "未接行情，不绘制价格"}</div>`;
+    ${names.map(symbol => {
+      const series = (data.klines || {})[symbol];
+      if (!series || series.length < 2) return `<div class="empty-plot">${esc(symbol)} 暂无 K 线</div>`;
+      return `<div style="margin-top:10px"><div style="display:flex;justify-content:space-between;font-size:12px"><span>${esc(symbol)} · 最近 ${series.length} 根 1m 收盘</span><b>${esc(series[series.length-1])}</b></div>${areaChart(series)}</div>`;
+    }).join("") || `<div class="empty-plot">未接行情，不绘制价格</div>`}`;
   document.getElementById("market-page").textContent = connected
     ? "BTCUSDT 与 ETHUSDT 的标记价格来自币安模拟盘公开行情。"
     : "未接行情。BTCUSDT 与 ETHUSDT 没有可显示的标记价格。";
