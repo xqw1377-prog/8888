@@ -134,7 +134,8 @@ class BinanceDataFeed:
                 )
             )
         for candle in candles:
-            self.store.put(candle)
+            if self.store.get(candle.identity()) is None:
+                self.store.put(candle)
         return candles
 
     def fetch_mark(self, symbol: str) -> MarkSample:
@@ -153,7 +154,8 @@ class BinanceDataFeed:
             index_price=D(body["indexPrice"]) if body.get("indexPrice") else None,
             source_id="demo-premiumIndex",
         )
-        self.store.put(sample)
+        if self.store.get(sample.identity()) is None:
+            self.store.put(sample)
         return sample
 
     def fetch_funding(self, symbol: str, limit: int = 100) -> list[FundingSettlement]:
@@ -181,7 +183,8 @@ class BinanceDataFeed:
                 )
             )
         for settlement in settlements:
-            self.store.put(settlement)
+            if self.store.get(settlement.identity()) is None:
+                self.store.put(settlement)
         return settlements
 
 

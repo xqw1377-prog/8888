@@ -757,6 +757,21 @@ def parse_usdt_wallet(body: dict) -> dict[str, str]:
     }
 
 
+def read_demo_marks() -> dict[str, str]:
+    load_local_env()
+    if os.environ.get("CTS_BINANCE_NETWORK") != "TESTNET":
+        raise CtsError("只读取币安模拟盘行情，未访问实盘", reason_code="LIVE_TRADING_HOLD")
+    transport = open_testnet_transport()
+    marks: dict[str, str] = {}
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        body = transport("GET", "/fapi/v1/premiumIndex", f"symbol={symbol}", {})
+        price = body.get("markPrice")
+        if not price:
+            raise CtsError(f"{symbol} 没有标记价格", reason_code="RECONCILIATION_FAILED")
+        marks[symbol] = str(price)
+    return marks
+
+
 def read_demo_wallet(now: datetime | None = None) -> dict[str, str]:
     load_local_env()
     if os.environ.get("CTS_BINANCE_NETWORK") != "TESTNET":

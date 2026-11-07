@@ -48,6 +48,7 @@ class ConsoleState:
     risk_coefficient: str = "1"
     last_reconcile_at: str = ""
     approvals: list[str] = field(default_factory=list)
+    marks: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_ledger(cls, ledger, *, occupancy=None, mode: str = "SIMULATION") -> "ConsoleState":
@@ -149,6 +150,15 @@ class ConsoleApp:
             self.state.books["unrealized"] = "暂无证据"
             self.state.metrics["data_freshness"] = "币安模拟盘读取失败"
             self.state.equity = None
+        self.refresh_demo_marks()
+
+    def refresh_demo_marks(self) -> None:
+        from cts.execution.live import read_demo_marks
+
+        try:
+            self.state.marks = read_demo_marks()
+        except Exception:
+            self.state.marks = {}
 
     def serve(self) -> int:
         app = self
@@ -580,6 +590,7 @@ def overview_payload(state: ConsoleState) -> dict:
         "curve": state.curve,
         "traces": list(state.traces.values()),
         "approvals": state.approvals,
+        "marks": dict(state.marks),
         "risk_coefficient": state.risk_coefficient,
         "last_reconcile_at": state.last_reconcile_at or "暂无证据",
     }
@@ -689,8 +700,8 @@ CONSOLE_HTML = """<!DOCTYPE html>
     border-radius:12px; }
   .quotes { display:flex; justify-content:space-between; gap:12px; margin-bottom:8px; }
   .quotes b { display:block; font-size:13px; }
-  .quotes strong { font-size:22px; font-variant-numeric:tabular-nums; }
-  .quotes em { font-style:normal; color:var(--muted); font-size:12px; }
+  .quotes strong { display:block; font-size:22px; font-variant-numeric:tabular-nums; }
+  .quotes em { display:block; font-style:normal; color:var(--muted); font-size:12px; }
   .radar-head, .pos-head { display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin:16px 0 10px; }
   .radar-head p, .pos-head p { margin:0; color:var(--muted); font-size:12px; }
   .radar { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
@@ -789,7 +800,7 @@ CONSOLE_HTML = """<!DOCTYPE html>
       </article>
       <article class="card">
         <div class="card-head">
-          <h2>市场走势 · 模拟行情</h2>
+          <h2 id="market-heading">市场走势 · 模拟行情</h2>
           <div class="ranges">
             <button type="button" disabled>1H</button>
             <button type="button" disabled>4H</button>
@@ -953,19 +964,30 @@ function navWindow(values) {
   if (!navSpan) return rows;
   return rows.slice(-navSpan);
 }
+function markOf(data, symbol) {
+  const price = data.marks && data.marks[symbol];
+  if (!price) return "暂无证据";
+  const trimmed = String(price).replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "");
+  return grouped(trimmed);
+}
 function board(data) {
   const names = ["BTCUSDT", "ETHUSDT"].filter(symbol => !queryText() || symbol.includes(queryText()));
+  const connected = names.some(symbol => data.marks && data.marks[symbol]);
+  const heading = document.getElementById("market-heading");
+  if (heading) heading.textContent = connected ? "市场走势 · 标记价格" : "市场走势 · 模拟行情";
   document.getElementById("market-board").innerHTML = `
-    <div class="quotes">${names.map(symbol => `<div>${coin(symbol)}<b>${esc(symbol)}</b><strong>暂无证据</strong><em>未接行情</em></div>`).join("") || `<div><strong>暂无证据</strong></div>`}</div>
-    <div class="empty-plot">未接行情，不绘制价格</div>`;
-  document.getElementById("market-page").textContent = "未接行情。BTCUSDT 与 ETHUSDT 没有可显示的标记价格。";
+    <div class="quotes">${names.map(symbol => `<div>${coin(symbol)}<b>${esc(symbol)}</b><strong>${esc(markOf(data, symbol))}</strong><em>${connected ? "标记价格" : "未接行情"}</em></div>`).join("") || `<div><strong>暂无证据</strong></div>`}</div>
+    <div class="empty-plot">${connected ? "标记价格来自币安模拟盘公开行情，这里不绘制历史曲线" : "未接行情，不绘制价格"}</div>`;
+  document.getElementById("market-page").textContent = connected
+    ? "BTCUSDT 与 ETHUSDT 的标记价格来自币安模拟盘公开行情。"
+    : "未接行情。BTCUSDT 与 ETHUSDT 没有可显示的标记价格。";
   document.getElementById("radar").innerHTML = names.map(symbol => {
     const found = (data.positions || []).find(item => item.symbol === symbol);
     const qty = found ? found.qty : "暂无证据";
     return `<article class="signal">
       <div class="signal-top">${coin(symbol)}<b>${esc(symbol)}</b><span class="tag">暂无信号</span></div>
       <button class="ghost-btn" data-open="research">查看信号</button>
-      <div class="px">未接行情</div>
+      <div class="px">${esc(markOf(data, symbol))}</div>
       <ul>
         <li><span>持仓数量</span><em>${esc(qty)}</em></li>
         <li><span>通道突破</span><em>暂无证据</em></li>
@@ -980,7 +1002,7 @@ function board(data) {
     const qty = String(item.qty ?? "");
     const side = !numeric(qty) ? "暂无证据" : (Number(qty) < 0 ? "空" : "多");
     const tone = side === "空" ? "short" : (side === "多" ? "long" : "");
-    return `<tr><td>${coin(item.symbol)} ${esc(item.symbol)}</td><td><span class="side ${tone}">${esc(side)}</span></td><td>${esc(qty)}</td><td>暂无证据</td><td>暂无证据</td><td>暂无证据</td><td>暂无证据</td><td>暂无证据</td><td>—</td></tr>`;
+    return `<tr><td>${coin(item.symbol)} ${esc(item.symbol)}</td><td><span class="side ${tone}">${esc(side)}</span></td><td>${esc(qty)}</td><td>暂无证据</td><td>${esc(markOf(data, item.symbol))}</td><td>暂无证据</td><td>暂无证据</td><td>暂无证据</td><td>—</td></tr>`;
   }).join("") : `<tr><td class="empty" colspan="9">暂无持仓</td></tr>`;
 }
 function paint(data) {

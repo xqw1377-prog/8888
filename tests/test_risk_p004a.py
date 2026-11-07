@@ -330,3 +330,38 @@ def test_signal_reserve_partial_fill_cancel_remaining_quota_trace(tmp_path) -> N
     assert fill_event.payload["filled_qty"] == format(reserved.qty * D("0.4"), "f")
     assert cancel_event.payload["released_qty"] == format(reserved.qty * D("0.6"), "f")
     assert released > 0
+
+
+def test_opposite_equal_qty_fill_reduces_position(tmp_path) -> None:
+    """平仓通道最小实现：等量反向成交按比例减仓，超量仍拒绝翻仓。"""
+    engine = make_engine(tmp_path)
+    long_res = engine.reserve([req("BTCUSDT", "s-close-1")], now=NOW)[0]
+    engine.apply_fill(long_res.reservation_id, long_res.qty, now=NOW)
+    assert engine.occupancy().positions[0].qty == long_res.qty
+
+    short = engine.reserve(
+        [ReserveRequest(
+            symbol="BTCUSDT", side=Side.SHORT, signal_key="s-close-2",
+            entry_price=D("100"), stop_price=D("102"), multiplier=D("1"), lot_size=D("0.001"),
+        )],
+        now=NOW,
+    )[0]
+    engine.apply_fill(short.reservation_id, long_res.qty, now=NOW)   # 等量平仓
+    view = engine.occupancy()
+    assert view.positions[0].qty == 0
+    assert view.positions[0].side is None
+    assert view.isolated_margin == long_res.notional / D("2")        # 保证金保持到清仓释放
+
+    over = engine.reserve(
+        [ReserveRequest(
+            symbol="BTCUSDT", side=Side.LONG, signal_key="s-close-3",
+            entry_price=D("100"), stop_price=D("98"), multiplier=D("1"), lot_size=D("0.001"),
+        )],
+        now=NOW,
+    )[0]
+    long2 = engine.reserve([req("BTCUSDT", "s-close-4")], now=NOW)[0]
+    engine.apply_fill(long2.reservation_id, long2.qty, now=NOW)
+    from cts.errors import UnitValidationError as _UVE
+    import pytest as _pytest
+    with _pytest.raises(_UVE):
+        engine.apply_fill(over.reservation_id, long2.qty + D("0.001"), now=NOW)

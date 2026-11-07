@@ -1534,7 +1534,26 @@ class RiskEngine:
         positions = {p.symbol: p for p in self.store.list_positions(conn, self.account_id)}
         pos = positions.get(res.symbol)
         if pos and pos.side and pos.side != res.side and pos.qty > 0:
-            raise UnitValidationError("预留成交方向与已有仓位相反，禁止翻仓")
+            if fill_qty > pos.qty:
+                raise UnitValidationError("预留成交方向与已有仓位相反，禁止翻仓")
+            # 平仓方向的等量成交：按比例减仓，不新增风险；超量仍拒绝
+            remaining = pos.qty - fill_qty
+            ratio = remaining / pos.qty if pos.qty > 0 else D("0")
+            conn.execute(
+                """
+                UPDATE positions SET qty=?, notional=?, risk_amount=?, side=?, position_version=position_version+1
+                WHERE account_id=? AND symbol=?
+                """,
+                (
+                    format(remaining, "f"),
+                    format(pos.notional * ratio, "f"),
+                    format(pos.risk_amount * ratio, "f"),
+                    res.side.value if remaining > 0 else None,
+                    self.account_id,
+                    res.symbol,
+                ),
+            )
+            return
         leverage = res.leverage
         if pos is None:
             qty = fill_qty
