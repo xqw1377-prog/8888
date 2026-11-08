@@ -179,13 +179,14 @@ class OrderStore:
                         raise ConflictError("同一订单号的数量、价格或方向不一致")
                     self._conn.execute("COMMIT")
                     return
-                charged = sum(
-                    (budget_notional(self._row(row)) for row in self._conn.execute(
+                existing_orders = [
+                    self._row(row)
+                    for row in self._conn.execute(
                         "SELECT * FROM live_orders WHERE account_id=?",
                         (order.account_id,),
-                    ).fetchall()),
-                    start=D("0"),
-                )
+                    ).fetchall()
+                ]
+                charged = net_session_exposure(existing_orders)
                 if charged + order.notional > D(max_notional):
                     raise RiskLimitError("累计名义超出本进程限额，未发送请求")
                 self._conn.execute(

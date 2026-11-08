@@ -299,6 +299,45 @@ class DemoTrader:
 
     # ---- 主循环 ----
 
+    def _resolve_unknown_orders(self) -> None:
+        """UNKNOWN 订单按交易所证据核销：无此单置 REJECTED，终态落账，释放净敞口。"""
+        from dataclasses import replace as _replace
+
+        try:
+            account_orders = self.session.orders.for_account(self.risk.account_id)
+        except Exception:
+            return
+        for order in account_orders:
+            stale_intent = (
+                order.status == "INTENT"
+                and getattr(order, "dispatch_started", 0)
+                and (utc_now() - (order.updated_at if getattr(order, "updated_at", None) else utc_now())).total_seconds() > 300
+            )
+            if order.status != "UNKNOWN" and not stale_intent:
+                continue
+            try:
+                status, body = self.signer(
+                    "/fapi/v1/order",
+                    {"symbol": order.symbol, "origClientOrderId": order.client_order_id},
+                )
+            except Exception:
+                continue
+            if status == 200:
+                data = json.loads(body)
+                self.session.orders.save(
+                    _replace(order, status=data.get("status", "UNKNOWN"), executed_qty=D(str(data.get("executedQty") or "0"))),
+                    utc_now(),
+                )
+                self.log(f"未决订单 {order.client_order_id} 按交易所置为 {data.get('status')}")
+            else:
+                try:
+                    code = json.loads(body).get("code")
+                except Exception:
+                    code = None
+                if code == -2013:
+                    self.session.orders.save(_replace(order, status="REJECTED", executed_qty=D("0")), utc_now())
+                    self.log(f"未决订单 {order.client_order_id} 交易所无此单，置 REJECTED")
+
     def _release_stale_reservations(self) -> None:
         """超过 15 分钟仍 PENDING 的 demo 预留视为残留，释放以免吃满组合预算。"""
         cutoff = utc_now() - timedelta(minutes=15)
@@ -326,6 +365,7 @@ class DemoTrader:
 
     def step(self) -> bool:
         self._poll_pending()
+        self._resolve_unknown_orders()
         self._release_stale_reservations()
         halted = self.state.get("halted")
         # 对账前置：任何新单之前先核对交易所仓位；不一致即熔断（只撤不挂）
