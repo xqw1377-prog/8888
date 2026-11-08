@@ -10,6 +10,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from cts.errors import ConflictError, CtsError, RiskLimitError
+from cts.ledger.models import Side
 from cts.money import D
 
 
@@ -38,6 +39,21 @@ def budget_notional(order: LiveOrder) -> Decimal:
     if order.status == "INTENT" and not order.dispatch_started:
         return order.notional
     return charged_notional(order)
+
+
+def net_session_exposure(orders) -> Decimal:
+    """会话净敞口：成交按买卖方向净额，在场/未决/未发送全额占位。用于进程限额判定。"""
+    total = Decimal("0")
+    for order in orders:
+        if order.status == "INTENT" and not order.dispatch_started:
+            total += order.notional
+        elif order.status in ("NEW", "PARTIALLY_FILLED", "UNKNOWN", "QUERYING", "CANCELING"):
+            total += order.notional
+        elif order.status in ("CANCELED", "EXPIRED", "FILLED"):
+            fraction = order.executed_qty / order.qty if order.qty > 0 else Decimal("0")
+            signed = Decimal("1") if order.side == Side.LONG else Decimal("-1")
+            total += order.notional * fraction * signed
+    return total if total > 0 else Decimal("0")
 
 
 def charged_notional(order: LiveOrder) -> Decimal:

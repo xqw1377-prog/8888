@@ -110,7 +110,6 @@ class DemoTrader:
 
     def log(self, text: str) -> None:
         line = f"[{utc_now().isoformat()}] {text}"
-        print(line, flush=True)
         os.makedirs(os.path.dirname(self.config.log_path), exist_ok=True)
         with open(self.config.log_path, "a") as handle:
             handle.write(line + "\n")
@@ -136,7 +135,14 @@ class DemoTrader:
     # ---- 行情与规则 ----
 
     def _bars(self):
-        return self.feed.fetch_candles(self.config.symbol, self.config.interval, self.config.bars)
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                return self.feed.fetch_candles(self.config.symbol, self.config.interval, self.config.bars)
+            except Exception as exc:
+                last_error = exc
+                self.sleeper(1.5 if attempt < 2 else 0)
+        raise last_error
 
     def _mark(self) -> Optional[D]:
         try:
@@ -155,11 +161,18 @@ class DemoTrader:
         )
 
     def _venue_position(self) -> D:
-        status, body = self.signer("/fapi/v2/positionRisk", {"symbol": self.config.symbol})
-        if status != 200:
-            raise CtsError(f"positionRisk 非 200: {status}", reason_code="RECONCILIATION_FAILED")
-        rows = json.loads(body)
-        return D(rows[0]["positionAmt"]) if rows else D("0")
+        last: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                status, body = self.signer("/fapi/v2/positionRisk", {"symbol": self.config.symbol})
+                if status != 200:
+                    raise CtsError(f"positionRisk 非 200: {status}", reason_code="RECONCILIATION_FAILED")
+                rows = json.loads(body)
+                return D(rows[0]["positionAmt"]) if rows else D("0")
+            except Exception as exc:
+                last = exc
+                self.sleeper(1.5 if attempt < 2 else 0)
+        raise last
 
     # ---- 订单 ----
 
@@ -193,17 +206,24 @@ class DemoTrader:
             qty = reservation.qty
             notional = qty * price
         coid = f"cts_demo_{tag}_{int(self.clock())}"
-        placed = self.session.submit(
-            symbol=self.config.symbol,
-            side=side,
-            qty=qty,
-            price=price,
-            client_order_id=coid,
-            notional=notional,
-            now=utc_now(),
-            risk=self.risk,
-            reservation_id=reservation.reservation_id,
-        )
+        try:
+            placed = self.session.submit(
+                symbol=self.config.symbol,
+                side=side,
+                qty=qty,
+                price=price,
+                client_order_id=coid,
+                notional=notional,
+                now=utc_now(),
+                risk=self.risk,
+                reservation_id=reservation.reservation_id,
+            )
+        except Exception as exc:
+            if getattr(exc, "reason_code", "") != "UNKNOWN_ORDER":
+                # 未发出或被本地拒绝：预留立即释放，避免占满组合预算
+                self.risk.release_unbound_reservation(reservation.reservation_id)
+                self.log(f"{tag} 提交失败已释放预留 {reservation.reservation_id[:8]}: {getattr(exc, 'reason_code', '')}")
+            raise
         self.log(f"{tag} 挂单 {coid} {side.value} {qty} @ {price} (预留 {reservation.reservation_id[:8]})")
         return {
             "coid": coid,
@@ -279,6 +299,24 @@ class DemoTrader:
 
     # ---- 主循环 ----
 
+    def _release_stale_reservations(self) -> None:
+        """超过 15 分钟仍 PENDING 的 demo 预留视为残留，释放以免吃满组合预算。"""
+        cutoff = utc_now() - timedelta(minutes=15)
+        with self.risk.store.txn() as conn:
+            rows = conn.execute(
+                "SELECT reservation_id, signal_key, created_at FROM reservations "
+                "WHERE account_id=? AND status='PENDING' AND signal_key LIKE 'demo-%'",
+                (self.risk.account_id,),
+            ).fetchall()
+        for row in rows:
+            try:
+                created = datetime.fromisoformat(row["created_at"])
+                if created < cutoff:
+                    self.risk.release_unbound_reservation(row["reservation_id"])
+                    self.log(f"释放超时预留 {row['reservation_id'][:8]} ({row['signal_key']})")
+            except Exception:
+                pass
+
     def _signed_local(self) -> D:
         position = self.state.get("position")
         if not position:
@@ -288,13 +326,20 @@ class DemoTrader:
 
     def step(self) -> bool:
         self._poll_pending()
+        self._release_stale_reservations()
         halted = self.state.get("halted")
         # 对账前置：任何新单之前先核对交易所仓位；不一致即熔断（只撤不挂）
+        venue = None
+        reconcile_error = ""
         try:
             venue = self._venue_position()
         except Exception as exc:
-            self.log(f"仓位核对失败 {type(exc).__name__}: {exc}")
-            venue = None
+            reconcile_error = f"{type(exc).__name__}: {exc}"
+        if venue is None and not self.state.get("pending"):
+            # 对账未知时不得下任何新单：入场会叠加未知敞口，反向平仓无仅减仓保证可能翻仓
+            self.log(f"仓位核对失败，本轮不触发交易 {reconcile_error}")
+            self._save_state()
+            return True
         if venue is not None and not self.state.get("pending"):
             if halted == "position-mismatch":
                 if venue == self._signed_local():

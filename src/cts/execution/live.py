@@ -25,7 +25,7 @@ from urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_ope
 
 from cts import LIVE_TRADING_AUTHORIZATION
 from cts.errors import ConflictError, CtsError, NewRiskBlockedError, UnitValidationError
-from cts.execution.orders import LiveOrder, OrderStore, budget_notional
+from cts.execution.orders import LiveOrder, OrderStore, budget_notional, net_session_exposure
 from cts.ledger.models import Side
 from cts.money import D
 from cts.risk.engine import RiskEngine
@@ -695,7 +695,9 @@ class LiveSession:
 
     def _hold(self, notional: Decimal) -> None:
         with self._budget_lock:
-            if self._reserved_notional + notional > self.grant.max_notional:
+            # 限额按净敞口判定：已平仓的成交净额归零，不永久占用常驻进程预算
+            exposure = net_session_exposure(self.orders.for_account(self.grant.account_id))
+            if exposure + notional > self.grant.max_notional:
                 raise CtsError("累计名义超出本进程限额，未发送请求", reason_code="RISK_LIMIT")
             self._reserved_notional += notional
 
