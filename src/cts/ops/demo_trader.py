@@ -91,6 +91,7 @@ class DemoTrader:
         signer: Callable[[str, dict], tuple[int, str]],
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
+        renew: Optional[Callable[[], None]] = None,
     ) -> None:
         self.config = config
         self.risk = risk
@@ -100,6 +101,9 @@ class DemoTrader:
         self.clock = clock
         self.sleeper = sleeper
         self.credentials = credentials
+        self.renew = renew
+        self._heartbeat = 0.0
+        self._failures = 0
         self.state: dict = {"position": None, "pending": None}
         self._load_state()
 
@@ -164,7 +168,9 @@ class DemoTrader:
         if notional > self.config.grant_max_notional:
             self.log(f"{tag} 名义 {notional} 超限，跳过")
             return None
-        if stop is None:
+        if stop is not None:
+            stop_price = D(stop)
+        else:
             atr = self._last_atr()
             stop_price = initial_stop(side, price, atr if atr else price * D("0.01"), self.config.params)
         request = ReserveRequest(
@@ -304,10 +310,23 @@ class DemoTrader:
                         pass
                 self.log("停止文件存在，交易器退出")
                 return
+            if self.renew is not None:
+                try:
+                    self.renew()
+                except Exception as exc:
+                    self.log(f"续期失败 {type(exc).__name__}: {exc}")
             try:
                 self.step()
+                self._failures = 0
             except Exception as exc:
-                self.log(f"迭代异常 {type(exc).__name__}: {getattr(exc, 'reason_code', '')} {exc}")
+                self._failures += 1
+                self.log(f"迭代异常({self._failures} 连续) {type(exc).__name__}: {getattr(exc, 'reason_code', '')} {exc}")
+                if self._failures == 10 and self.state.get("position"):
+                    self.log("连续 10 次失败且持仓在场：无法管理风险，请人工检查（停止文件可退出）")
+            if self.clock() - self._heartbeat >= 900:
+                self._heartbeat = self.clock()
+                pos = self.state.get("position")
+                self.log(f"心跳 持仓={pos['side'] + ' ' + pos['qty'] if pos else '无'} 待定单={'有' if self.state.get('pending') else '无'}")
             self.sleeper(self.config.poll_seconds)
 
 
@@ -373,7 +392,7 @@ def build_default(config: DemoTraderConfig, *, proxy: str = "http://127.0.0.1:17
     credentials = VenueCredentials(env["CTS_BINANCE_API_KEY"], env["CTS_BINANCE_API_SECRET"])
     feed = BinanceDataFeed(
         DataStore(),
-        DataPullAuthorization(granted_by="xinquanwang", expires_at=utc_now() + timedelta(hours=8), max_requests=100000),
+        DataPullAuthorization(granted_by="xinquanwang", expires_at=utc_now() + timedelta(hours=12), max_requests=10_000_000),
     )
     from cts.risk.store import RiskStore
 
@@ -384,7 +403,7 @@ def build_default(config: DemoTraderConfig, *, proxy: str = "http://127.0.0.1:17
         network="TESTNET",
         account_id="local-ledger",
         max_notional=config.grant_max_notional,
-        expires_at=utc_now() + timedelta(hours=6),
+        expires_at=utc_now() + timedelta(hours=12),
     )
     session = LiveSession(
         grant,
@@ -394,14 +413,42 @@ def build_default(config: DemoTraderConfig, *, proxy: str = "http://127.0.0.1:17
         path="/Users/xinquanwang/8888/var/ledger/orders.db",
         risk=risk,
     )
-    return DemoTrader(
+    holder: dict = {"session": session, "feed": feed}
+
+    def renew() -> None:
+        now = utc_now()
+        if now >= holder["session"].grant.expires_at - timedelta(minutes=30):
+            holder["session"] = LiveSession(
+                LiveGrant(
+                    granted_by="xinquanwang(会话现场指示)",
+                    statement=LIVE_GRANT_STATEMENT,
+                    network="TESTNET",
+                    account_id="local-ledger",
+                    max_notional=config.grant_max_notional,
+                    expires_at=now + timedelta(hours=12),
+                ),
+                credentials,
+                open_testnet_transport(),
+                now=now,
+                path="/Users/xinquanwang/8888/var/ledger/orders.db",
+                risk=risk,
+            )
+            feed.authorization = DataPullAuthorization(
+                granted_by="xinquanwang", expires_at=now + timedelta(hours=12), max_requests=10_000_000
+            )
+        holder["trader"].session = holder["session"]
+
+    trader = DemoTrader(
         config,
         risk=risk,
         credentials=credentials,
         feed=feed,
         session=session,
         signer=make_signer(credentials, proxy),
+        renew=renew,
     )
+    holder["trader"] = trader
+    return trader
 
 
 if __name__ == "__main__":
