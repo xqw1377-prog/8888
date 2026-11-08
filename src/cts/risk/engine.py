@@ -331,7 +331,13 @@ class RiskEngine:
         ):
             raise NewRiskBlockedError("解决证据未绑定当前故障实例", reason_code="RESOLUTION_EVIDENCE_INVALID")
 
-    def reserve(self, requests: Sequence[ReserveRequest], *, now: Optional[datetime] = None) -> list[Reservation]:
+    def reserve(
+        self,
+        requests: Sequence[ReserveRequest],
+        *,
+        now: Optional[datetime] = None,
+        exit_purpose: bool = False,
+    ) -> list[Reservation]:
         ts = now or utc_now()
         if not requests:
             return []
@@ -340,7 +346,9 @@ class RiskEngine:
             row = self.store.load_account(conn, self.account_id)
             bundle = self.store.load_bundle(row)
             mode = RuntimeMode(row["mode"])
-            self._admit_new_risk(view, bundle, mode, conn)
+            if not exit_purpose:
+                # 平仓方向的预留不受开仓准入限制；翻仓与上限仍由成交路径拦截
+                self._admit_new_risk(view, bundle, mode, conn)
             for req in requests:
                 if req.expected_equity_version is not None and req.expected_equity_version != view.equity_version:
                     raise StaleDataError("权益版本已变，旧预算不能批准新仓")
@@ -1548,7 +1556,7 @@ class RiskEngine:
                     format(remaining, "f"),
                     format(pos.notional * ratio, "f"),
                     format(pos.risk_amount * ratio, "f"),
-                    res.side.value if remaining > 0 else None,
+                    pos.side.value if remaining > 0 else None,
                     self.account_id,
                     res.symbol,
                 ),

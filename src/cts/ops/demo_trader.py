@@ -12,7 +12,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal as D
 from decimal import ROUND_DOWN, ROUND_UP
 from typing import Callable, Optional
@@ -42,6 +42,7 @@ from cts.strategy.t1 import (
 )
 
 STOP_FILE_DEFAULT = "/Users/xinquanwang/8888/var/run/DEMO_TRADER_STOP"
+OWNER_DIRECTIVE_FILE = "/Users/xinquanwang/8888/var/run/OWNER_TRADING_DIRECTIVE"
 
 
 @dataclass(frozen=True)
@@ -118,9 +119,14 @@ class DemoTrader:
         try:
             with open(self.config.state_path) as handle:
                 loaded = json.load(handle)
+            if not isinstance(loaded, dict) or "position" not in loaded or "pending" not in loaded:
+                raise ValueError("状态文件结构不完整")
             self.state = loaded
-        except Exception:
+        except FileNotFoundError:
             pass
+        except Exception:
+            # 损坏的状态文件不得静默当成空仓，熔断等待人工核对
+            self.state = {"position": None, "pending": None, "halted": "corrupt-state"}
 
     def _save_state(self) -> None:
         os.makedirs(os.path.dirname(self.config.state_path), exist_ok=True)
@@ -157,7 +163,7 @@ class DemoTrader:
 
     # ---- 订单 ----
 
-    def _place(self, *, side: Side, qty: D, ref_price: D, tag: str, stop: Optional[D]) -> Optional[dict]:
+    def _place(self, *, side: Side, qty: D, ref_price: D, tag: str, stop: Optional[D], exit_order: bool = False) -> Optional[dict]:
         tick, step, min_qty = self._filters()
         qty = max(round_to_step(qty, step, up=False), min_qty)
         if side == Side.LONG:
@@ -182,7 +188,7 @@ class DemoTrader:
             multiplier=D("1"),
             lot_size=step,
         )
-        reservation = self.risk.reserve([request], now=utc_now())[0]
+        reservation = self.risk.reserve([request], now=utc_now(), exit_purpose=exit_order)[0]
         if reservation.qty < qty:
             qty = reservation.qty
             notional = qty * price
@@ -211,9 +217,14 @@ class DemoTrader:
 
     def _last_atr(self) -> Optional[D]:
         try:
+            return self._last_atr_from(self._bars())
+        except Exception:
+            return None
+
+    def _last_atr_from(self, bars) -> Optional[D]:
+        try:
             from cts.strategy.indicators import atr_sma as atr
 
-            bars = self._bars()
             return atr(bars, self.config.params.atr_period)
         except Exception:
             return None
@@ -231,23 +242,31 @@ class DemoTrader:
             return
         status = result.get("status")
         cumulative = D(result.get("executedQty") or "0")
-        if cumulative > 0:
+        applied = D(pending.get("applied") or "0")
+        delta = cumulative - applied
+        if delta > 0:
             self.risk.project_live_cumulative(
                 pending["reservation"], pending["coid"], cumulative, now=utc_now()
             )
-        if status in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
-            self.log(f"{pending['coid']} 终态 {status} executedQty={cumulative}")
-            if cumulative > 0 and status == "FILLED":
-                filled_qty = cumulative
-                if pending["kind"] == "ENTRY":
+            pending["applied"] = format(cumulative, "f")
+            # 部分成交立即反映到本地持仓，不再等 FILLED
+            prev = self.state.get("position")
+            if pending["kind"] == "ENTRY":
+                if prev and prev.get("side") == pending["side"]:
+                    prev["qty"] = format(D(prev["qty"]) + delta, "f")
+                else:
                     self.state["position"] = {
                         "side": pending["side"],
-                        "qty": format(filled_qty, "f"),
+                        "qty": format(cumulative, "f"),
                         "entry": result.get("avgPrice") or result.get("price"),
                         "placed": pending["placed_at"],
                     }
-                else:
-                    self.state["position"] = None
+            elif prev:
+                remain = D(prev["qty"]) - delta
+                self.state["position"] = None if remain <= 0 else {**prev, "qty": format(remain, "f")}
+            self.log(f"{pending['coid']} 已成交增量 {delta}（累计 {cumulative}）")
+        if status in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
+            self.log(f"{pending['coid']} 终态 {status} executedQty={cumulative}")
             self.state["pending"] = None
         elif self.clock() - float(pending["placed_at"]) > self.config.max_order_age_seconds:
             try:
@@ -260,10 +279,71 @@ class DemoTrader:
 
     # ---- 主循环 ----
 
+    def _signed_local(self) -> D:
+        position = self.state.get("position")
+        if not position:
+            return D("0")
+        qty = D(position["qty"])
+        return qty if position["side"] == "LONG" else -qty
+
     def step(self) -> bool:
         self._poll_pending()
-        bars = self._bars()
+        halted = self.state.get("halted")
+        # 对账前置：任何新单之前先核对交易所仓位；不一致即熔断（只撤不挂）
+        try:
+            venue = self._venue_position()
+        except Exception as exc:
+            self.log(f"仓位核对失败 {type(exc).__name__}: {exc}")
+            venue = None
+        if venue is not None and not self.state.get("pending"):
+            if halted == "position-mismatch":
+                if venue == self._signed_local():
+                    self.state["halted"] = None
+                    self.log("仓位核对一致，解除熔断")
+                    halted = None
+                else:
+                    self._save_state()
+                    return True
+            elif venue != self._signed_local():
+                self.state["halted"] = "position-mismatch"
+                self.log(f"仓位核对不一致 本地={self._signed_local()} 交易所={venue}，熔断：不再挂新单，等待人工核对")
+                self._save_state()
+                return True
+        if halted == "corrupt-state":
+            self.log("状态文件损坏，熔断中：人工核对仓位后删除状态文件再重启")
+            self._save_state()
+            return True
+        if self.state.get("halted"):
+            self._save_state()
+            return True
+        # 行情；失败且有持仓时退化为仅标记价止损
+        try:
+            bars = self._bars()
+        except Exception as exc:
+            self.log(f"K线获取失败 {type(exc).__name__}: {exc}")
+            position = self.state.get("position")
+            if position and not self.state.get("pending"):
+                mark = self._mark()
+                stop = D(position.get("stop") or "0")
+                if mark is not None and stop > 0:
+                    hit = mark <= stop if position["side"] == "LONG" else mark >= stop
+                    if hit:
+                        opposite = Side.SHORT if position["side"] == "LONG" else Side.LONG
+                        self.state["pending"] = self._place(
+                            side=opposite, qty=D(position["qty"]), ref_price=mark, tag="EXIT", stop=stop, exit_order=True
+                        )
+                        self.log(f"数据降级：标记价 {mark} 触发止损 {stop}")
+            self._save_state()
+            return True
         position = self.state.get("position")
+        if position is not None and D(position.get("stop") or "0") <= 0:
+            # 恢复状态缺止损：按当前 ATR 重算，避免 stop=0 立即/永不触发
+            side = Side.LONG if position["side"] == "LONG" else Side.SHORT
+            atr = self._last_atr_from(bars)
+            entry = D(position.get("entry") or format(bars[-1].close, "f"))
+            stop = initial_stop(side, entry, atr if atr and atr > 0 else entry * D("0.005"), self.config.params)
+            position["stop"] = format(stop, "f")
+            self.log(f"恢复状态缺止损，按 ATR={atr} 重算 stop={stop}")
         mark = self._mark()
         if position is None and not self.state.get("pending"):
             signal = evaluate_signal(bars, params=self.config.params, has_position=False, has_pending_entry=False)
@@ -279,6 +359,11 @@ class DemoTrader:
             updated, exit_decision = evaluate_exit(open_position, bars, mark_price=mark, params=self.config.params)
             position["stop"] = format(updated.stop, "f")
             if exit_decision is not None:
+                if venue is not None and abs(venue) < D(position["qty"]):
+                    self.state["halted"] = "position-mismatch"
+                    self.log(f"拟平 {position['qty']} 超过交易所实际 {abs(venue)}，熔断")
+                    self._save_state()
+                    return True
                 last = bars[-1].close
                 self.state["pending"] = self._place(
                     side=Side.SHORT if position["side"] == "LONG" else Side.LONG,
@@ -286,13 +371,9 @@ class DemoTrader:
                     ref_price=last,
                     tag="EXIT",
                     stop=D(position["stop"]),
+                    exit_order=True,
                 )
                 self.log(f"退出信号 {exit_decision.reason} stop={exit_decision.stop}")
-        venue = self._venue_position()
-        local = D(position["qty"]) if position else D("0")
-        signed_local = local if (position is None or position["side"] == "LONG") else -local
-        if venue != signed_local and not self.state.get("pending"):
-            self.log(f"仓位核对不一致 本地={signed_local} 交易所={venue}，暂停新动作等待人工核对")
         self._save_state()
         return True
 
@@ -417,6 +498,18 @@ def build_default(config: DemoTraderConfig, *, proxy: str = "http://127.0.0.1:17
 
     def renew() -> None:
         now = utc_now()
+        try:
+            with open(OWNER_DIRECTIVE_FILE) as handle:
+                directive = json.load(handle)
+            directive_valid = now < datetime.fromisoformat(directive["expires_at"])
+        except Exception:
+            directive_valid = False
+        if not directive_valid:
+            if holder["trader"].state.get("halted") != "directive-expired":
+                holder["trader"].state["halted"] = "directive-expired"
+                holder["trader"].log("所有者交易指示缺失或过期：停止续期并熔断新单")
+            holder["trader"].session = holder["session"]
+            return
         if now >= holder["session"].grant.expires_at - timedelta(minutes=30):
             holder["session"] = LiveSession(
                 LiveGrant(
