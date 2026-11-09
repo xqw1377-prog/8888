@@ -50,6 +50,7 @@ class ConsoleState:
     approvals: list[str] = field(default_factory=list)
     marks: dict[str, str] = field(default_factory=dict)
     klines: dict[str, list[str]] = field(default_factory=dict)
+    recent_orders: list[dict[str, str]] = field(default_factory=list)
 
     @classmethod
     def from_ledger(cls, ledger, *, occupancy=None, mode: str = "SIMULATION") -> "ConsoleState":
@@ -610,7 +611,7 @@ def overview_payload(state: ConsoleState) -> dict:
         "curve": state.curve,
         "traces": list(state.traces.values()),
         "approvals": state.approvals,
-        "marks": dict(state.marks), "klines": dict(state.klines),
+        "marks": dict(state.marks), "klines": dict(state.klines), "recent_orders": list(state.recent_orders),
         "risk_coefficient": state.risk_coefficient,
         "last_reconcile_at": state.last_reconcile_at or "暂无证据",
     }
@@ -853,6 +854,11 @@ CONSOLE_HTML = """<!DOCTYPE html>
         </thead>
         <tbody id="positions-table"></tbody>
       </table>
+      <div class="pos-head" style="margin-top:14px">
+        <h2>近期委托 <span id="orders-count">(0)</span></h2>
+        <p>含每笔绑定的合同杠杆</p>
+      </div>
+      <ul class="ledger" id="orders-body"></ul>
     </article>
   </section>
   <section id="market" class="panel">
@@ -1026,8 +1032,23 @@ function board(data) {
     const qty = String(item.qty ?? "");
     const side = !numeric(qty) ? "暂无证据" : (Number(qty) < 0 ? "空" : "多");
     const tone = side === "空" ? "short" : (side === "多" ? "long" : "");
-    return `<tr><td>${coin(item.symbol)} ${esc(item.symbol)}</td><td><span class="side ${tone}">${esc(side)}</span></td><td>${esc(qty)}</td><td>暂无证据</td><td>${esc(markOf(data, item.symbol))}</td><td>暂无证据</td><td>暂无证据</td><td>暂无证据</td><td>—</td></tr>`;
+    const lev = item.leverage ? `<b class="tag" style="margin-left:6px">${esc(item.leverage)}×</b>` : "";
+    const entry = item.entry && Number(item.entry) > 0 ? esc(item.entry) : "暂无证据";
+    const upnl = item.upnl !== undefined && item.upnl !== null && item.upnl !== "" ? esc(item.upnl) : "暂无证据";
+    const roe = item.roe ? esc(item.roe) : "暂无证据";
+    const budget = [
+      item.margin ? `保证金 ${esc(item.margin)}` : "",
+      item.notional ? `名义 ${esc(item.notional)}` : "",
+      item.stop ? `止损 ${esc(item.stop)}` : "",
+      item.liq ? `强平 ${esc(item.liq)}` : "",
+    ].filter(Boolean).join("<br/>") || "暂无证据";
+    return `<tr><td>${coin(item.symbol)} ${esc(item.symbol)}${lev}</td><td><span class="side ${tone}">${esc(side)}</span></td><td>${esc(qty)}</td><td>${entry}</td><td>${esc(markOf(data, item.symbol))}</td><td>${upnl}</td><td>${roe}</td><td>${budget}</td><td>—</td></tr>`;
   }).join("") : `<tr><td class="empty" colspan="9">暂无持仓</td></tr>`;
+  const orders = data.recent_orders || [];
+  document.getElementById("orders-count").textContent = `(${orders.length})`;
+  document.getElementById("orders-body").innerHTML = orders.length ? orders.map(o =>
+    `<li>${esc(o.time || "")} ${esc(o.symbol)} <span class="side ${o.side === "BUY" ? "long" : "short"}">${esc(o.side)}</span> ${esc(o.qty)} @ ${esc(o.price)} · ${esc(o.status)}${o.leverage ? ` · <b>${esc(o.leverage)}×</b>` : ""}</li>`
+  ).join("") : `<li>暂无委托</li>`;
 }
 function paint(data) {
   board(data);
