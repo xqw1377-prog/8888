@@ -92,6 +92,7 @@ class ReserveRequest:
     expected_equity_version: Optional[int] = None
     expected_risk_version: Optional[int] = None
     qty: Optional[Decimal] = None  # 平仓预留必须显式给出精确数量
+    max_new_margin: Optional[Decimal] = None  # 本笔新增保证金上限；空则沿用参数合同
 
 
 @dataclass(frozen=True)

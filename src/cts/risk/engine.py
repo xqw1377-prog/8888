@@ -1434,6 +1434,9 @@ class RiskEngine:
         leverage = bundle.decimal("leverage")
         draft: list[Optional[SizedPosition]] = []
         for req in requests:
+            budget = remaining_margin
+            if req.max_new_margin is not None:
+                budget = min(budget, D(req.max_new_margin))
             draft.append(
                 size_position(
                     side=req.side,
@@ -1450,7 +1453,7 @@ class RiskEngine:
                     total_abs_notional_pct=bundle.decimal("total_abs_notional_pct"),
                     used_abs_notional=used_abs,
                     leverage=leverage,
-                    remaining_margin_budget=max(remaining_margin, D("0")),
+                    remaining_margin_budget=max(budget, D("0")),
                     fee_rate_one_way=req.fee_rate_one_way,
                     stress_slippage=req.stress_slippage,
                     funding_reserve_ratio=req.funding_reserve_ratio,

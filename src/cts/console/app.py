@@ -191,6 +191,8 @@ class ConsoleApp:
                 return morsel.value if morsel else ""
 
             def _authorized(self) -> bool:
+                if not app.token:
+                    return True  # 空口令模式：仅本机回环监听，直接放行
                 header = self.headers.get("Authorization", "")
                 bearer = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
                 return bearer == app.token or self._cookie_token() == app.token

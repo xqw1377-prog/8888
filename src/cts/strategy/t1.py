@@ -20,6 +20,7 @@ class T1Params:
     exit_lookback: int = 20
     atr_period: int = 20
     stop_multiple: Decimal = Decimal("2.5")
+    take_multiple: Decimal = Decimal("5")
     warmup_bars: int = 120
     version: str = "T1-E0"
 
@@ -132,6 +133,14 @@ def initial_stop(side: Side, fill_price: Decimal, signal_atr: Decimal, params: T
     return D(fill_price) + offset
 
 
+def take_profit_price(side: Side, fill_price: Decimal, signal_atr: Decimal, params: T1Params) -> Decimal:
+    """止盈是入场价加减 5 倍 ATR，等于初始止损距离的两倍，不跟随移动。"""
+    offset = D(params.take_multiple) * D(signal_atr)
+    if side == Side.LONG:
+        return D(fill_price) + offset
+    return D(fill_price) - offset
+
+
 def trail_stop(position: OpenPosition, candles: Sequence[Candle], params: T1Params) -> Decimal:
     atr = atr_sma(candles, params.atr_period)
     offset = D(params.stop_multiple) * atr
@@ -165,6 +174,11 @@ def evaluate_exit(
     updated = replace(updated, stop=trail_stop(updated, candles, params))
 
     mark = D(mark_price) if mark_price is not None else None
+    target = take_profit_price(position.side, position.avg_price, position.signal_atr, params)
+    if mark is not None and position.signal_atr > 0 and position.side == Side.LONG and mark >= target and mark > updated.stop:
+        return updated, ExitDecision("TAKE_PROFIT", updated.side, updated.stop, target, mark, current.close)
+    if mark is not None and position.signal_atr > 0 and position.side == Side.SHORT and mark <= target and mark < updated.stop:
+        return updated, ExitDecision("TAKE_PROFIT", updated.side, updated.stop, target, mark, current.close)
     if mark is not None and position.side == Side.LONG and mark <= updated.stop:
         return updated, ExitDecision("STOP", updated.side, updated.stop, Decimal("0"), mark, current.close)
     if mark is not None and position.side == Side.SHORT and mark >= updated.stop:

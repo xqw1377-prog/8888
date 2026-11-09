@@ -1,4 +1,4 @@
-"""杠杆只读合同：研究上限 3 倍，生产保持 2 倍，保证金与合同是同一个数。"""
+"""杠杆只读合同：研究上限 5 倍（所有者指示 2026-11-09），生产保持 2 倍。"""
 
 from __future__ import annotations
 
@@ -61,9 +61,9 @@ def test_production_cannot_raise_leverage_above_baseline(tmp_path) -> None:
 
 def test_leverage_above_research_cap_is_rejected(tmp_path) -> None:
     engine = make_engine(tmp_path)
-    engine.install_parameters(leverage_bundle("4"), now=NOW)
+    engine.install_parameters(leverage_bundle("6"), now=NOW)
     with pytest.raises(ParameterAdmissionError) as err:
-        engine.reserve([req("BTCUSDT", "s-lev-4")], now=NOW)
+        engine.reserve([req("BTCUSDT", "s-lev-6")], now=NOW)
     assert err.value.reason_code == "LEVERAGE_CONTRACT_MISMATCH"
 
 
@@ -138,7 +138,7 @@ def test_non_finite_leverage_is_rejected_on_reserve(tmp_path) -> None:
 
 def test_replay_rejects_leverage_above_research_cap(tmp_path) -> None:
     ledger = Ledger("acct", path=str(tmp_path / "ledger.db"))
-    config = ReplayConfig(params=T1Params(), leverage=D("4"))
+    config = ReplayConfig(params=T1Params(), leverage=D("6"))
     with pytest.raises(ParameterAdmissionError) as err:
         replay_t1(ledger=ledger, symbol="BTCUSDT", candles=(), marks=(), config=config, venue="SIM")
     assert err.value.reason_code == "LEVERAGE_CONTRACT_MISMATCH"

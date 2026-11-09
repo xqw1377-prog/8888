@@ -33,16 +33,20 @@ from cts.execution.live import (
 )
 from cts.ledger.models import Side
 from cts.risk.engine import RiskEngine
-from cts.risk.models import ReserveRequest
+from cts.risk.models import ParameterBundle, ParameterStatus, ReserveRequest, RuntimeMode
+from cts.risk.parameters import PROPOSED_VALUES, RESEARCH_LEVERAGE_CAP, bundle_hash
 from cts.strategy.t1 import (
     T1Params,
     evaluate_exit,
     evaluate_signal,
     initial_stop,
+    take_profit_price,
 )
 
 STOP_FILE_DEFAULT = "/Users/xinquanwang/8888/var/run/DEMO_TRADER_STOP"
 OWNER_DIRECTIVE_FILE = "/Users/xinquanwang/8888/var/run/OWNER_TRADING_DIRECTIVE"
+ENTRY_MARGIN_PCT = D("0.80")
+ADD_MARGIN_PCT = D("0.20")
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,42 @@ class DemoTraderConfig:
             max_order_age_seconds=150.0,
             aggression=D("0.002"),
         )
+
+
+def demo_research_bundle() -> ParameterBundle:
+    """模拟盘：保证金预算等于当日钱包。其中 80% 给定开仓，20% 只给定补仓。"""
+    values = dict(PROPOSED_VALUES)
+    leverage = format(RESEARCH_LEVERAGE_CAP, "f")
+    values["leverage"] = leverage
+    values["margin_budget_pct"] = "1.00"
+    values["per_symbol_notional_pct"] = leverage
+    values["total_abs_notional_pct"] = leverage
+    version = "risk-v0.3.3-demo-wallet80"
+    status = ParameterStatus.PROPOSED
+    return ParameterBundle(
+        version=version,
+        status=status,
+        values=values,
+        config_hash=bundle_hash(values, version, status),
+    )
+
+
+def wallet_notional_cap(equity: D) -> D:
+    return D(equity) * RESEARCH_LEVERAGE_CAP
+
+
+def add_triggered(position: dict, mark: D) -> bool:
+    """价格逆向达到 1 倍 ATR、尚未触及止损、且本仓还没补过，才动用 20% 预留。"""
+    if position.get("added"):
+        return False
+    atr = D(position.get("atr") or "0")
+    entry = D(position.get("entry") or "0")
+    stop = D(position.get("stop") or "0")
+    if atr <= 0 or entry <= 0 or stop <= 0:
+        return False
+    if position.get("side") == "LONG":
+        return mark <= entry - atr and mark > stop
+    return mark >= entry + atr and mark < stop
 
 
 def round_to_step(value: D, step: D, *, up: bool) -> D:
@@ -176,22 +216,64 @@ class DemoTrader:
 
     # ---- 订单 ----
 
-    def _place(self, *, side: Side, qty: D, ref_price: D, tag: str, stop: Optional[D], exit_order: bool = False) -> Optional[dict]:
+    def _order_cap(self) -> D:
+        grant = getattr(self.session, "grant", None)
+        if grant is not None:
+            return D(grant.max_notional)
+        return self.config.grant_max_notional
+
+    def _sync_wallet_equity(self) -> D:
+        from cts.execution.live import read_demo_wallet
+
+        equity = D(read_demo_wallet()["equity"])
+        self.risk.set_equity(equity, reason="币安模拟盘钱包")
+        return equity
+
+    def _capital_base(self) -> D:
+        current = self._sync_wallet_equity()
+        today = utc_now().date().isoformat()
+        daily = self.state.get("daily_wallet") or {}
+        if daily.get("date") != today:
+            daily = {"date": today, "equity": format(current, "f")}
+            self.state["daily_wallet"] = daily
+            self.log(f"当日钱包 {current}，开仓保证金上限 80%，补仓预留 20%")
+        base = min(current, D(daily["equity"]))
+        self.risk.set_equity(base, reason="当日钱包基数")
+        return base
+
+    def _protect(self, side: str, entry: D, atr: D) -> tuple[D, D]:
+        enum = Side.LONG if side == "LONG" else Side.SHORT
+        width = atr if atr > 0 else entry * D("0.005")
+        stop = initial_stop(enum, entry, width, self.config.params)
+        target = take_profit_price(enum, entry, width, self.config.params)
+        return stop, target
+
+    def _place(
+        self,
+        *,
+        side: Side,
+        qty: D,
+        ref_price: D,
+        tag: str,
+        stop: Optional[D],
+        exit_order: bool = False,
+        max_new_margin: Optional[D] = None,
+    ) -> Optional[dict]:
         tick, step, min_qty = self._filters()
-        qty = max(round_to_step(qty, step, up=False), min_qty)
         if side == Side.LONG:
             price = round_to_step(ref_price * (D("1") + self.config.aggression), tick, up=True)
         else:
             price = round_to_step(ref_price * (D("1") - self.config.aggression), tick, up=False)
-        notional = qty * price
-        if notional > self.config.grant_max_notional:
-            self.log(f"{tag} 名义 {notional} 超限，跳过")
-            return None
         if stop is not None:
             stop_price = D(stop)
         else:
             atr = self._last_atr()
             stop_price = initial_stop(side, price, atr if atr else price * D("0.01"), self.config.params)
+        if exit_order:
+            qty = round_to_step(qty, step, up=False)
+            if qty <= 0:
+                self.log(f"{tag} 数量无效，跳过")
+                return None
         request = ReserveRequest(
             symbol=self.config.symbol,
             side=side,
@@ -201,11 +283,27 @@ class DemoTrader:
             multiplier=D("1"),
             lot_size=step,
             qty=qty if exit_order else None,
+            max_new_margin=None if exit_order else max_new_margin,
         )
-        reservation = self.risk.reserve([request], now=utc_now(), exit_purpose=exit_order)[0]
-        if reservation.qty < qty:
-            qty = reservation.qty
-            notional = qty * price
+        created = self.risk.reserve([request], now=utc_now(), exit_purpose=exit_order)
+        if not created:
+            self.log(f"{tag} 按钱包权益和止损距离没有可下数量，跳过")
+            return None
+        reservation = created[0]
+        if exit_order:
+            if reservation.qty < qty:
+                qty = reservation.qty
+        else:
+            qty = round_to_step(reservation.qty, step, up=False)
+        if qty < min_qty:
+            self.risk.release_unbound_reservation(reservation.reservation_id)
+            self.log(f"{tag} 数量低于最小下单量，已释放预留")
+            return None
+        notional = qty * price
+        if notional > self._order_cap():
+            self.risk.release_unbound_reservation(reservation.reservation_id)
+            self.log(f"{tag} 名义 {notional} 超过钱包对应上限，已释放预留")
+            return None
         coid = f"cts_demo_{tag}_{int(self.clock())}"
         try:
             placed = self.session.submit(
@@ -272,14 +370,31 @@ class DemoTrader:
             pending["applied"] = format(cumulative, "f")
             # 部分成交立即反映到本地持仓，不再等 FILLED
             prev = self.state.get("position")
-            if pending["kind"] == "ENTRY":
-                if prev and prev.get("side") == pending["side"]:
+            if pending["kind"] in ("ENTRY", "ADD"):
+                fill = D(result.get("avgPrice") or result.get("price") or pending.get("ref") or "0")
+                if pending["kind"] == "ADD" and prev and prev.get("side") == pending["side"]:
+                    old_qty = D(prev["qty"])
+                    new_qty = old_qty + delta
+                    average = (old_qty * D(prev.get("entry") or fill) + delta * fill) / new_qty
+                    prev["qty"] = format(new_qty, "f")
+                    prev["entry"] = format(average, "f")
+                    prev["added"] = True
+                elif prev and prev.get("side") == pending["side"]:
                     prev["qty"] = format(D(prev["qty"]) + delta, "f")
                 else:
+                    entry = fill
+                    atr = D(pending.get("atr") or "0")
+                    stop, target = self._protect(pending["side"], entry, atr)
                     self.state["position"] = {
                         "side": pending["side"],
                         "qty": format(cumulative, "f"),
-                        "entry": result.get("avgPrice") or result.get("price"),
+                        "entry": format(entry, "f"),
+                        "atr": format(atr if atr > 0 else entry * D("0.005"), "f"),
+                        "stop": format(stop, "f"),
+                        "take_profit": format(target, "f"),
+                        "extreme": format(entry, "f"),
+                        "added": False,
+                        "entry_time": utc_now().isoformat(),
                         "placed": pending["placed_at"],
                     }
             elif prev:
@@ -366,6 +481,23 @@ class DemoTrader:
                 "WHERE account_id=? AND status='PENDING' AND signal_key LIKE 'demo-%'",
                 (self.risk.account_id,),
             ).fetchall()
+        with self.risk.store.txn() as conn:
+            unknowns = conn.execute(
+                "SELECT reservation_id, signal_key FROM reservations "
+                "WHERE account_id=? AND status='UNKNOWN' AND signal_key LIKE 'demo-%'",
+                (self.risk.account_id,),
+            ).fetchall()
+        for row in unknowns:
+            with self.risk.store.txn() as conn:
+                alloc = conn.execute(
+                    "SELECT client_order_id FROM live_order_allocations WHERE reservation_id=? AND released=0",
+                    (row["reservation_id"],),
+                ).fetchone()
+            if alloc:
+                # 先解除订单占用，预留才可释放
+                self.risk.release_live_order(alloc["client_order_id"])
+            self.risk.release_unbound_reservation(row["reservation_id"])
+            self.log(f"释放已核销订单的 UNKNOWN 预留 {row['reservation_id'][:8]} ({row['signal_key']})")
         for row in rows:
             try:
                 created = datetime.fromisoformat(row["created_at"])
@@ -429,7 +561,16 @@ class DemoTrader:
             if position and not self.state.get("pending"):
                 mark = self._mark()
                 stop = D(position.get("stop") or "0")
-                if mark is not None and stop > 0:
+                target = D(position.get("take_profit") or "0")
+                if mark is not None and target > 0:
+                    hit_target = mark >= target if position["side"] == "LONG" else mark <= target
+                    if hit_target:
+                        opposite = Side.SHORT if position["side"] == "LONG" else Side.LONG
+                        self.state["pending"] = self._place(
+                            side=opposite, qty=D(position["qty"]), ref_price=mark, tag="EXIT", stop=stop, exit_order=True
+                        )
+                        self.log(f"数据降级：标记价 {mark} 触发止盈 {target}")
+                elif mark is not None and stop > 0:
                     hit = mark <= stop if position["side"] == "LONG" else mark >= stop
                     if hit:
                         opposite = Side.SHORT if position["side"] == "LONG" else Side.LONG
@@ -442,26 +583,49 @@ class DemoTrader:
         position = self.state.get("position")
         if position is not None and D(position.get("stop") or "0") <= 0:
             # 恢复状态缺止损：按当前 ATR 重算，避免 stop=0 立即/永不触发
-            side = Side.LONG if position["side"] == "LONG" else Side.SHORT
             atr = self._last_atr_from(bars)
             entry = D(position.get("entry") or format(bars[-1].close, "f"))
-            stop = initial_stop(side, entry, atr if atr and atr > 0 else entry * D("0.005"), self.config.params)
+            stop, target = self._protect(position["side"], entry, atr if atr and atr > 0 else D("0"))
             position["stop"] = format(stop, "f")
-            self.log(f"恢复状态缺止损，按 ATR={atr} 重算 stop={stop}")
+            position["take_profit"] = format(target, "f")
+            position["atr"] = format(atr if atr and atr > 0 else entry * D("0.005"), "f")
+            self.log(f"恢复保护价 stop={stop} 止盈={target}")
         mark = self._mark()
         if position is None and not self.state.get("pending"):
             signal = evaluate_signal(bars, params=self.config.params, has_position=False, has_pending_entry=False)
             if signal is not None:
                 last = bars[-1].close
-                qty = self.config.target_notional / last
-                self.state["pending"] = self._place(
-                    side=signal.side, qty=qty, ref_price=last, tag="ENTRY", stop=None
+                base = self._capital_base()
+                placed = self._place(
+                    side=signal.side,
+                    qty=D("0"),
+                    ref_price=last,
+                    tag="ENTRY",
+                    stop=None,
+                    max_new_margin=base * ENTRY_MARGIN_PCT,
                 )
+                if placed is not None:
+                    placed["atr"] = format(signal.atr, "f")
+                self.state["pending"] = placed
                 self.log(f"入场信号 {signal.side.value} @band={signal.entry_band} atr={signal.atr}")
         elif position is not None and not self.state.get("pending"):
             open_position = _as_open_position(position, self.config.symbol)
             updated, exit_decision = evaluate_exit(open_position, bars, mark_price=mark, params=self.config.params)
             position["stop"] = format(updated.stop, "f")
+            position["extreme"] = format(updated.extreme, "f")
+            if exit_decision is None and mark is not None and add_triggered(position, mark):
+                base = self._capital_base()
+                self.state["pending"] = self._place(
+                    side=Side.LONG if position["side"] == "LONG" else Side.SHORT,
+                    qty=D("0"),
+                    ref_price=mark,
+                    tag="ADD",
+                    stop=D(position["stop"]),
+                    max_new_margin=base * ADD_MARGIN_PCT,
+                )
+                self.log(f"补仓触发 标记价={mark} 使用当日钱包 20% 保证金上限")
+                self._save_state()
+                return True
             if exit_decision is not None:
                 if venue is not None and abs(venue) < D(position["qty"]):
                     self.state["halted"] = "position-mismatch"
@@ -477,7 +641,10 @@ class DemoTrader:
                     stop=D(position["stop"]),
                     exit_order=True,
                 )
-                self.log(f"退出信号 {exit_decision.reason} stop={exit_decision.stop}")
+                self.log(
+                    f"退出信号 {exit_decision.reason} stop={exit_decision.stop} "
+                    f"目标={position.get('take_profit', '')}"
+                )
         self._save_state()
         return True
 
@@ -518,15 +685,21 @@ class DemoTrader:
 def _as_open_position(position: dict, symbol: str):
     from cts.strategy.t1 import OpenPosition
 
+    entry = D(position.get("entry") or "0")
+    raw_time = position.get("entry_time")
+    try:
+        opened = datetime.fromisoformat(raw_time) if raw_time else utc_now() - timedelta(minutes=1)
+    except ValueError:
+        opened = utc_now() - timedelta(minutes=1)
     return OpenPosition(
         symbol=symbol,
         side=Side.LONG if position["side"] == "LONG" else Side.SHORT,
         qty=D(position["qty"]),
-        avg_price=D(position.get("entry") or "0"),
-        signal_atr=D("1"),
+        avg_price=entry,
+        signal_atr=D(position.get("atr") or "0"),
         stop=D(position.get("stop") or "0"),
-        extreme=D(position.get("entry") or "0"),
-        entry_event_time=utc_now() - timedelta(minutes=1),
+        extreme=D(position.get("extreme") or entry),
+        entry_event_time=opened,
     )
 
 
@@ -582,6 +755,19 @@ def build_default(config: DemoTraderConfig, *, proxy: str = "http://127.0.0.1:17
     from cts.risk.store import RiskStore
 
     risk = RiskEngine(RiskStore("/Users/xinquanwang/8888/var/ledger/risk.db"), "local-ledger")
+    from cts.execution.live import read_demo_wallet
+
+    equity = D(read_demo_wallet()["equity"])
+    risk.set_equity(equity, reason="币安模拟盘钱包")
+    with risk.store.txn() as conn:
+        mode = RuntimeMode(risk.store.load_account(conn, "local-ledger")["mode"])
+    if mode == RuntimeMode.SIMULATION:
+        bundle = demo_research_bundle()
+        with risk.store.txn() as conn:
+            installed = risk.store.load_account(conn, "local-ledger")["param_version"]
+        if installed != bundle.version:
+            risk.install_parameters(bundle)
+    config = replace(config, grant_max_notional=wallet_notional_cap(equity))
     grant = LiveGrant(
         granted_by="xinquanwang(会话现场指示)",
         statement=LIVE_GRANT_STATEMENT,
@@ -615,13 +801,18 @@ def build_default(config: DemoTraderConfig, *, proxy: str = "http://127.0.0.1:17
             holder["trader"].session = holder["session"]
             return
         if now >= holder["session"].grant.expires_at - timedelta(minutes=30):
+            from cts.execution.live import read_demo_wallet
+
+            refreshed = D(read_demo_wallet()["equity"])
+            risk.set_equity(refreshed, reason="币安模拟盘钱包")
+            holder["trader"].config = replace(config, grant_max_notional=wallet_notional_cap(refreshed))
             holder["session"] = LiveSession(
                 LiveGrant(
                     granted_by="xinquanwang(会话现场指示)",
                     statement=LIVE_GRANT_STATEMENT,
                     network="TESTNET",
                     account_id="local-ledger",
-                    max_notional=config.grant_max_notional,
+                    max_notional=holder["trader"].config.grant_max_notional,
                     expires_at=now + timedelta(hours=12),
                 ),
                 credentials,

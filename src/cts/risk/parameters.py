@@ -12,8 +12,8 @@ from cts.risk.models import ParameterBundle, ParameterStatus, RuntimeMode
 
 # 已验收的初始保证金杠杆。生产不得提高；提高需要新版本验收。
 INITIAL_MARGIN_LEVERAGE = D("2")
-# 研究路径的上限。合同值不能自行抬高这个上限。
-RESEARCH_LEVERAGE_CAP = D("3")
+# 研究路径的上限（所有者指示 2026-11-09 由 3 上调至 5，待复审）。生产基线仍为 2。
+RESEARCH_LEVERAGE_CAP = D("5")
 
 PROPOSED_VALUES: dict[str, str] = {
     "per_symbol_risk_pct": "0.0020",
@@ -81,7 +81,7 @@ def parse_contract_leverage(values: Mapping[str, str]) -> Decimal:
         )
     if leverage <= 0 or leverage > RESEARCH_LEVERAGE_CAP:
         raise ParameterAdmissionError(
-            "杠杆超出合同：初始保证金 2 倍，研究上限 3 倍",
+            "杠杆超出合同：初始保证金 2 倍，研究上限 5 倍",
             reason_code="LEVERAGE_CONTRACT_MISMATCH",
         )
     return leverage

@@ -14,7 +14,8 @@ from cts.ledger.models import Side
 from cts.risk.engine import RiskEngine
 from cts.risk.models import ReserveRequest
 from cts.strategy.t1 import T1Params
-from cts.ops.demo_trader import DemoTrader, DemoTraderConfig
+from cts.risk.parameters import RESEARCH_LEVERAGE_CAP
+from cts.ops.demo_trader import DemoTrader, DemoTraderConfig, add_triggered, demo_research_bundle, wallet_notional_cap
 
 NOW = datetime(2026, 11, 8, 3, 0, tzinfo=UTC)
 
@@ -198,6 +199,29 @@ def test_corrupt_state_file_halts_instead_of_empty(tmp_path) -> None:
     t.step()
     assert t.state["halted"] == "corrupt-state"
     assert session.submits == []
+
+
+def test_demo_research_bundle_uses_the_cap() -> None:
+    bundle = demo_research_bundle()
+    assert bundle.values["leverage"] == "5"  # 所有者指示 2026-11-09：研究上限 3 -> 5
+    assert bundle.values["margin_budget_pct"] == "1.00"
+    assert wallet_notional_cap(D("5000")) == D("5000") * RESEARCH_LEVERAGE_CAP
+    held = {"side": "LONG", "entry": "100", "atr": "2", "stop": "95", "added": False}
+    assert add_triggered(held, D("98"))
+    assert not add_triggered(held, D("99"))
+    assert not add_triggered({**held, "added": True}, D("98"))
+    assert not add_triggered(held, D("95"))
+
+
+def test_entry_size_comes_from_equity_and_stop_not_fixed_notional(tmp_path) -> None:
+    session = FakeSession([])
+    t = trader(tmp_path, session=session)
+    pending = t._place(side=Side.LONG, qty=D("999"), ref_price=D("100"), tag="ENTRY", stop=D("99"))
+    assert pending is not None
+    submitted = session.submits[0][2]
+    assert submitted != D("999")
+    assert submitted < D("30")
+    assert submitted > D("1")
 
 
 def test_restored_position_without_stop_recomputes_nonzero_stop(tmp_path) -> None:

@@ -75,6 +75,27 @@ def test_stop_only_ratchets_in_favor() -> None:
         assert decision.mark_price <= later.stop
 
 
+def test_take_profit_is_twice_the_initial_stop_distance() -> None:
+    from cts.strategy.t1 import OpenPosition, apply_fill_to_state, take_profit_price
+
+    params = T1Params()
+    assert take_profit_price(Side.LONG, D("100"), D("2"), params) == D("110")
+    assert take_profit_price(Side.SHORT, D("100"), D("2"), params) == D("90")
+    bars = breakout_series(130)
+    signal = evaluate_signal(bars[:-1], params=params, has_position=False, has_pending_entry=False)
+    assert signal is not None
+    pos = apply_fill_to_state(signal=signal, fill_price=D("100"), qty=D("1"), params=params)
+    target = take_profit_price(pos.side, pos.avg_price, pos.signal_atr, params)
+    _, decision = evaluate_exit(pos, bars[:-1], mark_price=target, params=params)
+    assert decision is not None and decision.reason == "TAKE_PROFIT"
+    untouched = OpenPosition(
+        symbol="BTCUSDT", side=Side.LONG, qty=D("1"), avg_price=D("100"),
+        signal_atr=D("2"), stop=D("95"), extreme=D("100"), entry_event_time=pos.entry_event_time,
+    )
+    _, still = evaluate_exit(untouched, bars[:-1], mark_price=D("101"), params=params)
+    assert still is None or still.reason != "TAKE_PROFIT"
+
+
 def test_mark_stop_triggers_exit() -> None:
     bars = breakout_series(130)
     signal = evaluate_signal(bars[:-1], params=T1Params(), has_position=False, has_pending_entry=False)
