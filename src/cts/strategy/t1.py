@@ -25,6 +25,21 @@ class T1Params:
     version: str = "T1-E0"
 
 
+def t1_params_binding_hash(params: "T1Params") -> str:
+    """全字段绑定：任一策略参数（含 take_multiple、stop_multiple、回看期）变化都必须改变哈希。"""
+    from cts.checksum import sha256_hex
+
+    return sha256_hex({
+        "version": params.version,
+        "entry_lookback": str(params.entry_lookback),
+        "exit_lookback": str(params.exit_lookback),
+        "atr_period": str(params.attr_period) if hasattr(params, "attr_period") else str(params.atr_period),
+        "stop_multiple": format(params.stop_multiple, "f"),
+        "take_multiple": format(params.take_multiple, "f"),
+        "warmup_bars": str(params.warmup_bars),
+    })
+
+
 @dataclass(frozen=True)
 class SignalIntent:
     symbol: str

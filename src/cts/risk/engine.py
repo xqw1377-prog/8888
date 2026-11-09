@@ -1571,13 +1571,14 @@ class RiskEngine:
             ratio = remaining / pos.qty if pos.qty > 0 else D("0")
             conn.execute(
                 """
-                UPDATE positions SET qty=?, notional=?, risk_amount=?, side=?, position_version=position_version+1
+                UPDATE positions SET qty=?, notional=?, risk_amount=?, isolated_margin=?, side=?, position_version=position_version+1
                 WHERE account_id=? AND symbol=?
                 """,
                 (
                     format(remaining, "f"),
                     format(pos.notional * ratio, "f"),
                     format(pos.risk_amount * ratio, "f"),
+                    format(pos.isolated_margin * ratio, "f"),
                     pos.side.value if remaining > 0 else None,
                     self.account_id,
                     res.symbol,

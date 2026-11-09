@@ -41,6 +41,7 @@ from cts.strategy.t1 import (
     evaluate_signal,
     initial_stop,
     take_profit_price,
+    t1_params_binding_hash,
 )
 
 STOP_FILE_DEFAULT = "/Users/xinquanwang/8888/var/run/DEMO_TRADER_STOP"
@@ -84,6 +85,7 @@ def demo_research_bundle() -> ParameterBundle:
     leverage = format(RESEARCH_LEVERAGE_CAP, "f")
     values["leverage"] = leverage
     values["margin_budget_pct"] = "1.00"
+    values["t1_params_hash"] = t1_params_binding_hash(T1Params(entry_lookback=20, exit_lookback=10, atr_period=14, warmup_bars=60, version="T1-DEMO-1M"))
     values["per_symbol_notional_pct"] = leverage
     values["total_abs_notional_pct"] = leverage
     version = "risk-v0.3.3-demo-wallet80"
@@ -300,6 +302,10 @@ class DemoTrader:
             self.log(f"{tag} 数量低于最小下单量，已释放预留")
             return None
         notional = qty * price
+        if notional < D("50"):
+            self.risk.release_unbound_reservation(reservation.reservation_id)
+            self.log(f"{tag} 名义 {notional} 低于交易所最小 50，已释放预留")
+            return None
         if notional > self._order_cap():
             self.risk.release_unbound_reservation(reservation.reservation_id)
             self.log(f"{tag} 名义 {notional} 超过钱包对应上限，已释放预留")
@@ -455,6 +461,9 @@ class DemoTrader:
             return
         for row in holds:
             coid = row["client_order_id"]
+            if ":QUERYING:" in row["hold_id"] or ":CANCELING:" in row["hold_id"]:
+                # 活动请求的阻断属于其所属会话，不因订单缓存显示终态而绕过所有权
+                continue
             try:
                 order = self.session.orders.get(coid)
             except Exception:
@@ -552,11 +561,15 @@ class DemoTrader:
             venue = self._venue_position()
         except Exception as exc:
             reconcile_error = f"{type(exc).__name__}: {exc}"
-        if venue is None and not self.state.get("pending"):
-            # 对账未知时不得下任何新单：入场会叠加未知敞口，反向平仓无仅减仓保证可能翻仓
-            self.log(f"仓位核对失败，本轮不触发交易 {reconcile_error}")
+        position_now = self.state.get("position")
+        if venue is None and not self.state.get("pending") and position_now is None:
+            # 对账未知且空仓：不得开新仓（会叠加未知敞口）
+            self.log(f"仓位核对失败且空仓，本轮不开新仓 {reconcile_error}")
             self._save_state()
             return True
+        if venue is None and position_now is not None:
+            # 对账未知但持仓在场：不得开新仓/补仓，但退出管理（含降级止损）必须继续尝试
+            self.log(f"仓位核对失败但持仓在场，仅继续退出管理 {reconcile_error}")
         if venue is not None and not self.state.get("pending"):
             if halted == "position-mismatch":
                 if venue == self._signed_local():
@@ -588,14 +601,15 @@ class DemoTrader:
                 mark = self._mark()
                 stop = D(position.get("stop") or "0")
                 target = D(position.get("take_profit") or "0")
+                hit_target = False
                 if mark is not None and target > 0:
                     hit_target = mark >= target if position["side"] == "LONG" else mark <= target
-                    if hit_target:
-                        opposite = Side.SHORT if position["side"] == "LONG" else Side.LONG
-                        self.state["pending"] = self._place(
-                            side=opposite, qty=D(position["qty"]), ref_price=mark, tag="EXIT", stop=stop, exit_order=True
-                        )
-                        self.log(f"数据降级：标记价 {mark} 触发止盈 {target}")
+                if hit_target:
+                    opposite = Side.SHORT if position["side"] == "LONG" else Side.LONG
+                    self.state["pending"] = self._place(
+                        side=opposite, qty=D(position["qty"]), ref_price=mark, tag="EXIT", stop=stop, exit_order=True
+                    )
+                    self.log(f"数据降级：标记价 {mark} 触发止盈 {target}")
                 elif mark is not None and stop > 0:
                     hit = mark <= stop if position["side"] == "LONG" else mark >= stop
                     if hit:
@@ -639,7 +653,17 @@ class DemoTrader:
             updated, exit_decision = evaluate_exit(open_position, bars, mark_price=mark, params=self.config.params)
             position["stop"] = format(updated.stop, "f")
             position["extreme"] = format(updated.extreme, "f")
-            if exit_decision is None and mark is not None and add_triggered(position, mark):
+            if exit_decision is not None and exit_decision.reason == "TREND":
+                # 1 分钟通道大约十分钟就反向。5 倍合约不按这个提前平仓，只保留止损和止盈。
+                if not position.get("trend_held"):
+                    self.log(
+                        f"1 分钟通道已碰到 {exit_decision.trend_level}，5 倍合约继续持有，只等止损或止盈"
+                    )
+                    position["trend_held"] = True
+                exit_decision = None
+            elif position.get("trend_held"):
+                position.pop("trend_held", None)
+            if exit_decision is None and venue is not None and mark is not None and add_triggered(position, mark):
                 base = self._capital_base()
                 self.state["pending"] = self._place(
                     side=Side.LONG if position["side"] == "LONG" else Side.SHORT,

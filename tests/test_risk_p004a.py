@@ -350,7 +350,7 @@ def test_opposite_equal_qty_fill_reduces_position(tmp_path) -> None:
     view = engine.occupancy()
     assert view.positions[0].qty == 0
     assert view.positions[0].side is None
-    assert view.isolated_margin == long_res.notional / D("2")        # 保证金保持到清仓释放
+    assert view.isolated_margin == 0                                 # 数量归零时保证金一并释放
 
     over = engine.reserve(
         [ReserveRequest(

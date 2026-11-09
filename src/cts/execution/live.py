@@ -774,6 +774,52 @@ def read_demo_marks() -> dict[str, str]:
     return marks
 
 
+def parse_demo_positions(body: dict) -> list[dict[str, str]]:
+    """把持仓风险读数收成看板用的行。数量为零的合约不占一行。"""
+    rows = []
+    for row in body.get("positions") or []:
+        amount = D(str(row.get("positionAmt") or "0"))
+        if amount == 0:
+            continue
+        qty = abs(amount)
+        mark = D(str(row.get("markPrice") or "0"))
+        entry = D(str(row.get("entryPrice") or "0"))
+        upnl = D(str(row.get("unRealizedProfit") or row.get("unrealizedProfit") or "0"))
+        margin = D(str(row.get("isolatedWallet") or row.get("initialMargin") or "0"))
+        rows.append(
+            {
+                "symbol": str(row.get("symbol") or ""),
+                "qty": format(qty, "f"),
+                "side": "多" if amount > 0 else "空",
+                "entry": format(entry, "f"),
+                "leverage": str(row.get("leverage") or ""),
+                "upnl": format(upnl, "f"),
+                "roe": format(upnl / margin, "f") if margin > 0 else "",
+                "margin": format(margin, "f"),
+                "notional": format(qty * mark, "f"),
+                "liq": str(row.get("liquidationPrice") or ""),
+                "freshness": "KNOWN",
+            }
+        )
+    return rows
+
+
+def read_demo_positions(now: datetime | None = None) -> list[dict[str, str]]:
+    load_local_env()
+    if os.environ.get("CTS_BINANCE_NETWORK") != "TESTNET":
+        raise CtsError("只读取币安模拟盘持仓，未访问实盘", reason_code="LIVE_TRADING_HOLD")
+    creds = credentials_from_env()
+    moment = now or datetime.now(timezone.utc)
+    params = [("recvWindow", "5000"), ("timestamp", _millis(moment))]
+    body = open_testnet_transport()(
+        "GET",
+        "/fapi/v2/positionRisk",
+        _sign(params, creds.api_secret),
+        {"X-MBX-APIKEY": creds.api_key},
+    )
+    return [row for row in parse_demo_positions(body) if row["symbol"] in {"BTCUSDT", "ETHUSDT"}]
+
+
 def read_demo_wallet(now: datetime | None = None) -> dict[str, str]:
     load_local_env()
     if os.environ.get("CTS_BINANCE_NETWORK") != "TESTNET":

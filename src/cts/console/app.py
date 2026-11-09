@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+import time
 from dataclasses import dataclass, field
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,8 +14,27 @@ from urllib.parse import urlparse
 
 from cts import LIVE_TRADING_AUTHORIZATION, __version__
 from cts.clock import utc_now
-from cts.ledger.models import AccountBucket
+from cts.ledger.models import AccountBucket, Side
 from cts.money import D
+
+ORDERS_DB_PATH = "/Users/xinquanwang/8888/var/ledger/orders.db"
+TRADER_STATE_PATH = "/Users/xinquanwang/8888/var/run/demo_trader_state.json"
+EQUITY_CURVE_PATH = "/Users/xinquanwang/8888/var/run/demo_equity_curve.json"
+TRADER_LOG_PATH = "/Users/xinquanwang/8888/var/run/demo_trader.log"
+_POSITION_KEYS = (
+    "side",
+    "entry",
+    "stop",
+    "take_profit",
+    "leverage",
+    "upnl",
+    "roe",
+    "margin",
+    "notional",
+    "liq",
+    "atr",
+    "added",
+)
 
 
 REASONS = {
@@ -49,8 +71,10 @@ class ConsoleState:
     last_reconcile_at: str = ""
     approvals: list[str] = field(default_factory=list)
     marks: dict[str, str] = field(default_factory=dict)
-    klines: dict[str, list[str]] = field(default_factory=dict)
+    klines: dict[str, list] = field(default_factory=dict)
     recent_orders: list[dict[str, str]] = field(default_factory=list)
+    history: list[dict[str, str]] = field(default_factory=list)
+    desk: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_ledger(cls, ledger, *, occupancy=None, mode: str = "SIMULATION") -> "ConsoleState":
@@ -60,7 +84,16 @@ class ConsoleState:
         for pos in ledger.positions():
             if pos.qty <= 0:
                 continue
-            positions.append({"symbol": pos.symbol, "qty": format(pos.qty, "f"), "freshness": "KNOWN"})
+            side_text = {Side.LONG: "多", Side.SHORT: "空"}.get(pos.side, "")
+            positions.append(
+                {
+                    "symbol": pos.symbol,
+                    "qty": format(pos.qty, "f"),
+                    "freshness": "KNOWN",
+                    "side": side_text,
+                    "entry": format(pos.avg_price, "f"),
+                }
+            )
             gross += pos.qty * pos.avg_price * pos.multiplier
         fills, traces = _trade_chains(events)
         present = bool(events)
@@ -139,20 +172,40 @@ class ConsoleApp:
         self.watch_demo = watch_demo
         self._idempotency: dict[str, tuple[str, dict]] = {}
         self.httpd: Optional[ThreadingHTTPServer] = None
+        self._refresh_lock = threading.Lock()
+        self._refreshed_at = 0.0
+        self._kline_at = 0.0
+        self._btc_bars: list = []
 
     def refresh_demo_wallet(self) -> None:
-        from cts.execution.live import read_demo_wallet
-
+        if not self._refresh_lock.acquire(blocking=False):
+            return
         try:
-            apply_venue_wallet(self.state, read_demo_wallet(), as_of=utc_now().isoformat())
-        except Exception:
-            self.state.books["source"] = "币安模拟盘读取失败"
-            self.state.books["wallet"] = "暂无证据"
-            self.state.books["available"] = "暂无证据"
-            self.state.books["unrealized"] = "暂无证据"
-            self.state.metrics["data_freshness"] = "币安模拟盘读取失败"
-            self.state.equity = None
-        self.refresh_demo_marks()
+            now = time.monotonic()
+            if now - self._refreshed_at < 12:
+                return
+            from cts.execution.live import read_demo_wallet
+
+            try:
+                as_of = utc_now().isoformat()
+                apply_venue_wallet(self.state, read_demo_wallet(), as_of=as_of)
+                if self.state.equity:
+                    try:
+                        self.state.curve = record_demo_equity(self.state.equity, at=as_of)
+                    except (OSError, ValueError):
+                        pass
+            except Exception:
+                self.state.books["source"] = "币安模拟盘读取失败"
+                self.state.books["wallet"] = "暂无证据"
+                self.state.books["available"] = "暂无证据"
+                self.state.books["unrealized"] = "暂无证据"
+                self.state.metrics["data_freshness"] = "币安模拟盘读取失败"
+                self.state.equity = None
+            self.refresh_demo_marks()
+            self.refresh_demo_positions()
+            self._refreshed_at = time.monotonic() - (0 if self.state.marks else 10)
+        finally:
+            self._refresh_lock.release()
 
     def refresh_demo_marks(self) -> None:
         from cts.execution.live import read_demo_marks
@@ -160,26 +213,87 @@ class ConsoleApp:
         try:
             self.state.marks = read_demo_marks()
         except Exception:
-            self.state.marks = {}
+            pass
+        if self.state.klines and time.monotonic() - self._kline_at < 60:
+            return
         try:
+            from datetime import timedelta
+
             from cts.data.binance_feed import BinanceDataFeed, DataPullAuthorization
             from cts.data.store import DataStore
-            from cts.clock import utc_now
-            from datetime import timedelta
 
             feed = BinanceDataFeed(
                 DataStore(),
                 DataPullAuthorization(granted_by="console", expires_at=utc_now() + timedelta(minutes=30), max_requests=8),
             )
-            klines: dict[str, list[str]] = {}
+            klines: dict[str, list] = {}
+            self._btc_bars = []
             for symbol in ("BTCUSDT", "ETHUSDT"):
                 bars = feed.fetch_candles(symbol, "1m", 90)
-                klines[symbol] = [format(bar.close, "f") for bar in bars[-90:]]
+                closed = [bar for bar in bars if bar.is_closed][-90:]
+                if symbol == "BTCUSDT":
+                    self._btc_bars = closed
+                klines[symbol] = [
+                    {
+                        "o": format(bar.open, "f"),
+                        "h": format(bar.high, "f"),
+                        "l": format(bar.low, "f"),
+                        "c": format(bar.close, "f"),
+                    }
+                    for bar in closed
+                ]
             self.state.klines = klines
+            self._kline_at = time.monotonic()
         except Exception:
-            self.state.klines = {}
+            if not self.state.klines:
+                self.state.klines = {}
 
-    def serve(self) -> int:
+    def refresh_demo_positions(self) -> None:
+        from cts.execution.live import read_demo_positions
+
+        trader = _trader_snapshot()
+        try:
+            rows = read_demo_positions()
+        except Exception:
+            rows = None
+        if rows is not None:
+            self.state.positions = merge_desk_position(rows, trader.get("position"))
+            equity_text = self.state.equity or ""
+            if equity_text and equity_text != "暂无证据":
+                equity = D(equity_text)
+                if equity > 0:
+                    gross = sum((D(row.get("notional") or "0") for row in self.state.positions), D("0"))
+                    self.state.metrics["gross_leverage"] = format((gross / equity).quantize(D("0.01")), "f")
+        self.state.settings = {
+            **(self.state.settings or _settings(self.state.mode)),
+            "connection": "币安模拟盘",
+            "credentials": "模拟盘只读，不显示密钥",
+        }
+        self.state.desk = build_demo_desk(trader, bars=self._btc_bars, has_position=bool(self.state.positions))
+        if trader.get("halted"):
+            self.state.system_state = "HALTED"
+        elif trader.get("_age") is not None and float(trader["_age"]) < 45:
+            self.state.system_state = "RUNNING"
+        elif trader:
+            self.state.system_state = "STALE"
+        try:
+            filled = read_filled_demo_orders()
+        except (OSError, ValueError):
+            filled = []
+        self.state.history = position_rounds(filled)[:30]
+        self.state.recent_orders = [
+            {
+                "time": _beijing(str(order["time"])),
+                "symbol": order["symbol"],
+                "side": "BUY" if order["side"] in ("BUY", "LONG") else "SELL",
+                "qty": order["executed"],
+                "price": format(D(order["price"]).quantize(D("0.01")), "f"),
+                "status": "已成交",
+            }
+            for order in reversed(filled[-15:])
+        ]
+
+    def serve(self, port: int = 0) -> int:
         app = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -354,7 +468,7 @@ class ConsoleApp:
                 app._idempotency[key] = (signature, payload)
                 self._send(200, payload)
 
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         port = self.httpd.server_address[1]
         import threading
 
@@ -474,6 +588,281 @@ def _ledger_report(events, *, fees, funding, drawdown: str) -> dict[str, str]:
     }
 
 
+def _equity_rows(path: str) -> list[dict[str, str]]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(loaded, list):
+        return []
+    return [row for row in loaded if isinstance(row, dict) and row.get("t") and row.get("equity")]
+
+
+def _seed_equity_rows(log_path: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    try:
+        with open(log_path, encoding="utf-8") as handle:
+            for line in handle:
+                if not line.startswith("[") or "当日钱包 " not in line:
+                    continue
+                stamp, _, rest = line.partition("]")
+                number = ""
+                tail = rest.split("当日钱包 ", 1)[-1]
+                for token in tail.replace("，", " ").split():
+                    if token.count(".") == 1 and token.replace(".", "", 1).isdigit():
+                        number = token
+                        break
+                if not number:
+                    continue
+                rows.append({"t": stamp[1:], "equity": number})
+    except OSError:
+        return []
+    return rows
+
+
+def record_demo_equity(
+    equity: str,
+    *,
+    at: str,
+    curve_path: str = EQUITY_CURVE_PATH,
+    log_path: str = TRADER_LOG_PATH,
+) -> list[str]:
+    """把读到的模拟盘权益按时间留下。相同权益不重复记点。"""
+    rows = _equity_rows(curve_path)
+    if not rows:
+        rows = _seed_equity_rows(log_path)
+    if not rows or D(rows[-1]["equity"]) != D(equity):
+        rows.append({"t": at, "equity": equity})
+    os.makedirs(os.path.dirname(curve_path), exist_ok=True)
+    with open(curve_path, "w", encoding="utf-8") as handle:
+        json.dump(rows[-500:], handle, ensure_ascii=False)
+    return [format(D(row["equity"]).quantize(D("0.01")), "f") for row in rows[-500:]]
+
+
+def _trader_snapshot(path: str = TRADER_STATE_PATH) -> dict:
+    try:
+        age = time.time() - os.path.getmtime(path)
+        with open(path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    loaded["_age"] = age
+    return loaded
+
+
+def merge_desk_position(rows: list[dict[str, str]], local: object) -> list[dict[str, str]]:
+    """交易所持仓带上交易器记下的止损和止盈。本地有仓、交易所没有时单独标出。"""
+    merged = [dict(row) for row in rows]
+    if not isinstance(local, dict):
+        return merged
+    side = "多" if local.get("side") == "LONG" else "空" if local.get("side") == "SHORT" else ""
+    protection = {
+        "stop": str(local.get("stop") or ""),
+        "take_profit": str(local.get("take_profit") or ""),
+        "atr": str(local.get("atr") or ""),
+        "added": "已补仓" if local.get("added") else "未补仓",
+    }
+    matched = False
+    for item in merged:
+        if item.get("symbol") == "BTCUSDT" and item.get("side") == side:
+            item.update({key: value for key, value in protection.items() if value})
+            matched = True
+    if not matched and local.get("qty"):
+        merged.append(
+            {
+                "symbol": "BTCUSDT",
+                "qty": str(local.get("qty") or ""),
+                "side": side,
+                "entry": str(local.get("entry") or ""),
+                "freshness": "LOCAL",
+                **protection,
+            }
+        )
+    return merged
+
+
+def position_rounds(orders: list[dict]) -> list[dict[str, str]]:
+    """把已成交订单收成完整的开平回合。还没平掉的一笔不放进历史。"""
+    signed = D("0")
+    entry_qty = D("0")
+    entry_notional = D("0")
+    exit_qty = D("0")
+    exit_notional = D("0")
+    opened = ""
+    side_name = ""
+    symbol = ""
+    rounds: list[dict[str, str]] = []
+
+    def finish(closed_at: str) -> None:
+        nonlocal entry_qty, entry_notional, exit_qty, exit_notional, opened, side_name
+        if entry_qty <= 0 or exit_qty <= 0:
+            entry_qty = exit_qty = entry_notional = exit_notional = D("0")
+            opened = ""
+            return
+        entry = entry_notional / entry_qty
+        exit_price = exit_notional / exit_qty
+        pnl = exit_notional - entry_notional if side_name == "多" else entry_notional - exit_notional
+        rounds.append(
+            {
+                "symbol": symbol,
+                "side": side_name,
+                "qty": format(entry_qty, "f"),
+                "entry": format(entry.quantize(D("0.01")), "f"),
+                "exit": format(exit_price.quantize(D("0.01")), "f"),
+                "pnl": format(pnl.quantize(D("0.01")), "f"),
+                "opened": _beijing(opened),
+                "closed": _beijing(closed_at),
+            }
+        )
+        entry_qty = exit_qty = entry_notional = exit_notional = D("0")
+        opened = ""
+
+    for order in orders:
+        qty = D(order.get("executed") or "0")
+        if qty <= 0:
+            continue
+        price = D(order.get("price") or "0")
+        opening_side = order.get("side") in ("BUY", "LONG", "多")
+        delta = qty if opening_side else -qty
+        if signed == 0:
+            side_name = "多" if delta > 0 else "空"
+            symbol = order.get("symbol") or ""
+            opened = str(order.get("time") or "")
+        reducing = signed != 0 and ((signed > 0) != (delta > 0))
+        if not reducing:
+            entry_qty += qty
+            entry_notional += qty * price
+            signed += delta
+            continue
+        close_qty = min(qty, abs(signed))
+        exit_qty += close_qty
+        exit_notional += close_qty * price
+        signed += close_qty if delta > 0 else -close_qty
+        if signed == 0:
+            finish(str(order.get("time") or ""))
+        leftover = qty - close_qty
+        if leftover > 0:
+            side_name = "多" if delta > 0 else "空"
+            symbol = order.get("symbol") or symbol
+            opened = str(order.get("time") or "")
+            entry_qty = leftover
+            entry_notional = leftover * price
+            exit_qty = D("0")
+            exit_notional = D("0")
+            signed = leftover if delta > 0 else -leftover
+    return list(reversed(rounds))
+
+
+def _beijing(iso: str) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    text = (iso or "").replace("Z", "+00:00")
+    if not text:
+        return ""
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return iso
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    local = moment.astimezone(timezone(timedelta(hours=8)))
+    return local.strftime("%m-%d %H:%M")
+
+
+def read_filled_demo_orders(path: str = ORDERS_DB_PATH) -> list[dict]:
+    import sqlite3
+
+    if not os.path.exists(path):
+        return []
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as conn:
+            rows = conn.execute(
+                """
+                SELECT updated_at, symbol, side, executed_qty, price, body
+                FROM live_orders
+                WHERE status='FILLED'
+                ORDER BY updated_at ASC
+                """
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+    orders = []
+    for updated_at, symbol, side, executed, price, body in rows:
+        fill_price = price
+        try:
+            payload = json.loads(body or "{}")
+            avg = payload.get("avgPrice")
+            if avg not in (None, "") and D(str(avg)) > 0:
+                fill_price = str(avg)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        try:
+            if D(executed or "0") <= 0:
+                continue
+        except ValueError:
+            continue
+        orders.append(
+            {
+                "time": updated_at,
+                "symbol": symbol,
+                "side": side,
+                "executed": str(executed),
+                "price": str(fill_price),
+            }
+        )
+    return orders
+
+
+def build_demo_desk(trader: dict, *, bars: list, has_position: bool) -> dict[str, str]:
+    from cts.risk.parameters import RESEARCH_LEVERAGE_CAP
+    from cts.strategy.indicators import atr_sma
+    from cts.strategy.t1 import T1Params, evaluate_signal
+
+    params = T1Params(entry_lookback=20, exit_lookback=10, atr_period=14, warmup_bars=60, version="T1-DEMO-1M")
+    multiples = T1Params()
+    age = trader.get("_age")
+    if trader.get("halted"):
+        trader_state = "熔断"
+    elif isinstance(age, (int, float)) and age < 45:
+        trader_state = "运行中"
+    elif trader:
+        trader_state = "未见新心跳"
+    else:
+        trader_state = "未读到状态"
+    signal_name = "HOLD" if has_position else "NONE"
+    band = ""
+    atr = ""
+    if len(bars) >= params.atr_period:
+        atr = format(atr_sma(bars, params.atr_period), "f")
+    if bars:
+        found = evaluate_signal(bars, params=params, has_position=False, has_pending_entry=False)
+        if found is not None:
+            signal_name = found.side.value if not has_position else "HOLD"
+            band = format(found.entry_band, "f")
+            atr = format(found.atr, "f")
+    halted = str(trader.get("halted") or "")
+    return {
+        "name": params.version,
+        "symbol": "BTCUSDT",
+        "interval": "1m",
+        "directions": "多空都做，同一时间只持有一仓",
+        "stop": f"{multiples.stop_multiple}×ATR，只向有利方向移动",
+        "take_profit": f"{multiples.take_multiple}×ATR，按成交价固定",
+        "entry_margin": "当日钱包的 80% 作为开仓保证金上限",
+        "add_margin": "当日钱包的 20% 只用于一次补仓，逆向达到 1×ATR 且未碰到止损",
+        "hold": "5 倍合约只在止损或止盈时平仓，1 分钟通道碰到也不提前平",
+        "leverage": format(RESEARCH_LEVERAGE_CAP, "f"),
+        "trader": trader_state,
+        "halted": halted,
+        "signal": signal_name,
+        "signal_band": band,
+        "signal_atr": atr,
+    }
+
+
 def apply_venue_wallet(state: ConsoleState, venue: dict[str, str], *, as_of: str) -> None:
     if state.books.get("source") == "本地账本":
         state.books["local_equity"] = state.equity or ""
@@ -560,7 +949,11 @@ def overview_payload(state: ConsoleState) -> dict:
     for row in state.positions:
         freshness = row.get("freshness", "UNKNOWN")
         qty = "待核对" if freshness == "UNKNOWN" else row.get("qty", "待核对")
-        positions.append({"symbol": row.get("symbol", ""), "qty": qty, "freshness": freshness})
+        item = {"symbol": row.get("symbol", ""), "qty": qty, "freshness": freshness}
+        for key in _POSITION_KEYS:
+            if row.get(key):
+                item[key] = row[key]
+        positions.append(item)
     live_fills = [row for row in state.fills if row.get("origin") == "LIVE"]
     metrics = _filled(
         state.metrics,
@@ -611,7 +1004,11 @@ def overview_payload(state: ConsoleState) -> dict:
         "curve": state.curve,
         "traces": list(state.traces.values()),
         "approvals": state.approvals,
-        "marks": dict(state.marks), "klines": dict(state.klines), "recent_orders": list(state.recent_orders),
+        "marks": dict(state.marks),
+        "klines": {symbol: list(bars) for symbol, bars in state.klines.items()},
+        "recent_orders": list(state.recent_orders),
+        "history": list(state.history),
+        "desk": dict(state.desk),
         "risk_coefficient": state.risk_coefficient,
         "last_reconcile_at": state.last_reconcile_at or "暂无证据",
     }
@@ -680,11 +1077,11 @@ CONSOLE_HTML = """<!DOCTYPE html>
   .brand { display:flex; align-items:center; gap:10px; color:inherit; text-decoration:none; font-weight:650; white-space:nowrap; }
   .brand b { color:var(--blue); font-weight:750; letter-spacing:.04em; }
   .logo { width:28px; height:28px; border-radius:8px; background:var(--blue); display:grid; place-items:center; }
-  nav { display:flex; gap:18px; align-items:center; }
-  button.tab { background:transparent; border:0; color:#5c6578; padding:8px 0; cursor:pointer; }
+  nav { display:flex; gap:14px; align-items:center; flex:none; }
+  button.tab { background:transparent; border:0; color:#5c6578; padding:8px 0; cursor:pointer; white-space:nowrap; }
   button.tab[aria-current="true"] { color:var(--blue); box-shadow:inset 0 -2px 0 var(--blue); font-weight:650; }
   button.tab.ghost { color:var(--muted); }
-  .search { margin-left:auto; background:#f6f8fc; border:1px solid var(--line); border-radius:999px; padding:7px 14px; min-width:220px; }
+  .search { margin-left:auto; background:#f6f8fc; border:1px solid var(--line); border-radius:999px; padding:7px 14px; width:200px; flex:none; }
   .search input { border:0; background:transparent; width:100%; outline:none; color:inherit; }
   .pill { display:flex; align-items:center; gap:6px; background:var(--blue-soft); color:var(--blue); border-radius:999px; padding:6px 12px; white-space:nowrap; font-size:13px; }
   .dot { width:7px; height:7px; border-radius:50%; background:var(--blue); }
@@ -719,10 +1116,11 @@ CONSOLE_HTML = """<!DOCTYPE html>
   .plot-empty, .empty-plot { min-height:220px; display:grid; place-items:center; color:var(--muted); background:
     linear-gradient(to top, transparent 31px, var(--line) 32px) 0 0 / 100% 32px;
     border-radius:12px; }
-  .quotes { display:flex; justify-content:space-between; gap:12px; margin-bottom:8px; }
-  .quotes b { display:block; font-size:13px; }
-  .quotes strong { display:block; font-size:22px; font-variant-numeric:tabular-nums; }
-  .quotes em { display:block; font-style:normal; color:var(--muted); font-size:12px; }
+  .quotes { display:grid; grid-template-columns:repeat(2, minmax(180px, 1fr)); gap:12px; margin-bottom:8px; }
+  .quotes b, .quotes strong, .quotes em { display:block; white-space:nowrap; }
+  .quotes b { font-size:13px; }
+  .quotes strong { font-size:22px; font-variant-numeric:tabular-nums; }
+  .quotes em { font-style:normal; color:var(--muted); font-size:12px; }
   .radar-head, .pos-head { display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin:16px 0 10px; }
   .radar-head p, .pos-head p { margin:0; color:var(--muted); font-size:12px; }
   .radar { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
@@ -794,6 +1192,7 @@ CONSOLE_HTML = """<!DOCTYPE html>
         <p class="label">当前风险敞口</p>
         <strong id="risk-exposure">暂无证据</strong>
         <div class="bar"><span id="risk-bar"></span></div>
+        <p class="label" id="exposure-note"></p>
       </article>
       <article class="card stat-card">
         <p class="label">运行中策略</p>
@@ -808,7 +1207,7 @@ CONSOLE_HTML = """<!DOCTYPE html>
     <div class="charts">
       <article class="card">
         <div class="card-head">
-          <h2>策略净值</h2>
+          <h2>模拟盘权益</h2>
           <div class="ranges" id="nav-ranges">
             <button type="button" data-nav="7">7D</button>
             <button type="button" data-nav="30" aria-current="true">30D</button>
@@ -816,24 +1215,20 @@ CONSOLE_HTML = """<!DOCTYPE html>
             <button type="button" data-nav="0">全部</button>
           </div>
         </div>
-        <div class="legend"><span><i class="swatch" style="background:var(--blue)"></i>策略净值</span><span><i class="swatch" style="background:#c5cedd"></i>BTC基准 暂无曲线</span></div>
+        <div class="legend"><span><i class="swatch" style="background:var(--blue)"></i>模拟盘权益</span><span>每个点是一次读到的钱包权益</span></div>
         <div id="report-curve"></div>
       </article>
       <article class="card">
         <div class="card-head">
           <h2 id="market-heading">市场走势 · 模拟行情</h2>
-          <div class="ranges">
-            <button type="button" disabled>1H</button>
-            <button type="button" disabled>4H</button>
-            <button type="button" disabled>1W</button>
-          </div>
+          <p class="label">1 分钟 K 线</p>
         </div>
         <div id="market-board"></div>
       </article>
     </div>
     <div class="radar-head">
       <h2>机会雷达</h2>
-      <p>只显示已有证据 · 模拟行情未接入时不生成信号</p>
+      <p>BTCUSDT 按 T1 通道判断，其余品种只显示行情</p>
     </div>
     <div class="radar" id="radar"></div>
     <div class="pos-head">
@@ -843,6 +1238,7 @@ CONSOLE_HTML = """<!DOCTYPE html>
         <button class="act stop" id="pause">暂停新开仓</button>
         <button class="act" id="flatten">退出所有持仓</button>
       </div>
+      <p class="label">这两个按钮只写看板记录，不会向交易所发单。</p>
     </div>
     <article class="card">
       <table>
@@ -859,17 +1255,31 @@ CONSOLE_HTML = """<!DOCTYPE html>
         <p>含每笔绑定的合同杠杆</p>
       </div>
       <ul class="ledger" id="orders-body"></ul>
+      <div class="pos-head" style="margin-top:14px">
+        <h2>历史持仓 <span id="history-count">(0)</span></h2>
+        <p>模拟盘已经平掉的仓。价差按成交均价计算，不含手续费。</p>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>方向</th><th>数量</th><th>开仓均价</th><th>平仓均价</th><th>价差盈亏</th><th>开仓</th><th>平仓</th>
+          </tr>
+        </thead>
+        <tbody id="history-table"></tbody>
+      </table>
     </article>
   </section>
   <section id="market" class="panel">
     <article class="card page-card">
       <h2>行情</h2>
-      <p id="market-page">未接行情</p>
+      <div id="market-page"></div>
     </article>
   </section>
   <section id="research" class="panel">
     <article class="card page-card">
       <h2>策略</h2>
+      <p id="research-status" class="label"></p>
+      <div class="metrics" id="strategy-rules"></div>
       <p id="research-body">暂无证据</p>
       <div class="actions"><button class="act" id="create-research">创建研究版本</button></div>
     </article>
@@ -941,14 +1351,14 @@ function cells(target, rows) {
 function grouped(value) {
   const text = String(value ?? "");
   if (!text || text === "暂无证据") return "暂无证据";
-  if (!/^-?\d+(\.\d+)?$/.test(text)) return text;
+  if (!/^-?\\d+(\\.\\d+)?$/.test(text)) return text;
   const negative = text.startsWith("-");
   const [whole, frac] = text.replace("-", "").split(".");
-  const withComma = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const withComma = whole.replace(/\\B(?=(\\d{3})+(?!\\d))/g, ",");
   return (negative ? "-" : "") + withComma + (frac ? "." + frac : "");
 }
 function numeric(value) {
-  return /^-?\d+(\.\d+)?$/.test(String(value ?? ""));
+  return /^-?\\d+(\\.\\d+)?$/.test(String(value ?? ""));
 }
 function coin(symbol) {
   const kind = symbol === "ETHUSDT" ? "eth" : "btc";
@@ -976,7 +1386,7 @@ function areaChart(values) {
   const line = points.map(pair => pair.join(",")).join(" ");
   const area = `${left},${height - 16} ${line} ${points[points.length - 1][0]},${height - 16}`;
   const last = points[points.length - 1];
-  return `<svg viewBox="0 0 ${width} ${height}" width="100%" role="img" aria-label="策略净值">
+  return `<svg viewBox="0 0 ${width} ${height}" width="100%" role="img" aria-label="模拟盘权益">
     <text x="0" y="20" fill="#8b93a7" font-size="11">${esc(grouped(String(max)))}</text>
     <text x="0" y="${height - 12}" fill="#8b93a7" font-size="11">${esc(grouped(String(min)))}</text>
     <polygon points="${area}" fill="rgba(47,107,255,.16)"></polygon>
@@ -990,10 +1400,48 @@ function navWindow(values) {
   if (!navSpan) return rows;
   return rows.slice(-navSpan);
 }
+function candleChart(series) {
+  const bars = (series || []).map(bar => {
+    if (bar && typeof bar === "object") return {o:Number(bar.o), h:Number(bar.h), l:Number(bar.l), c:Number(bar.c)};
+    const close = Number(bar);
+    return {o:close, h:close, l:close, c:close};
+  }).filter(bar => Number.isFinite(bar.c));
+  if (bars.length < 2) return `<div class="empty-plot">暂无 K 线</div>`;
+  const lows = bars.map(bar => bar.l);
+  const highs = bars.map(bar => bar.h);
+  const min = Math.min(...lows);
+  const max = Math.max(...highs);
+  const width = 640;
+  const height = 220;
+  const left = 64;
+  const span = max === min ? 1 : max - min;
+  const yOf = price => max === min ? height / 2 : 16 + (1 - (price - min) / span) * (height - 36);
+  const slot = (width - left - 12) / bars.length;
+  const body = bars.map((bar, i) => {
+    const x = left + i * slot + slot * 0.2;
+    const openY = yOf(bar.o);
+    const closeY = yOf(bar.c);
+    const top = Math.min(openY, closeY);
+    const tall = Math.max(1, Math.abs(closeY - openY));
+    const color = bar.c >= bar.o ? "#12a36a" : "#e23b4a";
+    const mid = left + i * slot + slot / 2;
+    return `<line x1="${mid}" y1="${yOf(bar.h)}" x2="${mid}" y2="${yOf(bar.l)}" stroke="${color}" stroke-width="1"></line><rect x="${x}" y="${top}" width="${Math.max(1, slot * 0.6)}" height="${tall}" fill="${color}"></rect>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${width} ${height}" width="100%" role="img" aria-label="1分钟K线">
+    <text x="0" y="20" fill="#8b93a7" font-size="11">${esc(grouped(String(max)))}</text>
+    <text x="0" y="${height - 12}" fill="#8b93a7" font-size="11">${esc(grouped(String(min)))}</text>
+    ${body}
+  </svg>`;
+}
+function shown(value) {
+  if (!numeric(value)) return "";
+  const rounded = (Math.round(Number(value) * 100) / 100).toFixed(2).replace(/\\.00$/, "").replace(/(\\.\\d)0$/, "$1");
+  return grouped(rounded);
+}
 function markOf(data, symbol) {
   const price = data.marks && data.marks[symbol];
   if (!price) return "暂无证据";
-  const trimmed = String(price).replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "");
+  const trimmed = String(price).replace(/(\\.\\d*?[1-9])0+$/, "$1").replace(/\\.0+$/, "");
   return grouped(trimmed);
 }
 function board(data) {
@@ -1001,28 +1449,36 @@ function board(data) {
   const connected = names.some(symbol => data.marks && data.marks[symbol]);
   const heading = document.getElementById("market-heading");
   if (heading) heading.textContent = connected ? "市场走势 · 标记价格" : "市场走势 · 模拟行情";
-  document.getElementById("market-board").innerHTML = `
+  const markup = `
     <div class="quotes">${names.map(symbol => `<div>${coin(symbol)}<b>${esc(symbol)}</b><strong>${esc(markOf(data, symbol))}</strong><em>${connected ? "标记价格" : "未接行情"}</em></div>`).join("") || `<div><strong>暂无证据</strong></div>`}</div>
     ${names.map(symbol => {
       const series = (data.klines || {})[symbol];
+      const last = series && series.length ? (series[series.length - 1].c || series[series.length - 1]) : "";
       if (!series || series.length < 2) return `<div class="empty-plot">${esc(symbol)} 暂无 K 线</div>`;
-      return `<div style="margin-top:10px"><div style="display:flex;justify-content:space-between;font-size:12px"><span>${esc(symbol)} · 最近 ${series.length} 根 1m 收盘</span><b>${esc(series[series.length-1])}</b></div>${areaChart(series)}</div>`;
-    }).join("") || `<div class="empty-plot">未接行情，不绘制价格</div>`}`;
-  document.getElementById("market-page").textContent = connected
-    ? "BTCUSDT 与 ETHUSDT 的标记价格来自币安模拟盘公开行情。"
-    : "未接行情。BTCUSDT 与 ETHUSDT 没有可显示的标记价格。";
+      return `<div style="margin-top:10px"><div style="display:flex;justify-content:space-between;font-size:12px"><span>${esc(symbol)} · 最近 ${series.length} 根 1 分钟</span><b>${esc(last)}</b></div>${candleChart(series)}</div>`;
+    }).join("") || `<div class="empty-plot">未接行情，不绘制价格</div>`}
+    <p class="label">${connected ? "标记价格和 K 线来自币安模拟盘公开行情。" : "未接行情。BTCUSDT 与 ETHUSDT 没有可显示的标记价格。"}</p>`;
+  document.getElementById("market-board").innerHTML = markup;
+  const marketPage = document.getElementById("market-page");
+  if (marketPage) marketPage.innerHTML = markup;
   document.getElementById("radar").innerHTML = names.map(symbol => {
     const found = (data.positions || []).find(item => item.symbol === symbol);
     const qty = found ? found.qty : "暂无证据";
+    const desk = data.desk || {};
+    const traded = symbol === "BTCUSDT";
+    const signalName = {LONG:"做多", SHORT:"做空", HOLD:"持仓中", NONE:"无突破"}[desk.signal] || "暂无信号";
+    const tag = traded ? signalName : "未交易";
+    const band = traded && desk.signal_band ? shown(desk.signal_band) : "暂无证据";
+    const atr = traded && desk.signal_atr ? shown(desk.signal_atr) : "暂无证据";
     return `<article class="signal">
-      <div class="signal-top">${coin(symbol)}<b>${esc(symbol)}</b><span class="tag">暂无信号</span></div>
-      <button class="ghost-btn" data-open="research">查看信号</button>
+      <div class="signal-top">${coin(symbol)}<b>${esc(symbol)}</b><span class="tag">${esc(tag)}</span></div>
+      <button class="ghost-btn" data-open="research">查看策略</button>
       <div class="px">${esc(markOf(data, symbol))}</div>
       <ul>
         <li><span>持仓数量</span><em>${esc(qty)}</em></li>
-        <li><span>通道突破</span><em>暂无证据</em></li>
-        <li><span>波动率</span><em>暂无证据</em></li>
-        <li><span>成本预算</span><em>${esc(data.metrics.per_trade_risk)} / ${esc(data.metrics.portfolio_risk)}</em></li>
+        <li><span>通道</span><em>${esc(band)}</em></li>
+        <li><span>ATR</span><em>${esc(atr)}</em></li>
+        <li><span>止损 / 止盈</span><em>${desk.name ? "2.5× / 5× ATR" : "暂无证据"}</em></li>
       </ul>
     </article>`;
   }).join("") || `<article class="signal"><div class="px">暂无证据</div></article>`;
@@ -1030,47 +1486,81 @@ function board(data) {
   document.getElementById("position-count").textContent = `(${rows.length})`;
   document.getElementById("positions-table").innerHTML = rows.length ? rows.map(item => {
     const qty = String(item.qty ?? "");
-    const side = !numeric(qty) ? "暂无证据" : (Number(qty) < 0 ? "空" : "多");
+    const side = item.side || (!numeric(qty) ? "暂无证据" : (Number(qty) < 0 ? "空" : "多"));
     const tone = side === "空" ? "short" : (side === "多" ? "long" : "");
     const lev = item.leverage ? `<b class="tag" style="margin-left:6px">${esc(item.leverage)}×</b>` : "";
     const entry = item.entry && Number(item.entry) > 0 ? esc(item.entry) : "暂无证据";
-    const upnl = item.upnl !== undefined && item.upnl !== null && item.upnl !== "" ? esc(item.upnl) : "暂无证据";
-    const roe = item.roe ? esc(item.roe) : "暂无证据";
+    const upnl = numeric(item.upnl) ? grouped(item.upnl) : "暂无证据";
+    const roe = numeric(item.roe) ? `${(Number(item.roe) * 100).toFixed(2)}%` : "暂无证据";
     const budget = [
-      item.margin ? `保证金 ${esc(item.margin)}` : "",
-      item.notional ? `名义 ${esc(item.notional)}` : "",
-      item.stop ? `止损 ${esc(item.stop)}` : "",
+      item.margin ? `保证金 ${esc(shown(item.margin))}` : "",
+      item.notional ? `名义 ${esc(shown(item.notional))}` : "",
+      item.stop ? `止损 ${esc(shown(item.stop))}` : "",
+      item.take_profit ? `止盈 ${esc(shown(item.take_profit))}` : "",
+      item.added ? esc(item.added) : "",
       item.liq ? `强平 ${esc(item.liq)}` : "",
+      item.freshness === "LOCAL" ? "交易所未见到这一仓" : "",
     ].filter(Boolean).join("<br/>") || "暂无证据";
     return `<tr><td>${coin(item.symbol)} ${esc(item.symbol)}${lev}</td><td><span class="side ${tone}">${esc(side)}</span></td><td>${esc(qty)}</td><td>${entry}</td><td>${esc(markOf(data, item.symbol))}</td><td>${upnl}</td><td>${roe}</td><td>${budget}</td><td>—</td></tr>`;
   }).join("") : `<tr><td class="empty" colspan="9">暂无持仓</td></tr>`;
   const orders = data.recent_orders || [];
   document.getElementById("orders-count").textContent = `(${orders.length})`;
   document.getElementById("orders-body").innerHTML = orders.length ? orders.map(o =>
-    `<li>${esc(o.time || "")} ${esc(o.symbol)} <span class="side ${o.side === "BUY" ? "long" : "short"}">${esc(o.side)}</span> ${esc(o.qty)} @ ${esc(o.price)} · ${esc(o.status)}${o.leverage ? ` · <b>${esc(o.leverage)}×</b>` : ""}</li>`
+    `<li>${esc(o.time || "")} ${esc(o.symbol)} <span class="side ${o.side === "BUY" || o.side === "多" ? "long" : "short"}">${esc(o.side === "BUY" ? "买入" : (o.side === "SELL" ? "卖出" : o.side))}</span> ${esc(o.qty)} @ ${esc(shown(o.price))} · ${esc(o.status)}${o.leverage ? ` · <b>${esc(o.leverage)}×</b>` : ""}</li>`
   ).join("") : `<li>暂无委托</li>`;
+  const history = data.history || [];
+  const historyTable = document.getElementById("history-table");
+  if (historyTable) {
+    document.getElementById("history-count").textContent = `(${history.length})`;
+    historyTable.innerHTML = history.length ? history.map(item => {
+      const tone = item.side === "空" ? "short" : "long";
+      const pnl = numeric(item.pnl) ? shown(item.pnl) : "暂无证据";
+      const pnlClass = numeric(item.pnl) && Number(item.pnl) < 0 ? "down" : (numeric(item.pnl) && Number(item.pnl) > 0 ? "up" : "");
+      return `<tr><td><span class="side ${tone}">${esc(item.side)}</span></td><td>${esc(item.qty)}</td><td>${esc(shown(item.entry))}</td><td>${esc(shown(item.exit))}</td><td class="${pnlClass}">${pnl}</td><td>${esc(item.opened)}</td><td>${esc(item.closed)}</td></tr>`;
+    }).join("") : `<tr><td class="empty" colspan="7">暂无已平仓记录</td></tr>`;
+  }
 }
 function paint(data) {
   board(data);
-  document.getElementById("equity").textContent = grouped(data.equity);
+  document.getElementById("equity").textContent = numeric(data.equity) ? shown(data.equity) : grouped(data.equity);
   const source = data.books.source || "暂无证据";
   document.getElementById("equity-source").textContent = source;
   const unrealized = data.books.unrealized;
   const day = document.getElementById("day-pnl");
-  day.textContent = numeric(unrealized) ? `未实现盈亏 ${grouped(unrealized)}` : "今日盈亏 暂无证据";
+  day.textContent = numeric(unrealized) ? `未实现盈亏 ${shown(unrealized)}` : "未实现盈亏 暂无证据";
   day.className = numeric(unrealized) && Number(unrealized) < 0 ? "down" : (numeric(unrealized) && Number(unrealized) > 0 ? "up" : "");
   const exposure = data.metrics.gross_leverage;
-  document.getElementById("risk-exposure").textContent = numeric(exposure) ? `${exposure} x` : "暂无证据";
-  document.getElementById("risk-bar").style.width = numeric(exposure) ? `${Math.max(0, Math.min(100, Number(exposure) / 2 * 100))}%` : "0%";
-  document.getElementById("strategy-count").textContent = "暂无证据";
-  document.getElementById("available-margin").textContent = grouped(data.books.available);
+  const desk = data.desk || {};
+  const cap = numeric(desk.leverage) ? Number(desk.leverage) : 5;
+  document.getElementById("risk-exposure").textContent = numeric(exposure) ? `${grouped(exposure)}×` : "暂无证据";
+  document.getElementById("risk-bar").style.width = numeric(exposure) ? `${Math.max(0, Math.min(100, Number(exposure) / cap * 100))}%` : "0%";
+  document.getElementById("exposure-note").textContent = numeric(data.metrics.margin_used) ? `已用保证金 ${grouped(data.metrics.margin_used)}` : "";
+  document.getElementById("strategy-count").textContent = desk.trader === "运行中" ? "1" : (desk.name ? "0" : "暂无证据");
+  const rules = document.getElementById("strategy-rules");
+  const status = document.getElementById("research-status");
+  if (desk.name && rules && status) {
+    status.textContent = `${desk.name} · ${desk.symbol} ${desk.interval} · ${desk.trader}${desk.halted ? " · " + desk.halted : ""}`;
+    cells("strategy-rules", [
+      ["方向", desk.directions],
+      ["杠杆", `${desk.leverage}×`],
+      ["开仓", desk.entry_margin],
+      ["补仓", desk.add_margin],
+      ["止损", desk.stop],
+      ["止盈", desk.take_profit],
+      ["平仓", desk.hold || "暂无证据"],
+      ["信号", {LONG:"做多", SHORT:"做空", HOLD:"持仓中", NONE:"无突破"}[desk.signal] || "暂无证据"],
+      ["通道 / ATR", desk.signal_atr ? `${desk.signal_band ? shown(desk.signal_band) : "无突破"} / ${shown(desk.signal_atr)}` : "暂无证据"]
+    ]);
+  }
+  document.getElementById("available-margin").textContent = numeric(data.books.available) ? shown(data.books.available) : grouped(data.books.available);
   const share = document.getElementById("margin-share");
   share.textContent = numeric(data.books.available) && numeric(data.equity) && Number(data.equity) !== 0
     ? `占总权益 ${(Number(data.books.available) / Number(data.equity) * 100).toFixed(1)}%`
     : "占总权益 暂无证据";
   document.getElementById("position-source").textContent = `数据来源：${source}`;
   document.getElementById("mode").textContent = data.mode === "SIMULATION" ? "演示模式" : data.mode;
-  document.getElementById("system-state").textContent = data.system_state;
+  const stateNames = {RUNNING:"交易器运行", HALTED:"交易器熔断", STALE:"交易器无心跳", RECONCILING:"对账中"};
+  document.getElementById("system-state").textContent = stateNames[data.system_state] || data.system_state;
   document.getElementById("seal").textContent = data.live_authorization;
   document.getElementById("session-note").textContent = data.message_zh;
   document.getElementById("reconcile-at").textContent = data.last_reconcile_at;
@@ -1084,7 +1574,7 @@ function paint(data) {
     ["数据新鲜度", data.metrics.data_freshness],
     ["当前阻断", data.blockers.length ? data.blockers.join("，") : "暂无证据"]
   ]);
-  document.getElementById("research-body").textContent = data.report.conclusion;
+  document.getElementById("research-body").textContent = desk.name ? "" : data.report.conclusion;
   document.getElementById("report-conclusion").textContent = data.report.conclusion;
   document.getElementById("report-curve").innerHTML = areaChart(data.curve);
   cells("report-metrics", [
@@ -1098,8 +1588,14 @@ function paint(data) {
     ["最大回撤", data.report.max_drawdown]
   ]);
   const origin = { BACKTEST: "回测", SIMULATION: "模拟", LIVE: "实盘" };
-  const fills = [...data.backtest_fills, ...data.simulation_fills, ...data.live_fills];
-  document.getElementById("trades-body").innerHTML = (fills.length ? fills : [{origin:"", symbol:"", id:""}]).map(item => {
+  const historyRows = data.history || [];
+  const fills = historyRows.length ? [] : [...data.backtest_fills, ...data.simulation_fills, ...data.live_fills];
+  if (historyRows.length) {
+    document.getElementById("trades-body").innerHTML = historyRows.map(item =>
+      `<li>${esc(item.closed)} ${esc(item.side)} ${esc(item.qty)} 开仓 ${esc(shown(item.entry))} 平仓 ${esc(shown(item.exit))} 价差 ${esc(shown(item.pnl))}</li>`
+    ).join("");
+  }
+  if (!historyRows.length) document.getElementById("trades-body").innerHTML = (fills.length ? fills : [{origin:"", symbol:"", id:""}]).map(item => {
     if (!item.origin) return "<li>暂无证据</li>";
     const label = `${origin[item.origin] || item.origin} ${item.symbol || ""}`;
     return item.id ? `<li><button class="link" data-trace="${esc(item.id)}">${esc(label)}</button></li>` : `<li>${esc(label)}</li>`;
@@ -1164,7 +1660,7 @@ document.querySelectorAll("button.tab").forEach(button => button.addEventListene
 async function post(path) {
   const response = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json","Idempotency-Key":crypto.randomUUID()}, body:JSON.stringify({expected_version:initial.version})});
   const payload = await response.json();
-  document.getElementById("action-note").textContent = payload.message_zh || (payload.paused ? "已暂停新开仓，保护单仍保留" : "已记录退出请求");
+  document.getElementById("action-note").textContent = payload.message_zh || (payload.paused ? "已在看板上记下暂停。交易器不读这个开关，也不会撤掉保护。" : "已记下退出请求，尚未向交易所发单。");
   if (payload.version) initial.version = payload.version;
   if (response.ok || payload.reason_code === "RECOVERY_APPROVAL_REQUIRED") {
     const overview = await fetch("/v1/overview");
@@ -1204,6 +1700,14 @@ function tick() {
 }
 tick();
 setInterval(tick, 30000);
+setInterval(async () => {
+  try {
+    const response = await fetch("/v1/overview");
+    if (response.ok) paint(await response.json());
+  } catch (error) {
+    return;
+  }
+}, 15000);
 </script>
 </body>
 </html>

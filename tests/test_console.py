@@ -2,7 +2,17 @@ import json
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from cts.console.app import ConsoleApp, ConsoleState, apply_research_report
+from cts.console.app import (
+    ConsoleApp,
+    ConsoleState,
+    apply_research_report,
+    build_demo_desk,
+    merge_desk_position,
+    overview_payload,
+    position_rounds,
+    record_demo_equity,
+)
+from cts.execution.live import parse_demo_positions
 from cts.ledger.models import Side
 from cts.ledger.journal import Ledger
 from cts.money import D
@@ -241,3 +251,93 @@ def test_trade_chain_names_each_link_or_says_evidence_is_missing() -> None:
     assert "不是交易所读回" in trace["liq_distance"]
     assert state.report["concentration"].startswith("BTCUSDT")
     assert state.report["data_grade"] == "SIGNAL_RESEARCH_ONLY"
+
+
+def test_board_keeps_position_protection_and_draws_klines_apart_from_nav() -> None:
+    rows = parse_demo_positions(
+        {
+            "positions": [
+                {
+                    "symbol": "BTCUSDT",
+                    "positionAmt": "0.1661",
+                    "entryPrice": "74153.4",
+                    "markPrice": "74000",
+                    "unRealizedProfit": "-25.5",
+                    "isolatedWallet": "246.4",
+                    "leverage": "5",
+                    "liquidationPrice": "60000",
+                },
+                {"symbol": "ETHUSDT", "positionAmt": "0", "entryPrice": "0", "markPrice": "2000"},
+            ]
+        }
+    )
+    assert rows[0]["side"] == "多"
+    assert rows[0]["qty"] == "0.1661"
+    assert len(rows) == 1
+    merged = merge_desk_position(
+        rows,
+        {"side": "LONG", "qty": "0.1661", "stop": "74063.24", "take_profit": "74333.72", "added": True, "atr": "36"},
+    )
+    assert merged[0]["stop"] == "74063.24"
+    assert merged[0]["take_profit"] == "74333.72"
+    assert merged[0]["added"] == "已补仓"
+    missing = merge_desk_position([], {"side": "SHORT", "qty": "0.02", "stop": "100", "take_profit": "90", "added": False})
+    assert missing[0]["freshness"] == "LOCAL"
+    assert missing[0]["side"] == "空"
+    state = ConsoleState(positions=merged, equity="5000", klines={"BTCUSDT": [{"o": "1", "h": "2", "l": "1", "c": "2"}]})
+    payload = overview_payload(state)
+    assert payload["positions"][0]["stop"] == "74063.24"
+    assert payload["positions"][0]["side"] == "多"
+    desk = build_demo_desk({"halted": None, "_age": 1}, bars=[], has_position=False)
+    assert desk["trader"] == "运行中"
+    assert "80%" in desk["entry_margin"]
+    assert "20%" in desk["add_margin"]
+    assert desk["signal"] == "NONE"
+    app = ConsoleApp("secret", state)
+    port = app.serve()
+    try:
+        status, _, html = _json(port, "/", token="secret")
+        assert status == 200
+        assert "candleChart" in html
+        assert "1 分钟 K 线" in html
+        assert "不会向交易所发单" in html
+        assert "模拟盘权益" in html
+        assert "历史持仓" in html
+        assert "navWindow" in html
+        script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+        assert "areaChart(series)" not in script
+    finally:
+        app.shutdown()
+
+
+def test_equity_curve_keeps_distinct_wallet_reads(tmp_path) -> None:
+    log = tmp_path / "trader.log"
+    log.write_text(
+        "[2026-11-09T07:41:17+00:00] 当日钱包 4995.27，开仓保证金上限 80%，补仓预留 20%\n"
+        "[2026-11-09T07:41:50+00:00] 补仓触发 标记价=74094.80 使用当日钱包 20% 保证金上限\n"
+        "[2026-11-09T08:10:50+00:00] 当日钱包 4945.64，开仓保证金上限 80%，补仓预留 20%\n",
+        encoding="utf-8",
+    )
+    curve = tmp_path / "curve.json"
+    first = record_demo_equity("4942.59", at="2026-11-09T08:45:00+00:00", curve_path=str(curve), log_path=str(log))
+    assert first == ["4995.27", "4945.64", "4942.59"]
+    again = record_demo_equity("4942.59", at="2026-11-09T08:46:00+00:00", curve_path=str(curve), log_path=str(log))
+    assert again == first
+
+
+def test_closed_rounds_keep_adds_and_skip_an_open_position() -> None:
+    orders = [
+        {"symbol": "BTCUSDT", "side": "LONG", "executed": "1", "price": "100", "time": "2026-11-09T09:04:20+00:00"},
+        {"symbol": "BTCUSDT", "side": "LONG", "executed": "1", "price": "110", "time": "2026-11-09T09:11:01+00:00"},
+        {"symbol": "BTCUSDT", "side": "SHORT", "executed": "2", "price": "90", "time": "2026-11-09T09:11:25+00:00"},
+        {"symbol": "BTCUSDT", "side": "LONG", "executed": "0.5", "price": "95", "time": "2026-11-09T09:20:00+00:00"},
+    ]
+    rounds = position_rounds(orders)
+    assert len(rounds) == 1
+    assert rounds[0]["side"] == "多"
+    assert rounds[0]["qty"] == "2"
+    assert rounds[0]["entry"] == "105.00"
+    assert rounds[0]["exit"] == "90.00"
+    assert rounds[0]["pnl"] == "-30.00"
+    assert rounds[0]["opened"] == "11-09 17:04"
+    assert rounds[0]["closed"] == "11-09 17:11"

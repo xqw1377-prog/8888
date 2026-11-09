@@ -224,9 +224,146 @@ def test_entry_size_comes_from_equity_and_stop_not_fixed_notional(tmp_path) -> N
     assert submitted > D("1")
 
 
+def test_one_minute_channel_does_not_close_a_five_times_position(tmp_path) -> None:
+    session = FakeSession([])
+    bars = make_bars(["100"] * 7 + ["99"])
+    t = trader(
+        tmp_path,
+        venue="1",
+        session=session,
+        bars=bars,
+        state={
+            "position": {
+                "side": "LONG",
+                "qty": "1",
+                "entry": "100",
+                "stop": "50",
+                "take_profit": "200",
+                "atr": "1",
+                "extreme": "100",
+                "entry_time": "2026-11-01T00:00:00+00:00",
+            },
+            "pending": None,
+        },
+    )
+    t.step()
+    assert session.submits == []
+    assert t.state["position"]["qty"] == "1"
+    assert t.state["position"]["trend_held"] is True
+    assert "继续持有" in Path(t.config.log_path).read_text(encoding="utf-8")
+
+
 def test_restored_position_without_stop_recomputes_nonzero_stop(tmp_path) -> None:
     # 审计反例：恢复空头 stop=0 → 价格不变也触发退出
     t = trader(tmp_path, venue="-1", state={"position": {"side": "SHORT", "qty": "1", "entry": "100"}, "pending": None},
                bars=make_bars(["100"] * 8))
     t.step()
     assert D(t.state["position"]["stop"]) > 0, "恢复的空头必须重算出非零止损"
+
+
+# ---------- 复审反例回归（aaf9f04 CHANGES-REQUIRED） ----------
+
+
+def _order(status: str, *, side: str = "LONG", symbol: str = "BTCUSDT", notional: str = "60",
+           executed: str = "0", dispatch: bool = False):
+    from cts.execution.orders import LiveOrder
+
+    return LiveOrder(
+        client_order_id=f"o-{status}-{side}-{symbol}-{notional}", account_id="acct-1",
+        reservation_id="r-1", symbol=symbol, side=side, qty=D("1"), price=D("100"),
+        notional=D(notional), status=status, executed_qty=D(executed),
+        dispatch_started=dispatch, body={},
+    )
+
+
+def test_inflight_intent_counts_toward_exposure() -> None:
+    # 反例：名义 60，响应尚未确认时计为 0
+    from cts.execution.orders import net_session_exposure
+
+    assert net_session_exposure([_order("INTENT", dispatch=True)]) == D("60")
+    assert net_session_exposure([_order("INTENT", dispatch=False)]) == D("60")
+
+
+def test_filled_short_exposure_is_counted() -> None:
+    # 反例：已成交空头 60 被计为 0
+    from cts.execution.orders import net_session_exposure
+
+    assert net_session_exposure([_order("FILLED", side="SHORT", executed="1")]) == D("60")
+
+
+def test_cross_symbol_exposure_does_not_offset() -> None:
+    # 反例：BTC 空 60 + ETH 多 60 被合计为 0
+    from cts.execution.orders import net_session_exposure
+
+    exposure = net_session_exposure([
+        _order("FILLED", side="SHORT", symbol="BTCUSDT", executed="1"),
+        _order("FILLED", side="LONG", symbol="ETHUSDT", executed="1"),
+    ])
+    assert exposure == D("120")
+
+
+def test_degraded_stop_fires_when_reconcile_unknown(tmp_path, monkeypatch) -> None:
+    # 反例：多头止损 95、止盈 110、标记价 94；K 线与对账都失败后仍必须触发退出
+    session = FakeSession([])
+    t = trader(
+        tmp_path, session=session,
+        state={"position": {"side": "LONG", "qty": "1", "entry": "100", "stop": "95", "take_profit": "110", "atr": "5"}, "pending": None},
+    )
+
+    def broken_bars(*a, **k):
+        raise RuntimeError("行情不可用")
+
+    def broken_venue(path, params):
+        raise RuntimeError("对账不可用")
+
+    t.feed.fetch_candles = broken_bars
+    t.feed.fetch_mark = lambda symbol: type("M", (), {"mark_price": D("94")})()
+    t.signer = broken_venue
+    t.step()
+    assert session.submits, "降级止损必须仍然触发"
+    coid, side, qty = session.submits[0]
+    assert side == "SHORT"
+
+
+def test_hold_cleanup_respects_request_ownership(tmp_path) -> None:
+    # 反例：订单缓存显示终态就删除另一条仍活动的查询阻断
+    import sqlite3 as _sql
+    from dataclasses import replace as _rep
+    from cts.clock import utc_now
+
+    t = trader(tmp_path, session=FakeSession([]))
+    conn = t.risk.store._conn
+    conn.execute("BEGIN IMMEDIATE")
+    now_iso = utc_now().isoformat()
+    conn.execute(
+        "INSERT INTO live_risk_holds(hold_id, account_id, reservation_id, client_order_id, reason, created_at, owner_id) VALUES(?,?,?,?,?,?,?)",
+        ("q1:QUERYING:live", t.risk.account_id, "r-q", "cts_x_query", "QUERYING", now_iso, "owner-1"),
+    )
+    conn.execute(
+        "INSERT INTO live_risk_holds(hold_id, account_id, reservation_id, client_order_id, reason, created_at, owner_id) VALUES(?,?,?,?,?,?,?)",
+        ("unknown:cts_x_unknown", t.risk.account_id, "r-u", "cts_x_unknown", "UNKNOWN", now_iso, "owner-1"),
+    )
+    conn.execute("COMMIT")
+
+    class _Orders:
+        def get(self, coid):
+            base = _order("FILLED")
+            return None
+
+    class _Row:
+        def __init__(self, d):
+            self.__dict__.update(d)
+
+    t.session.orders = _Orders()
+    t._reconcile_orders_and_holds()
+    remaining = {r[0] for r in conn.execute("SELECT hold_id FROM live_risk_holds WHERE account_id=?", (t.risk.account_id,)).fetchall()}
+    assert "q1:QUERYING:live" in remaining, "活动查询阻断不得被清除"
+
+
+def test_strategy_params_fully_bound_into_hash() -> None:
+    # 反例：止盈 5 改 50，信号哈希仍相同
+    from cts.strategy.t1 import T1Params, t1_params_binding_hash
+
+    base = t1_params_binding_hash(T1Params())
+    assert base != t1_params_binding_hash(T1Params(take_multiple=D("50")))
+    assert base != t1_params_binding_hash(T1Params(entry_lookback=21))

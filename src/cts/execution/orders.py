@@ -42,18 +42,23 @@ def budget_notional(order: LiveOrder) -> Decimal:
 
 
 def net_session_exposure(orders) -> Decimal:
-    """会话净敞口：成交按买卖方向净额，在场/未决/未发送全额占位。用于进程限额判定。"""
-    total = Decimal("0")
+    """会话限额占用：已成交部分按币种取绝对净额后求和（跨币种不得抵销），
+    在场/未决/在途意图（含已派发未终报）按全额计。"""
+    per_symbol: dict = {}
+    resting = Decimal("0")
     for order in orders:
-        if order.status == "INTENT" and not order.dispatch_started:
-            total += order.notional
+        if order.status == "INTENT":
+            # 已开始派发的意图同样占用额度：响应未确认不代表名义不存在
+            resting += order.notional
         elif order.status in ("NEW", "PARTIALLY_FILLED", "UNKNOWN", "QUERYING", "CANCELING"):
-            total += order.notional
+            resting += order.notional
         elif order.status in ("CANCELED", "EXPIRED", "FILLED"):
             fraction = order.executed_qty / order.qty if order.qty > 0 else Decimal("0")
-            signed = Decimal("1") if order.side == Side.LONG else Decimal("-1")
-            total += order.notional * fraction * signed
-    return total if total > 0 else Decimal("0")
+            if fraction > 0:
+                signed = Decimal("1") if order.side == Side.LONG else Decimal("-1")
+                per_symbol[order.symbol] = per_symbol.get(order.symbol, Decimal("0")) + order.notional * fraction * signed
+    filled_gross = sum((abs(net) for net in per_symbol.values()), start=Decimal("0"))
+    return filled_gross + resting
 
 
 def charged_notional(order: LiveOrder) -> Decimal:
