@@ -219,7 +219,7 @@ class LiveSession:
         )
         if isinstance(risk, RiskEngine):
             self._bind_risk(risk, now)
-        if reduce_only:
+        if reduce_only and type(self._transport) is not PinnedTransport:
             raise CtsError("减仓写单不在本批放行，未发送请求", reason_code="LIVE_TRADING_HOLD")
         if computed > self.grant.max_notional:
             raise CtsError("名义价值超出本进程限额，未发送请求", reason_code="RISK_LIMIT")
@@ -277,7 +277,7 @@ class LiveSession:
                 ("quantity", format(D(qty), "f")),
                 ("price", format(D(price), "f")),
                 ("newClientOrderId", client_order_id),
-                ("reduceOnly", "false"),
+                ("reduceOnly", "true" if reduce_only else "false"),
                 ("recvWindow", "5000"),
                 ("timestamp", _millis(now)),
             ]

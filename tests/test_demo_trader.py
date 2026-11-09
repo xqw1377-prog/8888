@@ -224,33 +224,33 @@ def test_entry_size_comes_from_equity_and_stop_not_fixed_notional(tmp_path) -> N
     assert submitted > D("1")
 
 
-def test_one_minute_channel_does_not_close_a_five_times_position(tmp_path) -> None:
+def test_trailing_stop_exit_is_honored(tmp_path) -> None:
+    """复审裁定：恢复既有退出行为——移动止损触发即平仓，不得为持有而忽略。"""
+    session = FakeSession([])
+    bars = make_bars(["100"] * 7 + ["99"])  # 收盘跌破触发线
+    t = trader(
+        tmp_path, venue="1", session=session, bars=bars,
+        state={"position": {"side": "LONG", "qty": "1", "entry": "100", "stop": "101",
+                            "take_profit": "200", "atr": "1", "extreme": "130",
+                            "entry_time": "2026-11-01T00:00:00+00:00"}, "pending": None},
+    )
+    t.step()
+    assert session.submits, "移动止损/趋势退出必须照常触发平仓"
+
+
+def test_trend_exit_is_honored(tmp_path) -> None:
+    """复审裁定：恢复既有退出行为——TREND 退出立即平仓，不得忽略后继续持有。"""
     session = FakeSession([])
     bars = make_bars(["100"] * 7 + ["99"])
     t = trader(
-        tmp_path,
-        venue="1",
-        session=session,
-        bars=bars,
-        state={
-            "position": {
-                "side": "LONG",
-                "qty": "1",
-                "entry": "100",
-                "stop": "50",
-                "take_profit": "200",
-                "atr": "1",
-                "extreme": "100",
-                "entry_time": "2026-11-01T00:00:00+00:00",
-            },
-            "pending": None,
-        },
+        tmp_path, venue="1", session=session, bars=bars,
+        state={"position": {"side": "LONG", "qty": "1", "entry": "100", "stop": "50",
+                            "take_profit": "200", "atr": "1", "extreme": "100",
+                            "entry_time": "2026-11-01T00:00:00+00:00"}, "pending": None},
     )
     t.step()
-    assert session.submits == []
-    assert t.state["position"]["qty"] == "1"
-    assert t.state["position"]["trend_held"] is True
-    assert "继续持有" in Path(t.config.log_path).read_text(encoding="utf-8")
+    assert session.submits, "TREND 退出必须照常触发平仓"
+    assert "trend_held" not in (t.state.get("position") or {})
 
 
 def test_restored_position_without_stop_recomputes_nonzero_stop(tmp_path) -> None:
@@ -270,7 +270,7 @@ def _order(status: str, *, side: str = "LONG", symbol: str = "BTCUSDT", notional
 
     return LiveOrder(
         client_order_id=f"o-{status}-{side}-{symbol}-{notional}", account_id="acct-1",
-        reservation_id="r-1", symbol=symbol, side=side, qty=D("1"), price=D("100"),
+        reservation_id="r-1", symbol=symbol, side=side, qty=D("1"), price=D(notional),
         notional=D(notional), status=status, executed_qty=D(executed),
         dispatch_started=dispatch, body={},
     )
@@ -367,3 +367,56 @@ def test_strategy_params_fully_bound_into_hash() -> None:
     base = t1_params_binding_hash(T1Params())
     assert base != t1_params_binding_hash(T1Params(take_multiple=D("50")))
     assert base != t1_params_binding_hash(T1Params(entry_lookback=21))
+
+
+def test_flat_quantity_leaves_no_residual_exposure() -> None:
+    # 反例：买 1@100、卖 1@90 已空仓，不得残留 10 占用
+    from cts.execution.orders import LiveOrder, net_session_exposure
+
+    def order(side: str, price: str):
+        return LiveOrder(client_order_id=f"o-{side}-{price}", account_id="a", reservation_id="r",
+                         symbol="BTCUSDT", side=side, qty=D("1"), price=D(price), notional=D("1") * D(price),
+                         status="FILLED", executed_qty=D("1"), dispatch_started=True, body={})
+
+    assert net_session_exposure([order("LONG", "100"), order("SHORT", "90")]) == D("0")
+
+
+def test_signal_hash_changes_with_take_multiple(tmp_path) -> None:
+    # 反例接线验证：止盈 5→50，信号哈希必须改变
+    import cts.risk.engine  # noqa: F401  解开既有的包初始化顺序
+    from decimal import Decimal as DD
+    from cts.strategy.t1 import T1Params, evaluate_signal
+
+    bars = make_bars(["100"] * 30 + ["200"])
+    a = evaluate_signal(bars, params=T1Params(entry_lookback=5, exit_lookback=3, atr_period=3, warmup_bars=6, version="T"),
+                        has_position=False, has_pending_entry=False)
+    b = evaluate_signal(bars, params=T1Params(entry_lookback=5, exit_lookback=3, atr_period=3, warmup_bars=6, version="T", take_multiple=DD("50")),
+                        has_position=False, has_pending_entry=False)
+    assert a is not None and b is not None
+    assert a.input_hash != b.input_hash, "信号哈希必须绑定全部策略参数"
+
+
+def test_unknown_cleanup_spares_sibling_query_hold(tmp_path) -> None:
+    # 反例：同一订单同时有 unknown:* 与活动查询阻断，只删恢复行
+    from cts.clock import utc_now
+
+    t = trader(tmp_path, session=FakeSession([]))
+    conn = t.risk.store._conn
+    now_iso = utc_now().isoformat()
+    conn.execute("BEGIN IMMEDIATE")
+    for hold_id in (f"unknown:cts_x9", f"req1:QUERYING:{now_iso}"):
+        conn.execute(
+            "INSERT INTO live_risk_holds(hold_id, account_id, reservation_id, client_order_id, reason, created_at, owner_id) VALUES(?,?,?,?,?,?,?)",
+            (hold_id, t.risk.account_id, "r-9", "cts_x9", "UNKNOWN" if hold_id.startswith("unknown") else "QUERYING", now_iso, "owner-9"),
+        )
+    conn.execute("COMMIT")
+
+    class _Orders:
+        def get(self, coid):
+            return None
+
+    t.session.orders = _Orders()
+    t._reconcile_orders_and_holds()
+    remaining = {r[0] for r in conn.execute("SELECT hold_id FROM live_risk_holds WHERE account_id=?", (t.risk.account_id,)).fetchall()}
+    assert not any(h.startswith("unknown:") for h in remaining), "恢复型阻断应被清除"
+    assert any(":QUERYING:" in h for h in remaining), "同订单的活动查询阻断不得被连带删除"

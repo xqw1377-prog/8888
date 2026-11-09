@@ -118,6 +118,7 @@ def evaluate_signal(
         "d40": d40,
         "atr": atr,
         "params": params.version,
+        "params_binding": t1_params_binding_hash(params),
         "candle_checksum": current.checksum,
         "prior_checksums": [c.checksum for c in prior[-params.entry_lookback :]],
     }

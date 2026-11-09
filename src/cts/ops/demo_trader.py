@@ -302,7 +302,8 @@ class DemoTrader:
             self.log(f"{tag} 数量低于最小下单量，已释放预留")
             return None
         notional = qty * price
-        if notional < D("50"):
+        if notional < D("50") and not exit_order:
+            # 只约束开仓/补仓的最小名义；残余小仓的平仓不得被本地拦截
             self.risk.release_unbound_reservation(reservation.reservation_id)
             self.log(f"{tag} 名义 {notional} 低于交易所最小 50，已释放预留")
             return None
@@ -322,6 +323,7 @@ class DemoTrader:
                 now=utc_now(),
                 risk=self.risk,
                 reservation_id=reservation.reservation_id,
+                reduce_only=exit_order,
             )
         except Exception as exc:
             if getattr(exc, "reason_code", "") != "UNKNOWN_ORDER":
@@ -502,10 +504,10 @@ class DemoTrader:
                     continue
                 with self.risk.store.txn() as conn:
                     conn.execute(
-                        "DELETE FROM live_risk_holds WHERE account_id=? AND client_order_id=?",
-                        (self.risk.account_id, coid),
+                        "DELETE FROM live_risk_holds WHERE account_id=? AND hold_id=?",
+                        (self.risk.account_id, row["hold_id"]),
                     )
-                self.log(f"清除已完结订单 {coid} 的风险阻断行")
+                self.log(f"清除恢复型阻断行 {row['hold_id'][:24]}（订单 {coid}）")
 
     def _release_stale_reservations(self) -> None:
         """超过 15 分钟仍 PENDING 的 demo 预留视为残留，释放以免吃满组合预算。"""
@@ -651,18 +653,8 @@ class DemoTrader:
         elif position is not None and not self.state.get("pending"):
             open_position = _as_open_position(position, self.config.symbol)
             updated, exit_decision = evaluate_exit(open_position, bars, mark_price=mark, params=self.config.params)
-            position["stop"] = format(updated.stop, "f")
             position["extreme"] = format(updated.extreme, "f")
-            if exit_decision is not None and exit_decision.reason == "TREND":
-                # 1 分钟通道大约十分钟就反向。5 倍合约不按这个提前平仓，只保留止损和止盈。
-                if not position.get("trend_held"):
-                    self.log(
-                        f"1 分钟通道已碰到 {exit_decision.trend_level}，5 倍合约继续持有，只等止损或止盈"
-                    )
-                    position["trend_held"] = True
-                exit_decision = None
-            elif position.get("trend_held"):
-                position.pop("trend_held", None)
+            position["stop"] = format(updated.stop, "f")
             if exit_decision is None and venue is not None and mark is not None and add_triggered(position, mark):
                 base = self._capital_base()
                 self.state["pending"] = self._place(
