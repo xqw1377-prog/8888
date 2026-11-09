@@ -348,6 +348,26 @@ class DemoTrader:
         except Exception:
             return None
 
+    def _order_evidence(self, coid: str) -> Optional[dict]:
+        """会话查询拒绝回放时，直接读交易所订单。终态才采用，避免把未知单收成成交。"""
+        try:
+            status, body = self.signer(
+                "/fapi/v1/order",
+                {"symbol": self.config.symbol, "origClientOrderId": coid},
+            )
+        except Exception:
+            return None
+        if status != 200:
+            return None
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        if data.get("status") not in ("FILLED", "CANCELED", "REJECTED", "EXPIRED", "PARTIALLY_FILLED"):
+            return None
+        self.log(f"{coid} 按交易所直接取证 {data.get('status')} cumulative={data.get('executedQty')}")
+        return data
+
     def _poll_pending(self) -> None:
         pending = self.state.get("pending")
         if not pending:
@@ -358,15 +378,21 @@ class DemoTrader:
             )
         except CtsError as exc:
             self.log(f"查询 {pending['coid']} 失败 {getattr(exc, 'reason_code', '')} {exc}")
-            return
+            result = self._order_evidence(pending["coid"])
+            if result is None:
+                return
         status = result.get("status")
         cumulative = D(result.get("executedQty") or "0")
         applied = D(pending.get("applied") or "0")
         delta = cumulative - applied
         if delta > 0:
-            self.risk.project_live_cumulative(
-                pending["reservation"], pending["coid"], cumulative, now=utc_now()
-            )
+            try:
+                self.risk.project_live_cumulative(
+                    pending["reservation"], pending["coid"], cumulative, now=utc_now()
+                )
+            except CtsError as exc:
+                # 游标已在前面的回执里记过这笔成交时，本地仓位仍要跟上交易所
+                self.log(f"{pending['coid']} 成交投影保持原值 {getattr(exc, 'reason_code', '')} {exc}")
             pending["applied"] = format(cumulative, "f")
             # 部分成交立即反映到本地持仓，不再等 FILLED
             prev = self.state.get("position")
