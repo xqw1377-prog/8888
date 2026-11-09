@@ -200,6 +200,7 @@ class DemoTrader:
             stop_price=stop_price,
             multiplier=D("1"),
             lot_size=step,
+            qty=qty if exit_order else None,
         )
         reservation = self.risk.reserve([request], now=utc_now(), exit_purpose=exit_order)[0]
         if reservation.qty < qty:
@@ -299,44 +300,62 @@ class DemoTrader:
 
     # ---- 主循环 ----
 
-    def _resolve_unknown_orders(self) -> None:
-        """UNKNOWN 订单按交易所证据核销：无此单置 REJECTED，终态落账，释放净敞口。"""
+    def _reconcile_orders_and_holds(self) -> None:
+        """以风险侧阻断行为源头对账：订单终态或交易所证明完结即删行，解除在途封锁。"""
         from dataclasses import replace as _replace
 
         try:
-            account_orders = self.session.orders.for_account(self.risk.account_id)
+            with self.risk.store.txn() as conn:
+                holds = conn.execute(
+                    "SELECT hold_id, client_order_id FROM live_risk_holds WHERE account_id=? LIMIT 5",
+                    (self.risk.account_id,),
+                ).fetchall()
         except Exception:
             return
-        for order in account_orders:
-            stale_intent = (
-                order.status == "INTENT"
-                and getattr(order, "dispatch_started", 0)
-                and (utc_now() - (order.updated_at if getattr(order, "updated_at", None) else utc_now())).total_seconds() > 300
-            )
-            if order.status != "UNKNOWN" and not stale_intent:
-                continue
+        for row in holds:
+            coid = row["client_order_id"]
             try:
-                status, body = self.signer(
-                    "/fapi/v1/order",
-                    {"symbol": order.symbol, "origClientOrderId": order.client_order_id},
-                )
+                order = self.session.orders.get(coid)
             except Exception:
-                continue
-            if status == 200:
-                data = json.loads(body)
-                self.session.orders.save(
-                    _replace(order, status=data.get("status", "UNKNOWN"), executed_qty=D(str(data.get("executedQty") or "0"))),
-                    utc_now(),
-                )
-                self.log(f"未决订单 {order.client_order_id} 按交易所置为 {data.get('status')}")
-            else:
+                order = None
+            if order is not None and order.status in ("UNKNOWN", "QUERYING", "CANCELING"):
                 try:
-                    code = json.loads(body).get("code")
+                    status, body = self.signer(
+                        "/fapi/v1/order", {"symbol": order.symbol, "origClientOrderId": coid}
+                    )
                 except Exception:
-                    code = None
-                if code == -2013:
-                    self.session.orders.save(_replace(order, status="REJECTED", executed_qty=D("0")), utc_now())
-                    self.log(f"未决订单 {order.client_order_id} 交易所无此单，置 REJECTED")
+                    continue
+                if status == 200:
+                    data = json.loads(body)
+                    self.session.orders.save(
+                        _replace(order, status=data.get("status", "UNKNOWN"),
+                                 executed_qty=D(str(data.get("executedQty") or "0"))),
+                        utc_now(),
+                    )
+                    self.log(f"未决订单 {coid} 按交易所置为 {data.get('status')}")
+                else:
+                    try:
+                        code = json.loads(body).get("code")
+                    except Exception:
+                        code = None
+                    if code == -2013:
+                        self.session.orders.save(_replace(order, status="REJECTED", executed_qty=D("0")), utc_now())
+                        self.log(f"未决订单 {coid} 交易所无此单，置 REJECTED")
+            order = None
+            try:
+                order = self.session.orders.get(coid)
+            except Exception:
+                pass
+            if order is None or order.status in ("FILLED", "CANCELED", "REJECTED", "EXPIRED", "NEW", "PARTIALLY_FILLED"):
+                # NEW/PARTIALLY_FILLED 的阻断属于当前会话管理；其余终态立即解除
+                if order is not None and order.status in ("NEW", "PARTIALLY_FILLED"):
+                    continue
+                with self.risk.store.txn() as conn:
+                    conn.execute(
+                        "DELETE FROM live_risk_holds WHERE account_id=? AND client_order_id=?",
+                        (self.risk.account_id, coid),
+                    )
+                self.log(f"清除已完结订单 {coid} 的风险阻断行")
 
     def _release_stale_reservations(self) -> None:
         """超过 15 分钟仍 PENDING 的 demo 预留视为残留，释放以免吃满组合预算。"""
@@ -365,7 +384,7 @@ class DemoTrader:
 
     def step(self) -> bool:
         self._poll_pending()
-        self._resolve_unknown_orders()
+        self._reconcile_orders_and_holds()
         self._release_stale_reservations()
         halted = self.state.get("halted")
         # 对账前置：任何新单之前先核对交易所仓位；不一致即熔断（只撤不挂）

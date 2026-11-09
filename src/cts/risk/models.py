@@ -91,6 +91,7 @@ class ReserveRequest:
     funding_reserve_ratio: Decimal = Decimal("0")
     expected_equity_version: Optional[int] = None
     expected_risk_version: Optional[int] = None
+    qty: Optional[Decimal] = None  # 平仓预留必须显式给出精确数量
 
 
 @dataclass(frozen=True)

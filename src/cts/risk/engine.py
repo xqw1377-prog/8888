@@ -354,7 +354,26 @@ class RiskEngine:
                     raise StaleDataError("权益版本已变，旧预算不能批准新仓")
                 if req.expected_risk_version is not None and req.expected_risk_version != view.risk_version:
                     raise StaleDataError("风险版本已变，必须重算预留")
-            sized = self._size_batch(requests, view, bundle)
+            if exit_purpose:
+                sized = []
+                for req in requests:
+                    if req.qty is None or req.qty <= 0:
+                        raise UnitValidationError("平仓预留必须显式给出精确数量")
+                    distance = abs(req.entry_price - req.stop_price)
+                    notional = req.qty * req.entry_price * req.multiplier
+                    sized.append(
+                        SizedPosition(
+                            side=req.side,
+                            qty=req.qty,
+                            notional=notional,
+                            risk_amount=distance * req.qty * req.multiplier,
+                            stress_loss_ratio=(distance / req.entry_price) if req.entry_price > 0 else D("0"),
+                            binding_constraint="EXIT",
+                            effective_notional_capacity=notional,
+                        )
+                    )
+            else:
+                sized = self._size_batch(requests, view, bundle)
             created: list[Reservation] = []
             skipped: list[str] = []
             for req, item in zip(requests, sized):

@@ -43,13 +43,17 @@ def test_partial_close_keeps_original_side_and_zeroes_out(tmp_path) -> None:
     assert long_res.qty == D("10")
     engine.apply_fill(long_res.reservation_id, D("10"), now=NOW)
 
-    exit1 = engine.reserve([req(Side.SHORT, "s-2", "100", "102")], now=NOW, exit_purpose=True)[0]  # qty 5
+    exit1 = engine.reserve([ReserveRequest(symbol="BTCUSDT", side=Side.SHORT, signal_key="s-2",
+                                             entry_price=D("100"), stop_price=D("102"), multiplier=D("1"),
+                                             lot_size=D("1"), qty=D("5"))], now=NOW, exit_purpose=True)[0]
     engine.apply_fill(exit1.reservation_id, D("5"), now=NOW)
     pos = engine.occupancy().positions[0]
     assert pos.side == Side.LONG, "部分平仓后剩余方向必须仍是多头"
     assert pos.qty == D("5")
 
-    exit2 = engine.reserve([req(Side.SHORT, "s-3", "100", "102")], now=NOW, exit_purpose=True)[0]
+    exit2 = engine.reserve([ReserveRequest(symbol="BTCUSDT", side=Side.SHORT, signal_key="s-3",
+                                             entry_price=D("100"), stop_price=D("102"), multiplier=D("1"),
+                                             lot_size=D("1"), qty=D("5"))], now=NOW, exit_purpose=True)[0]
     engine.apply_fill(exit2.reservation_id, D("5"), now=NOW)
     pos = engine.occupancy().positions[0]
     assert pos.qty == D("0")
@@ -63,7 +67,9 @@ def test_exit_reservation_bypasses_entry_admission_blocks(tmp_path) -> None:
     engine.store.mark_restart("acct-1", now=NOW)  # RECONCILING 状态阻断一切开仓准入
     with pytest.raises(Exception):
         engine.reserve([req(Side.LONG, "s-entry-blocked", "100", "98")], now=NOW)
-    exit_res = engine.reserve([req(Side.SHORT, "s-exit", "100", "102")], now=NOW, exit_purpose=True)[0]
+    exit_res = engine.reserve([ReserveRequest(symbol="BTCUSDT", side=Side.SHORT, signal_key="s-exit",
+                                                entry_price=D("100"), stop_price=D("102"), multiplier=D("1"),
+                                                lot_size=D("1"), qty=D("10"))], now=NOW, exit_purpose=True)[0]
     assert exit_res.qty == D("10")  # 预算给满；交易器提交时自限到实际持仓量
 
 
