@@ -457,3 +457,108 @@ def test_unknown_cleanup_spares_sibling_query_hold(tmp_path) -> None:
     remaining = {r[0] for r in conn.execute("SELECT hold_id FROM live_risk_holds WHERE account_id=?", (t.risk.account_id,)).fetchall()}
     assert not any(h.startswith("unknown:") for h in remaining), "恢复型阻断应被清除"
     assert any(":QUERYING:" in h for h in remaining), "同订单的活动查询阻断不得被连带删除"
+
+
+# ---------- 授权合同：上限、品种、期限与真减仓豁免 ----------
+
+import json as _json_mod
+from pathlib import Path as _Path
+
+from cts.errors import CtsError
+from cts.ops.demo_trader import (
+    OwnerDirective,
+    directive_entry_cap,
+    directive_session_expiry,
+)
+
+
+def _directive_file(tmp_path, *, scope="TESTNET demo-fapi.binance.com 仅 BTCUSDT/ETHUSDT，单笔名义<=300 USDT",
+                    expires="2026-11-30T00:00:00+00:00") -> str:
+    path = _Path(tmp_path) / "directive.json"
+    path.write_text(_json_mod.dumps({
+        "granted_by": "xinquanwang",
+        "basis": "测试",
+        "granted_at": "2026-11-01T00:00:00+00:00",
+        "expires_at": expires,
+        "scope": scope,
+    }))
+    return str(path)
+
+
+def test_owner_directive_parses_scope_symbols_and_cap(tmp_path) -> None:
+    d = OwnerDirective.from_file(_directive_file(tmp_path))
+    assert d.network == "TESTNET"
+    assert d.symbols == ("BTCUSDT", "ETHUSDT")
+    assert d.per_order_notional_cap == D("300")
+    assert len(d.auth_id) == 12
+    assert len(d.raw_sha256) == 64
+
+
+def test_unparsable_or_missing_directive_fails_closed(tmp_path) -> None:
+    with pytest.raises(CtsError) as no_cap:
+        OwnerDirective.from_file(_directive_file(tmp_path, scope="TESTNET 仅 BTCUSDT"))
+    assert no_cap.value.reason_code == "AUTHORIZATION_UNPARSABLE"
+    with pytest.raises(CtsError) as missing:
+        OwnerDirective.from_file(str(_Path(tmp_path) / "absent.json"))
+    assert missing.value.reason_code == "AUTHORIZATION_UNPARSABLE"
+
+
+def test_wallet_can_only_shrink_the_entry_cap(tmp_path) -> None:
+    d = OwnerDirective.from_file(_directive_file(tmp_path))
+    big = directive_entry_cap(d, D("300"), D("10000"), D("5"))
+    assert big == D("300"), "钱包再大也不能超过授权/配置上限"
+    small = directive_entry_cap(d, D("300"), D("50"), D("5"))
+    assert small == D("250"), "钱包缩小只能跟着缩小额度"
+
+
+def test_session_expiry_never_exceeds_root_directive(tmp_path) -> None:
+    from datetime import timedelta
+
+    now = datetime(2026, 11, 11, tzinfo=UTC)
+    short = OwnerDirective.from_file(_directive_file(tmp_path, expires="2026-11-11T02:00:00+00:00"))
+    assert directive_session_expiry(short, now) == datetime(2026, 11, 11, 2, tzinfo=UTC)
+    long = OwnerDirective.from_file(_directive_file(tmp_path))
+    assert directive_session_expiry(long, now) == now + timedelta(hours=12)
+
+
+def test_fake_exit_orders_are_rejected_locally(tmp_path) -> None:
+    import itertools
+
+    t = trader(tmp_path)
+    t.clock = itertools.count(1000).__next__
+    t.directive = OwnerDirective.from_file(_directive_file(tmp_path))
+    t.state["position"] = {"side": "LONG", "qty": "1.0", "entry": "100", "stop": "98"}
+    oversized = t._place(side=Side.SHORT, qty=D("1.5"), ref_price=D("100"), tag="EXIT",
+                         stop=D("102"), exit_order=True)
+    assert oversized is None
+    same_side = t._place(side=Side.LONG, qty=D("1.0"), ref_price=D("100"), tag="EXIT",
+                         stop=D("98"), exit_order=True)
+    assert same_side is None
+    t.state["position"] = None
+    no_position = t._place(side=Side.SHORT, qty=D("1.0"), ref_price=D("100"), tag="EXIT",
+                           stop=D("102"), exit_order=True)
+    assert no_position is None
+    assert t.session.submits == []
+
+
+def test_true_exit_over_cap_passes_and_out_of_scope_symbol_is_refused(tmp_path) -> None:
+    import itertools
+    from dataclasses import replace as _replace
+
+    t = trader(tmp_path)
+    t.clock = itertools.count(1000).__next__
+    t.directive = OwnerDirective.from_file(_directive_file(tmp_path))
+    t.config = _replace(t.config, grant_max_notional=D("50"))  # 远小于平仓名义 100
+    t.state["position"] = {"side": "LONG", "qty": "1.0", "entry": "100", "stop": "98"}
+    placed = t._place(side=Side.SHORT, qty=D("1.0"), ref_price=D("100"), tag="EXIT",
+                      stop=D("102"), exit_order=True)
+    assert placed is not None and placed["kind"] == "EXIT"
+
+    narrow = OwnerDirective.from_file(_directive_file(tmp_path, scope="TESTNET 仅 ETHUSDT，单笔名义<=300 USDT"))
+    (tmp_path / "sub").mkdir()
+    t2 = trader(tmp_path / "sub")
+    t2.directive = narrow
+    t2.state["position"] = {"side": "LONG", "qty": "1.0", "entry": "100", "stop": "98"}
+    refused = t2._place(side=Side.SHORT, qty=D("1.0"), ref_price=D("100"), tag="EXIT",
+                        stop=D("102"), exit_order=True)
+    assert refused is None, "品种不在授权范围内连平仓也必须拒绝"

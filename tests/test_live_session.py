@@ -1885,3 +1885,50 @@ def test_blank_credentials_are_rejected() -> None:
     with pytest.raises(CtsError) as err:
         VenueCredentials("", SECRET)
     assert err.value.reason_code == "CREDENTIALS_MISSING"
+
+
+def test_over_cap_reduce_only_exit_passes_but_entry_is_blocked(tmp_path) -> None:
+    from cts.risk.models import ReserveRequest
+
+    engine = make_engine(tmp_path, equity="100000")
+    entry_res = engine.reserve([req("BTCUSDT", "s-over-cap")], now=NOW)[0]
+    more = engine.reserve([req("ETHUSDT", "s-over-cap-2")], now=NOW)[0]
+    engine.apply_fill(entry_res.reservation_id, entry_res.qty, now=NOW)
+    exit_res = engine.reserve(
+        [ReserveRequest(
+            symbol="BTCUSDT", side=Side.SHORT, signal_key="s-over-cap-exit",
+            entry_price=D("100"), stop_price=D("102"), multiplier=D("1"),
+            lot_size=D("0.001"), qty=entry_res.qty,
+        )],
+        now=NOW, exit_purpose=True,
+    )[0]
+    opener, pinned = transport(
+        [
+            {"dualSidePosition": False},
+            {"multiAssetsMargin": False},
+            [{"symbol": "BTCUSDT", "marginType": "isolated"}],
+            {"orderId": 1, "status": "NEW", "executedQty": "0"},
+        ]
+    )
+    session = LiveSession(
+        grant(network="TESTNET", account_id=engine.account_id, max_notional=D("100")),
+        VenueCredentials("key-id", SECRET),
+        pinned,
+        now=NOW,
+        path=ensure_order_db(tmp_path / "exit-cap-orders.db"),
+    )
+    with pytest.raises(CtsError) as err:
+        submit(session, engine, more.reservation_id, qty=D("1.5"), notional=D("150"), client_order_id="cid-entry")
+    assert err.value.reason_code == "RISK_LIMIT"
+
+    exit_notional = entry_res.qty * D("100")
+    assert exit_notional > D("100"), "前提：已有持仓名义确实超过上限"
+    body = submit(
+        session, engine, exit_res.reservation_id, side=Side.SHORT,
+        qty=entry_res.qty, notional=exit_notional, client_order_id="cid-exit",
+        reduce_only=True,
+    )
+    assert body["status"] == "NEW"
+    posts = [call for call in opener.calls if call[0] == "POST" and "/fapi/v1/order" in call[1]]
+    assert len(posts) == 1
+    assert "reduceOnly=true" in posts[0][1]

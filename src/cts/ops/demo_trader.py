@@ -10,6 +10,7 @@ import hmac
 import hashlib
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -20,6 +21,7 @@ from urllib.parse import urlencode
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
 from cts.clock import utc_now
+from cts.checksum import sha256_hex
 from cts.data.binance_feed import BinanceDataFeed, DataPullAuthorization
 from cts.data.store import DataStore
 from cts.errors import CtsError
@@ -114,6 +116,63 @@ def wallet_notional_cap(equity: D) -> D:
     return D(equity) * RESEARCH_LEVERAGE_CAP
 
 
+_DIRECTIVE_CAP_RE = re.compile(r"单笔名义\s*<=\s*([0-9]+(?:\.[0-9]+)?)\s*USDT")
+_DIRECTIVE_SYMBOLS_RE = re.compile(r"仅\s*([A-Z0-9]+(?:/[A-Z0-9]+)*)")
+
+
+@dataclass(frozen=True)
+class OwnerDirective:
+    """所有者授权合同是上限、品种、网络与期限的唯一来源；解析不了就熔断，代码不得另行抬高金额。"""
+
+    granted_by: str
+    granted_at: datetime
+    expires_at: datetime
+    network: str
+    symbols: tuple[str, ...]
+    per_order_notional_cap: D
+    auth_id: str
+    raw_sha256: str
+
+    @classmethod
+    def from_file(cls, path: str = OWNER_DIRECTIVE_FILE) -> "OwnerDirective":
+        try:
+            with open(path) as handle:
+                raw = handle.read()
+            directive = json.loads(raw)
+            scope = directive["scope"]
+            granted_at = datetime.fromisoformat(directive["granted_at"])
+            expires_at = datetime.fromisoformat(directive["expires_at"])
+        except Exception as exc:
+            raise CtsError(f"授权合同不可读取或解析: {exc}", reason_code="AUTHORIZATION_UNPARSABLE") from exc
+        cap = _DIRECTIVE_CAP_RE.search(scope)
+        symbols = _DIRECTIVE_SYMBOLS_RE.search(scope)
+        if cap is None or symbols is None:
+            raise CtsError("授权合同缺少单笔上限或品种范围", reason_code="AUTHORIZATION_UNPARSABLE")
+        if "TESTNET" not in scope.upper():
+            raise CtsError("授权合同未限定 TESTNET", reason_code="AUTHORIZATION_UNPARSABLE")
+        payload = f"{directive['granted_by']}|{directive['granted_at']}|{directive['expires_at']}|{scope}"
+        return cls(
+            granted_by=directive["granted_by"],
+            granted_at=granted_at,
+            expires_at=expires_at,
+            network="TESTNET",
+            symbols=tuple(symbols.group(1).split("/")),
+            per_order_notional_cap=D(cap.group(1)),
+            auth_id=sha256_hex({"contract": payload})[:12],
+            raw_sha256=sha256_hex({"file": raw}),
+        )
+
+
+def directive_entry_cap(directive: OwnerDirective, config_cap: D, wallet_equity: D, leverage: D) -> D:
+    """开仓/补仓额度取授权上限、配置上限、钱包对应额度的最小值；钱包只能缩小额度。"""
+    return min(D(directive.per_order_notional_cap), D(config_cap), D(wallet_equity) * D(leverage))
+
+
+def directive_session_expiry(directive: OwnerDirective, now: datetime, hours: int = 12) -> datetime:
+    """会话期限不得超过根授权期限。"""
+    return min(now + timedelta(hours=hours), directive.expires_at)
+
+
 def exit_limit_price(order_side: Side, mark: D, anchor: D, atr: D, aggression: D) -> D:
     """平仓限价以止损或止盈为锚，最多再让出 0.5 倍 ATR，不跟着收盘价追。"""
     room = (atr if atr > 0 else D("0")) * EXIT_CHASE_ATR
@@ -174,6 +233,7 @@ class DemoTrader:
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
         renew: Optional[Callable[[], None]] = None,
+        directive: Optional[OwnerDirective] = None,
     ) -> None:
         self.config = config
         self.risk = risk
@@ -184,6 +244,7 @@ class DemoTrader:
         self.sleeper = sleeper
         self.credentials = credentials
         self.renew = renew
+        self.directive = directive
         self._heartbeat = 0.0
         self._failures = 0
         self.state: dict = {"position": None, "pending": None}
@@ -350,9 +411,24 @@ class DemoTrader:
             self.risk.release_unbound_reservation(reservation.reservation_id)
             self.log(f"{tag} 名义 {notional} 低于交易所最小 50，已释放预留")
             return None
-        if notional > self._order_cap():
+        if notional > self._order_cap() and not exit_order:
             self.risk.release_unbound_reservation(reservation.reservation_id)
-            self.log(f"{tag} 名义 {notional} 超过钱包对应上限，已释放预留")
+            self.log(f"{tag} 名义 {notional} 超过授权/配置/钱包上限，已释放预留")
+            return None
+        if exit_order:
+            # 额度豁免只给真减仓：必须有相反持仓且数量不得超过它，否则退出通道会被借道加风险
+            pos = self.state.get("position")
+            if pos is None or pos.get("side") == side.value:
+                self.risk.release_unbound_reservation(reservation.reservation_id)
+                self.log(f"{tag} 拒绝：没有相反方向持仓的减仓证据")
+                return None
+            if qty > D(pos["qty"]):
+                self.risk.release_unbound_reservation(reservation.reservation_id)
+                self.log(f"{tag} 拒绝：平仓量 {qty} 超过持仓 {pos['qty']}")
+                return None
+        if self.directive is not None and self.config.symbol not in self.directive.symbols:
+            self.risk.release_unbound_reservation(reservation.reservation_id)
+            self.log(f"{tag} 拒绝：{self.config.symbol} 不在授权品种 {self.directive.symbols}")
             return None
         coid = f"cts_demo_{tag}_{int(self.clock())}"
         try:
@@ -871,14 +947,21 @@ def build_default(config: DemoTraderConfig, *, proxy: str = "http://127.0.0.1:17
             installed = risk.store.load_account(conn, "local-ledger")["param_version"]
         if installed != bundle.version:
             risk.install_parameters(bundle)
-    config = replace(config, grant_max_notional=wallet_notional_cap(equity))
+    directive = OwnerDirective.from_file()
+    if utc_now() >= directive.expires_at:
+        raise CtsError("所有者授权合同已过期", reason_code="LIVE_GRANT_EXPIRED")
+    if config.symbol not in directive.symbols:
+        raise CtsError(f"{config.symbol} 不在授权品种范围 {directive.symbols}", reason_code="AUTHORIZATION_SCOPE")
+    base_config_cap = config.grant_max_notional
+    config = replace(config, grant_max_notional=directive_entry_cap(directive, base_config_cap, equity, RESEARCH_LEVERAGE_CAP))
     grant = LiveGrant(
-        granted_by="xinquanwang(会话现场指示)",
+        granted_by=f"{directive.granted_by}(授权合同 {directive.auth_id})",
         statement=LIVE_GRANT_STATEMENT,
         network="TESTNET",
         account_id="local-ledger",
         max_notional=config.grant_max_notional,
-        expires_at=utc_now() + timedelta(hours=12),
+        expires_at=directive_session_expiry(directive, utc_now()),
+        symbols=directive.symbols,
     )
     session = LiveSession(
         grant,
@@ -893,10 +976,9 @@ def build_default(config: DemoTraderConfig, *, proxy: str = "http://127.0.0.1:17
     def renew() -> None:
         now = utc_now()
         try:
-            with open(OWNER_DIRECTIVE_FILE) as handle:
-                directive = json.load(handle)
-            directive_valid = now < datetime.fromisoformat(directive["expires_at"])
-        except Exception:
+            fresh = OwnerDirective.from_file()
+            directive_valid = now < fresh.expires_at
+        except CtsError:
             directive_valid = False
         if not directive_valid:
             if holder["trader"].state.get("halted") != "directive-expired":
@@ -909,15 +991,18 @@ def build_default(config: DemoTraderConfig, *, proxy: str = "http://127.0.0.1:17
 
             refreshed = D(read_demo_wallet()["equity"])
             risk.set_equity(refreshed, reason="币安模拟盘钱包")
-            holder["trader"].config = replace(config, grant_max_notional=wallet_notional_cap(refreshed))
+            # 续期不得扩大金额：额度仍是授权、原始配置上限、当前钱包三者的最小值
+            cap = directive_entry_cap(fresh, base_config_cap, refreshed, RESEARCH_LEVERAGE_CAP)
+            holder["trader"].config = replace(config, grant_max_notional=cap)
             holder["session"] = LiveSession(
                 LiveGrant(
-                    granted_by="xinquanwang(会话现场指示)",
+                    granted_by=f"{fresh.granted_by}(授权合同 {fresh.auth_id})",
                     statement=LIVE_GRANT_STATEMENT,
                     network="TESTNET",
                     account_id="local-ledger",
-                    max_notional=holder["trader"].config.grant_max_notional,
-                    expires_at=now + timedelta(hours=12),
+                    max_notional=cap,
+                    expires_at=directive_session_expiry(fresh, now),
+                    symbols=fresh.symbols,
                 ),
                 credentials,
                 open_testnet_transport(),

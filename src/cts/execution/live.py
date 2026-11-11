@@ -221,7 +221,8 @@ class LiveSession:
             self._bind_risk(risk, now)
         if reduce_only and type(self._transport) is not PinnedTransport:
             raise CtsError("减仓写单不在本批放行，未发送请求", reason_code="LIVE_TRADING_HOLD")
-        if computed > self.grant.max_notional:
+        if computed > self.grant.max_notional and not reduce_only:
+            # 减仓单不受额度拦截：真仅减仓由交易所 reduceOnly 语义、引擎等量减仓和调用方持仓证据共同保证
             raise CtsError("名义价值超出本进程限额，未发送请求", reason_code="RISK_LIMIT")
         existing = self._require_known(client_order_id, allow_missing=True)
         if existing is not None:
@@ -241,7 +242,9 @@ class LiveSession:
         elif self._has_unknown():
             raise CtsError("存在未知订单，禁止新增风险", reason_code="UNKNOWN_ORDER")
         if existing is None:
-            self._admit_open(risk, reservation_id, symbol, side, D(qty), computed)
+            if not reduce_only:
+                # 开仓准入只约束新风险；减仓单凭 exit_purpose 预留 + reduceOnly 语义放行
+                self._admit_open(risk, reservation_id, symbol, side, D(qty), computed)
             risk.bind_live_order(
                 reservation_id,
                 client_order_id=client_order_id,
@@ -261,6 +264,7 @@ class LiveSession:
                     price=D(price),
                     notional=computed,
                     now=now,
+                    reduce_only=reduce_only,
                 )
             except Exception:
                 risk.release_live_order(client_order_id)
@@ -421,6 +425,7 @@ class LiveSession:
         price: Decimal,
         notional: Decimal,
         now: datetime,
+        reduce_only: bool = False,
     ) -> None:
         draft = LiveOrder(
             client_order_id=client_order_id,
@@ -438,7 +443,7 @@ class LiveSession:
         )
         if self._has_unknown():
             raise CtsError("存在未知订单，禁止新增风险", reason_code="UNKNOWN_ORDER")
-        self.orders.insert_intent_within_cap(draft, self.grant.max_notional, now)
+        self.orders.insert_intent_within_cap(draft, self.grant.max_notional, now, reduce_only=reduce_only)
         self._recompute_reserved()
 
     def _save_order(

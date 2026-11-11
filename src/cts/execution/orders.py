@@ -174,7 +174,9 @@ class OrderStore:
             ).fetchone()
         return None if row is None else self._row(row)
 
-    def insert_intent_within_cap(self, order: LiveOrder, max_notional: Decimal, updated_at: datetime) -> None:
+    def insert_intent_within_cap(
+        self, order: LiveOrder, max_notional: Decimal, updated_at: datetime, reduce_only: bool = False
+    ) -> None:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -196,7 +198,7 @@ class OrderStore:
                     ).fetchall()
                 ]
                 charged = net_session_exposure(existing_orders)
-                if charged + order.notional > D(max_notional):
+                if not reduce_only and charged + order.notional > D(max_notional):
                     raise RiskLimitError("累计名义超出本进程限额，未发送请求")
                 self._conn.execute(
                     """
