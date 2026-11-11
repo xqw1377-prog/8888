@@ -227,12 +227,9 @@ class ConsoleApp:
                 DataPullAuthorization(granted_by="console", expires_at=utc_now() + timedelta(minutes=30), max_requests=8),
             )
             klines: dict[str, list] = {}
-            self._btc_bars = []
             for symbol in ("BTCUSDT", "ETHUSDT"):
                 bars = feed.fetch_candles(symbol, "1m", 90)
                 closed = [bar for bar in bars if bar.is_closed][-90:]
-                if symbol == "BTCUSDT":
-                    self._btc_bars = closed
                 klines[symbol] = [
                     {
                         "o": format(bar.open, "f"),
@@ -243,6 +240,13 @@ class ConsoleApp:
                     for bar in closed
                 ]
             self.state.klines = klines
+            try:
+                signal_bars = feed.fetch_candles("BTCUSDT", "15m", 90)
+                closed_signal = [bar for bar in signal_bars if bar.is_closed][-90:]
+                if len(closed_signal) >= 60:
+                    self._btc_bars = closed_signal
+            except Exception:
+                pass
             self._kline_at = time.monotonic()
         except Exception:
             if not self.state.klines:
@@ -819,10 +823,12 @@ def read_filled_demo_orders(path: str = ORDERS_DB_PATH) -> list[dict]:
 def build_demo_desk(trader: dict, *, bars: list, has_position: bool) -> dict[str, str]:
     from cts.risk.parameters import RESEARCH_LEVERAGE_CAP
     from cts.strategy.indicators import atr_sma
-    from cts.strategy.t1 import T1Params, evaluate_signal
+    from cts.strategy.t1 import evaluate_signal
 
-    params = T1Params(entry_lookback=20, exit_lookback=10, atr_period=14, warmup_bars=60, version="T1-DEMO-1M")
-    multiples = T1Params()
+    from cts.ops.demo_trader import DEMO_PARAMS
+
+    params = DEMO_PARAMS
+    multiples = DEMO_PARAMS
     age = trader.get("_age")
     if trader.get("halted"):
         trader_state = "熔断"
@@ -847,19 +853,21 @@ def build_demo_desk(trader: dict, *, bars: list, has_position: bool) -> dict[str
     return {
         "name": params.version,
         "symbol": "BTCUSDT",
-        "interval": "1m",
+        "interval": "15m",
         "directions": "多空都做，同一时间只持有一仓",
-        "stop": f"{multiples.stop_multiple}×ATR，只向有利方向移动",
-        "take_profit": f"{multiples.take_multiple}×ATR，按成交价固定",
-        "entry_margin": "当日钱包的 80% 作为开仓保证金上限",
-        "add_margin": "当日钱包的 20% 只用于一次补仓，逆向达到 1×ATR 且未碰到止损",
-        "hold": "5 倍合约只在止损或止盈时平仓，1 分钟通道碰到也不提前平",
+        "stop": f"{multiples.stop_multiple}×ATR，5 倍杠杆下的慢止损，开仓时定下",
+        "take_profit": f"{multiples.take_multiple}×ATR，按成交价固定，比止损近",
+        "entry_margin": "当日钱包的 80% 作为开仓保证金上限。当日权益跌破 1% 就不再开新仓",
+        "add_margin": "当日钱包的 20% 留在钱包里，不再加到亏损仓",
+        "hold": "只在止损或止盈时平仓。平仓限价锚在止损或止盈上，最多再让 0.5×ATR",
         "leverage": format(RESEARCH_LEVERAGE_CAP, "f"),
         "trader": trader_state,
         "halted": halted,
         "signal": signal_name,
         "signal_band": band,
         "signal_atr": atr,
+        "stop_multiple": format(multiples.stop_multiple, "f"),
+        "take_multiple": format(multiples.take_multiple, "f"),
     }
 
 
@@ -1478,7 +1486,7 @@ function board(data) {
         <li><span>持仓数量</span><em>${esc(qty)}</em></li>
         <li><span>通道</span><em>${esc(band)}</em></li>
         <li><span>ATR</span><em>${esc(atr)}</em></li>
-        <li><span>止损 / 止盈</span><em>${desk.name ? "2.5× / 5× ATR" : "暂无证据"}</em></li>
+        <li><span>止损 / 止盈</span><em>${desk.name ? `${desk.stop_multiple}× / ${desk.take_multiple}× ATR` : "暂无证据"}</em></li>
       </ul>
     </article>`;
   }).join("") || `<article class="signal"><div class="px">暂无证据</div></article>`;

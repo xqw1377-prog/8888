@@ -48,6 +48,18 @@ STOP_FILE_DEFAULT = "/Users/xinquanwang/8888/var/run/DEMO_TRADER_STOP"
 OWNER_DIRECTIVE_FILE = "/Users/xinquanwang/8888/var/run/OWNER_TRADING_DIRECTIVE"
 ENTRY_MARGIN_PCT = D("0.80")
 ADD_MARGIN_PCT = D("0.20")
+EXIT_CHASE_ATR = D("0.5")
+ENTRY_DRIFT_ATR = D("0.5")
+DAILY_LOSS_PAUSE = D("0.01")
+DEMO_PARAMS = T1Params(
+    entry_lookback=20,
+    exit_lookback=10,
+    atr_period=14,
+    warmup_bars=60,
+    stop_multiple=D("8"),
+    take_multiple=D("4"),
+    version="T1-DEMO-15M",
+)
 
 
 @dataclass(frozen=True)
@@ -69,8 +81,8 @@ class DemoTraderConfig:
     def fast_1m(cls, symbol: str = "BTCUSDT") -> "DemoTraderConfig":
         return cls(
             symbol=symbol,
-            interval="1m",
-            params=T1Params(entry_lookback=20, exit_lookback=10, atr_period=14, warmup_bars=60, version="T1-DEMO-1M"),
+            interval="15m",
+            params=DEMO_PARAMS,
             target_notional=D("150"),
             grant_max_notional=D("300"),
             poll_seconds=20.0,
@@ -80,15 +92,15 @@ class DemoTraderConfig:
 
 
 def demo_research_bundle() -> ParameterBundle:
-    """模拟盘：保证金预算等于当日钱包。其中 80% 给定开仓，20% 只给定补仓。"""
+    """模拟盘：保证金预算等于当日钱包。开仓最多用 80%，另外 20% 留在钱包里。"""
     values = dict(PROPOSED_VALUES)
     leverage = format(RESEARCH_LEVERAGE_CAP, "f")
     values["leverage"] = leverage
     values["margin_budget_pct"] = "1.00"
-    values["t1_params_hash"] = t1_params_binding_hash(T1Params(entry_lookback=20, exit_lookback=10, atr_period=14, warmup_bars=60, version="T1-DEMO-1M"))
+    values["t1_params_hash"] = t1_params_binding_hash(DEMO_PARAMS)
     values["per_symbol_notional_pct"] = leverage
     values["total_abs_notional_pct"] = leverage
-    version = "risk-v0.3.3-demo-wallet80"
+    version = "risk-v0.3.4-demo-slowstop"
     status = ParameterStatus.PROPOSED
     return ParameterBundle(
         version=version,
@@ -100,6 +112,33 @@ def demo_research_bundle() -> ParameterBundle:
 
 def wallet_notional_cap(equity: D) -> D:
     return D(equity) * RESEARCH_LEVERAGE_CAP
+
+
+def exit_limit_price(order_side: Side, mark: D, anchor: D, atr: D, aggression: D) -> D:
+    """平仓限价以止损或止盈为锚，最多再让出 0.5 倍 ATR，不跟着收盘价追。"""
+    room = (atr if atr > 0 else D("0")) * EXIT_CHASE_ATR
+    if order_side == Side.SHORT:
+        worst = anchor - room
+        raw = mark * (D("1") - aggression)
+        return max(raw, worst)
+    worst = anchor + room
+    raw = mark * (D("1") + aggression)
+    return min(raw, worst)
+
+
+def entry_still_valid(*, side: Side, close: D, band: D, atr: D, mark: D) -> bool:
+    """标记价回到通道内，或离开信号价超过 0.5 倍 ATR，这笔不做。"""
+    if atr > 0 and abs(mark - close) > atr * ENTRY_DRIFT_ATR:
+        return False
+    if side == Side.LONG:
+        return mark > band
+    return mark < band
+
+
+def daily_loss_reached(opened: D, current: D) -> bool:
+    if opened <= 0 or current <= 0:
+        return False
+    return current <= opened * (D("1") - DAILY_LOSS_PAUSE)
 
 
 def add_triggered(position: dict, mark: D) -> bool:
@@ -233,6 +272,7 @@ class DemoTrader:
 
     def _capital_base(self) -> D:
         current = self._sync_wallet_equity()
+        self.state["last_equity"] = format(current, "f")
         today = utc_now().date().isoformat()
         daily = self.state.get("daily_wallet") or {}
         if daily.get("date") != today:
@@ -260,9 +300,12 @@ class DemoTrader:
         stop: Optional[D],
         exit_order: bool = False,
         max_new_margin: Optional[D] = None,
+        limit_price: Optional[D] = None,
     ) -> Optional[dict]:
         tick, step, min_qty = self._filters()
-        if side == Side.LONG:
+        if limit_price is not None:
+            price = round_to_step(limit_price, tick, up=(side == Side.LONG))
+        elif side == Side.LONG:
             price = round_to_step(ref_price * (D("1") + self.config.aggression), tick, up=True)
         else:
             price = round_to_step(ref_price * (D("1") - self.config.aggression), tick, up=False)
@@ -608,18 +651,22 @@ class DemoTrader:
                     hit_target = mark >= target if position["side"] == "LONG" else mark <= target
                 if hit_target:
                     opposite = Side.SHORT if position["side"] == "LONG" else Side.LONG
+                    limit = exit_limit_price(opposite, mark, target, D(position.get("atr") or "0"), self.config.aggression)
                     self.state["pending"] = self._place(
-                        side=opposite, qty=D(position["qty"]), ref_price=mark, tag="EXIT", stop=stop, exit_order=True
+                        side=opposite, qty=D(position["qty"]), ref_price=mark, tag="EXIT", stop=stop,
+                        exit_order=True, limit_price=limit,
                     )
-                    self.log(f"数据降级：标记价 {mark} 触发止盈 {target}")
+                    self.log(f"数据降级：标记价 {mark} 触发止盈 {target} 限价={limit}")
                 elif mark is not None and stop > 0:
                     hit = mark <= stop if position["side"] == "LONG" else mark >= stop
                     if hit:
                         opposite = Side.SHORT if position["side"] == "LONG" else Side.LONG
+                        limit = exit_limit_price(opposite, mark, stop, D(position.get("atr") or "0"), self.config.aggression)
                         self.state["pending"] = self._place(
-                            side=opposite, qty=D(position["qty"]), ref_price=mark, tag="EXIT", stop=stop, exit_order=True
+                            side=opposite, qty=D(position["qty"]), ref_price=mark, tag="EXIT", stop=stop,
+                            exit_order=True, limit_price=limit,
                         )
-                        self.log(f"数据降级：标记价 {mark} 触发止损 {stop}")
+                        self.log(f"数据降级：标记价 {mark} 触发止损 {stop} 限价={limit}")
             self._save_state()
             return True
         position = self.state.get("position")
@@ -636,56 +683,71 @@ class DemoTrader:
         if position is None and not self.state.get("pending"):
             signal = evaluate_signal(bars, params=self.config.params, has_position=False, has_pending_entry=False)
             if signal is not None:
-                last = bars[-1].close
                 base = self._capital_base()
-                placed = self._place(
-                    side=signal.side,
-                    qty=D("0"),
-                    ref_price=last,
-                    tag="ENTRY",
-                    stop=None,
-                    max_new_margin=base * ENTRY_MARGIN_PCT,
-                )
-                if placed is not None:
-                    placed["atr"] = format(signal.atr, "f")
-                self.state["pending"] = placed
-                self.log(f"入场信号 {signal.side.value} @band={signal.entry_band} atr={signal.atr}")
+                opened = D((self.state.get("daily_wallet") or {}).get("equity") or "0")
+                if daily_loss_reached(opened, D(self.state.get("last_equity") or "0")):
+                    if not self.state.get("day_paused"):
+                        self.log(f"当日权益已低于开盘钱包 {DAILY_LOSS_PAUSE}，停止新开仓")
+                        self.state["day_paused"] = True
+                elif mark is None or not entry_still_valid(
+                    side=signal.side, close=signal.close, band=signal.entry_band, atr=signal.atr, mark=mark
+                ):
+                    key = signal.event_time.isoformat()
+                    if self.state.get("stale_skip") != key:
+                        self.state["stale_skip"] = key
+                        self.log(f"入场作废 标记价={mark} 信号价={signal.close} 通道={signal.entry_band}")
+                else:
+                    self.state["day_paused"] = False
+                    placed = self._place(
+                        side=signal.side,
+                        qty=D("0"),
+                        ref_price=mark,
+                        tag="ENTRY",
+                        stop=None,
+                        max_new_margin=base * ENTRY_MARGIN_PCT,
+                    )
+                    if placed is not None:
+                        placed["atr"] = format(signal.atr, "f")
+                    self.state["pending"] = placed
+                    self.log(f"入场信号 {signal.side.value} @band={signal.entry_band} atr={signal.atr}")
         elif position is not None and not self.state.get("pending"):
             open_position = _as_open_position(position, self.config.symbol)
+            stored_stop = D(position.get("stop") or "0")
             updated, exit_decision = evaluate_exit(open_position, bars, mark_price=mark, params=self.config.params)
             position["extreme"] = format(updated.extreme, "f")
-            position["stop"] = format(updated.stop, "f")
-            if exit_decision is None and venue is not None and mark is not None and add_triggered(position, mark):
-                base = self._capital_base()
-                self.state["pending"] = self._place(
-                    side=Side.LONG if position["side"] == "LONG" else Side.SHORT,
-                    qty=D("0"),
-                    ref_price=mark,
-                    tag="ADD",
-                    stop=D(position["stop"]),
-                    max_new_margin=base * ADD_MARGIN_PCT,
-                )
-                self.log(f"补仓触发 标记价={mark} 使用当日钱包 20% 保证金上限")
-                self._save_state()
-                return True
+            if exit_decision is not None and exit_decision.reason == "TREND":
+                if not position.get("trend_noted"):
+                    self.log(f"通道已碰到 {exit_decision.trend_level}，继续持有到止损或止盈")
+                    position["trend_noted"] = True
+                exit_decision = None
+            elif position.get("trend_noted"):
+                position.pop("trend_noted", None)
+            if exit_decision is not None and exit_decision.reason == "STOP" and mark is not None:
+                hit = mark <= stored_stop if position["side"] == "LONG" else mark >= stored_stop
+                if not hit:
+                    exit_decision = None
             if exit_decision is not None:
                 if venue is not None and abs(venue) < D(position["qty"]):
                     self.state["halted"] = "position-mismatch"
                     self.log(f"拟平 {position['qty']} 超过交易所实际 {abs(venue)}，熔断")
                     self._save_state()
                     return True
-                last = bars[-1].close
+                anchor = stored_stop if exit_decision.reason == "STOP" else D(position.get("take_profit") or "0")
+                order_side = Side.SHORT if position["side"] == "LONG" else Side.LONG
+                ref = mark if mark is not None else bars[-1].close
+                limit = exit_limit_price(order_side, ref, anchor, D(position.get("atr") or "0"), self.config.aggression)
                 self.state["pending"] = self._place(
-                    side=Side.SHORT if position["side"] == "LONG" else Side.LONG,
+                    side=order_side,
                     qty=D(position["qty"]),
-                    ref_price=last,
+                    ref_price=ref,
                     tag="EXIT",
-                    stop=D(position["stop"]),
+                    stop=stored_stop,
                     exit_order=True,
+                    limit_price=limit,
                 )
                 self.log(
-                    f"退出信号 {exit_decision.reason} stop={exit_decision.stop} "
-                    f"目标={position.get('take_profit', '')}"
+                    f"退出信号 {exit_decision.reason} stop={stored_stop} "
+                    f"目标={position.get('take_profit', '')} 限价={limit}"
                 )
         self._save_state()
         return True

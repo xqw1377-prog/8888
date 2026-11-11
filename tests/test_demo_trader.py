@@ -15,7 +15,16 @@ from cts.risk.engine import RiskEngine
 from cts.risk.models import ReserveRequest
 from cts.strategy.t1 import T1Params
 from cts.risk.parameters import RESEARCH_LEVERAGE_CAP
-from cts.ops.demo_trader import DemoTrader, DemoTraderConfig, add_triggered, demo_research_bundle, wallet_notional_cap
+from cts.ops.demo_trader import (
+    DemoTrader,
+    DemoTraderConfig,
+    add_triggered,
+    daily_loss_reached,
+    demo_research_bundle,
+    entry_still_valid,
+    exit_limit_price,
+    wallet_notional_cap,
+)
 
 NOW = datetime(2026, 11, 8, 3, 0, tzinfo=UTC)
 
@@ -201,6 +210,19 @@ def test_corrupt_state_file_halts_instead_of_empty(tmp_path) -> None:
     assert session.submits == []
 
 
+def test_low_leverage_stop_is_slower_than_the_old_scalp() -> None:
+    from cts.ops.demo_trader import DEMO_PARAMS
+    from cts.strategy.t1 import initial_stop, take_profit_price
+
+    assert DEMO_PARAMS.stop_multiple == D("8")
+    assert DEMO_PARAMS.take_multiple == D("4")
+    assert DEMO_PARAMS.take_multiple < DEMO_PARAMS.stop_multiple
+    stop = initial_stop(Side.LONG, D("100"), D("2"), DEMO_PARAMS)
+    target = take_profit_price(Side.LONG, D("100"), D("2"), DEMO_PARAMS)
+    assert stop == D("84")
+    assert target == D("108")
+
+
 def test_demo_research_bundle_uses_the_cap() -> None:
     bundle = demo_research_bundle()
     assert bundle.values["leverage"] == "5"  # 所有者指示 2026-11-09：研究上限 3 -> 5
@@ -238,8 +260,8 @@ def test_trailing_stop_exit_is_honored(tmp_path) -> None:
     assert session.submits, "移动止损/趋势退出必须照常触发平仓"
 
 
-def test_trend_exit_is_honored(tmp_path) -> None:
-    """复审裁定：恢复既有退出行为——TREND 退出立即平仓，不得忽略后继续持有。"""
+def test_channel_touch_and_trail_do_not_close(tmp_path) -> None:
+    """2026-11-10：通道碰到、移动止损收紧，都不平仓。记下的止损没被标记价碰到就继续持有。"""
     session = FakeSession([])
     bars = make_bars(["100"] * 7 + ["99"])
     t = trader(
@@ -249,8 +271,23 @@ def test_trend_exit_is_honored(tmp_path) -> None:
                             "entry_time": "2026-11-01T00:00:00+00:00"}, "pending": None},
     )
     t.step()
-    assert session.submits, "TREND 退出必须照常触发平仓"
-    assert "trend_held" not in (t.state.get("position") or {})
+    assert session.submits == []
+    assert t.state["position"]["stop"] == "50"
+
+
+def test_exit_limit_stops_at_half_an_atr_past_the_stop() -> None:
+    price = exit_limit_price(Side.LONG, D("74453"), D("74206"), D("24"), D("0.002"))
+    assert price == D("74218")
+    held = exit_limit_price(Side.SHORT, D("90"), D("100"), D("4"), D("0.002"))
+    assert held == D("98")
+
+
+def test_entry_is_void_once_price_reenters_or_runs_off() -> None:
+    assert not entry_still_valid(side=Side.LONG, close=D("100"), band=D("99"), atr=D("4"), mark=D("99"))
+    assert not entry_still_valid(side=Side.LONG, close=D("100"), band=D("99"), atr=D("4"), mark=D("103"))
+    assert entry_still_valid(side=Side.LONG, close=D("100"), band=D("99"), atr=D("4"), mark=D("101"))
+    assert daily_loss_reached(D("4995"), D("4945.05"))
+    assert not daily_loss_reached(D("4995"), D("4950"))
 
 
 def test_restored_position_without_stop_recomputes_nonzero_stop(tmp_path) -> None:
