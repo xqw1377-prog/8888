@@ -659,3 +659,65 @@ def test_funding_visible_after_exit_is_booked_without_backdating() -> None:
     assert funding.metadata["payment"] == "-0.5"
     closed = next(event for event in ledger.events() if event.metadata.get("note") == "reduce")
     assert closed.metadata["price"] == "110"
+
+
+def _tp_replay(bars, marks, params=None):
+    ledger = Ledger("acct-tp")
+    ledger.transfer_in(amount=D("10000"), event_time=ORIGIN, received_at=ORIGIN, external_id="dep")
+    result = replay_t1(
+        ledger=ledger,
+        symbol="BTCUSDT",
+        candles=bars,
+        marks=marks,
+        config=ReplayConfig(params=params or T1Params()),
+        venue="SIM",
+    )
+    return ledger, result
+
+
+def test_take_profit_is_booked_as_exit_and_releases_margin() -> None:
+    bars = breakout_series(130)
+    bars.append(candle(132, open_="118.5", high="130", low="118", close="129"))
+    marks = [mark(132, "135")]
+    ledger, result = _tp_replay(bars, marks)
+    assert result.fills == 1
+    assert result.exits == 1
+    assert result.exit_reasons == {"TAKE_PROFIT": 1}
+    pos = ledger.position("BTCUSDT")
+    assert pos.qty == 0 and pos.side is None
+    # 清仓后逐仓保证金必须全部划回钱包
+    assert pos.isolated_margin == 0
+    assert ledger.balance(AccountBucket.ISOLATED_MARGIN) == 0
+    kinds = [e.event_type for e in ledger.events()]
+    assert LedgerEventType.MARGIN_RELEASE in kinds
+    exits = [e for e in ledger.events() if e.metadata.get("exit_reason")]
+    assert len(exits) == result.exits
+    assert exits[0].metadata["exit_reason"] == "TAKE_PROFIT"
+    assert exits[0].metadata["price_source"] == "MARK"
+    assert exits[0].metadata["quote_grade"] == "RESEARCH_APPROXIMATE"
+
+
+def test_tp_and_stop_event_order_is_respected() -> None:
+    tail = [
+        candle(132, open_="118.5", high="130", low="118", close="129"),
+        candle(133, open_="129", high="130", low="117", close="118"),
+    ]
+    bars = breakout_series(130) + tail
+    _, tp_first = _tp_replay(bars, [mark(132, "135"), mark(133, "105")])
+    assert tp_first.exit_reasons == {"TAKE_PROFIT": 1}
+    _, stop_first = _tp_replay(bars, [mark(132, "105"), mark(133, "135")])
+    assert stop_first.exit_reasons == {"STOP": 1}
+
+
+def test_same_mark_tp_and_stop_resolves_conservatively_to_stop() -> None:
+    # 先把 extreme 抬到 150,移动止损(150-2.5*ATR≈138.75)越过固定止盈(118.06+14.5≈132.56);
+    # 唯一一笔标记价 135 同时满足两个条件,先后不可辨,必须保守取止损。
+    bars = breakout_series(130)
+    bars.append(candle(132, open_="118.5", high="126", low="118", close="126"))
+    bars.append(candle(133, open_="126", high="150", low="126", close="150"))
+    bars.append(candle(134, open_="150", high="150", low="130", close="140"))
+    marks = [mark(134, "135")]
+    ledger, result = _tp_replay(bars, marks)
+    assert result.exit_reasons == {"STOP": 1}
+    exits = [e for e in ledger.events() if e.metadata.get("exit_reason")]
+    assert exits[0].metadata["price"] == "135"

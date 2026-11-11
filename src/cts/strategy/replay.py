@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional, Sequence
 
 from cts.clock import UTC
 from cts.data.models import Candle, DataGrade, FundingSettlement, MarkSample
-from cts.errors import LookaheadError, UnitValidationError
+from cts.errors import CtsError, LookaheadError, UnitValidationError
 from cts.execution.liq import model_liq_price
 from cts.ledger.journal import Ledger
-from cts.ledger.models import Side
+from cts.ledger.models import LedgerEventType, Side
 from cts.money import D
 from cts.risk.parameters import INITIAL_MARGIN_LEVERAGE, parse_contract_leverage
 from cts.strategy.sizing import SizedPosition, size_position
@@ -25,6 +25,7 @@ from cts.strategy.t1 import (
     evaluate_signal,
     next_open_fill_price,
     stop_breached,
+    take_profit_price,
 )
 
 
@@ -49,6 +50,7 @@ class ReplayResult:
     skipped_no_fill: int
     grade: DataGrade = DataGrade.SIGNAL_RESEARCH_ONLY
     funding_posted: int = 0
+    exit_reasons: dict[str, int] = field(default_factory=dict)
 
 
 def bar_open_time(bar: Candle) -> datetime:
@@ -93,7 +95,22 @@ def _mark_key(mk: MarkSample) -> tuple:
     return (mk.symbol, mk.source_id, mk.event_time.isoformat(), format(mk.mark_price, "f"), mk.available_at.isoformat())
 
 
-def next_available_stop(position: OpenPosition, marks: Sequence[MarkSample], consumed: set[tuple], as_of: datetime):
+def take_profit_hit(side: Side, mark_price: Decimal, target: Decimal) -> bool:
+    m = D(mark_price)
+    if side == Side.LONG:
+        return m >= target
+    return m <= target
+
+
+def next_mark_exit(
+    position: OpenPosition,
+    marks: Sequence[MarkSample],
+    consumed: set[tuple],
+    as_of: datetime,
+    params: T1Params,
+) -> tuple[Optional[MarkSample], str]:
+    """按事件顺序找第一笔触发退出条件的标记价：止损与止盈同根不可辨时保守取止损。"""
+    target = take_profit_price(position.side, position.avg_price, position.signal_atr, params)
     visible = [
         mk
         for mk in marks
@@ -106,8 +123,10 @@ def next_available_stop(position: OpenPosition, marks: Sequence[MarkSample], con
     for mk in visible:
         consumed.add(_mark_key(mk))
         if stop_breached(position, mk.mark_price):
-            return mk
-    return None
+            return mk, "STOP"
+        if take_profit_hit(position.side, mk.mark_price, target):
+            return mk, "TAKE_PROFIT"
+    return None, ""
 
 
 def latest_mark(marks: Sequence[MarkSample], as_of: datetime, symbol: str) -> Optional[MarkSample]:
@@ -145,6 +164,7 @@ def replay_t1(
     exits = 0
     skipped = 0
     funding_posted = 0
+    reason_counts: dict[str, int] = {}
     consumed_marks: set[tuple] = set()
     posted_funding: set[str] = set()
     prior = ledger.events()
@@ -167,7 +187,21 @@ def replay_t1(
         last_received = seen
         return seen
 
-    def book_stop(held: OpenPosition, breached: MarkSample) -> None:
+    def release_closed_margin(booked: datetime, seen: datetime, tag: str) -> None:
+        """清仓后把剩余逐仓保证金划回钱包；金额取成交后的实际剩余，不是当初锁定量。"""
+        held_margin = ledger.position(symbol, multiplier=config.multiplier).isolated_margin
+        if held_margin > 0:
+            when = max(booked, last_event_time)
+            ledger.release_margin(
+                amount=held_margin,
+                symbol=symbol,
+                event_time=when,
+                received_at=max(seen, when),
+                external_id=f"margin-release:{symbol}:{tag}",
+                venue=venue,
+            )
+
+    def book_stop(held: OpenPosition, breached: MarkSample, reason: str = "STOP") -> None:
         nonlocal exits, last_exit, position, pending
         booked = stamp(executable_time(held.entry_event_time, breached.available_at))
         seen = observe(booked)
@@ -179,14 +213,14 @@ def replay_t1(
             multiplier=config.multiplier,
             event_time=booked,
             received_at=seen,
-            external_id=f"exit:{symbol}:{booked.isoformat()}:STOP:{breached.source_id}",
+            external_id=f"exit:{symbol}:{booked.isoformat()}:{reason}:{breached.source_id}",
             venue=venue,
             venue_trade_id=f"exit-{fills}-{exits}",
             reduce_only=True,
             price_source="MARK",
             quote_grade=classify_quote(breached.event_time, breached.available_at, booked),
             price_event_time=breached.event_time,
-            annotations={"exit_reason": "STOP", "direction": held.side.value},
+            annotations={"exit_reason": reason, "direction": held.side.value},
         )
         notional = held.qty * breached.mark_price * config.multiplier
         book_exit_costs(notional, booked, seen, f"{symbol}:{booked.isoformat()}:{breached.source_id}")
@@ -194,8 +228,10 @@ def replay_t1(
         position = None
         pending = None
         exits += 1
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
         close_hold(booked)
         book_late_funding(decision_as_of)
+        release_closed_margin(booked, seen, f"{booked.isoformat()}:{reason}:{breached.source_id}")
 
     def book_exit_costs(notional: Decimal, booked: datetime, seen: datetime, tag: str) -> None:
         fee = notional * config.fee_rate
@@ -305,17 +341,20 @@ def replay_t1(
         sample = latest_mark(marks, bar.available_at, symbol)
         m = sample.mark_price if sample is not None else None
         if position is not None:
-            breached = next_available_stop(position, marks, consumed_marks, bar.available_at)
+            breached, exit_reason = next_mark_exit(position, marks, consumed_marks, bar.available_at, config.params)
             stop_time = executable_time(position.entry_event_time, breached.available_at) if breached is not None else bar.available_at
             book_funding_until(bar.available_at, stop_time)
             if breached is not None:
-                book_stop(position, breached)
+                book_stop(position, breached, exit_reason)
                 continue
         if position is not None:
             mark_for_stop = m if sample is not None and sample.event_time > position.entry_event_time else None
             position, decision = evaluate_exit(position, hist, mark_price=mark_for_stop, params=config.params)
             if decision is not None and decision.reason == "STOP" and sample is not None:
-                book_stop(position, sample)
+                book_stop(position, sample, "STOP")
+                continue
+            if decision is not None and decision.reason == "TAKE_PROFIT" and sample is not None:
+                book_stop(position, sample, "TAKE_PROFIT")
                 continue
             if decision is not None and decision.reason == "TREND":
                 booked = stamp(executable_time(position.entry_event_time, bar.available_at))
@@ -343,9 +382,11 @@ def replay_t1(
                 last_exit = booked
                 close_hold(booked)
                 book_late_funding(bar.available_at)
+                release_closed_margin(booked, seen, f"{booked.isoformat()}:TREND")
                 position = None
                 pending = None
                 exits += 1
+                reason_counts["TREND"] = reason_counts.get("TREND", 0) + 1
                 continue
 
         if pending is not None:
@@ -431,7 +472,7 @@ def replay_t1(
                     open_hold(position.entry_event_time)
                     fills += 1
                     pending = None
-                    breached = next_available_stop(position, marks, consumed_marks, bar.available_at)
+                    breached, exit_reason = next_mark_exit(position, marks, consumed_marks, bar.available_at, config.params)
                     stop_time = (
                         executable_time(position.entry_event_time, breached.available_at)
                         if breached is not None
@@ -439,7 +480,7 @@ def replay_t1(
                     )
                     book_funding_until(bar.available_at, stop_time)
                     if breached is not None:
-                        book_stop(position, breached)
+                        book_stop(position, breached, exit_reason)
                         continue
 
         if position is None and pending is None:
@@ -454,6 +495,16 @@ def replay_t1(
                 signals.append(intent)
                 pending = intent
 
+    ledger_exits: dict[str, int] = {}
+    for event in ledger.events():
+        reason = event.metadata.get("exit_reason")
+        if event.event_type == LedgerEventType.FILL and reason:
+            ledger_exits[reason] = ledger_exits.get(reason, 0) + 1
+    if ledger_exits != reason_counts:
+        raise CtsError(
+            f"回放退出计数与账本事件不一致: 本地 {reason_counts} != 账本 {ledger_exits}",
+            reason_code="REPLAY_LEDGER_MISMATCH",
+        )
     return ReplayResult(
         signals=signals,
         fills=fills,
@@ -461,6 +512,7 @@ def replay_t1(
         skipped_no_fill=skipped,
         grade=DataGrade.SIGNAL_RESEARCH_ONLY,
         funding_posted=funding_posted,
+        exit_reasons=reason_counts,
     )
 
 
