@@ -859,7 +859,7 @@ def build_demo_desk(trader: dict, *, bars: list, has_position: bool) -> dict[str
         "take_profit": f"{multiples.take_multiple}×ATR，按成交价固定，比止损近",
         "entry_margin": "当日钱包的 80% 作为开仓保证金上限。当日权益跌破 1% 就不再开新仓",
         "add_margin": "当日钱包的 20% 留在钱包里，不再加到亏损仓",
-        "hold": "只在止损或止盈时平仓。平仓限价锚在止损或止盈上，最多再让 0.5×ATR",
+        "hold": "固定初始止损和止盈，退出核直接比较这两个价格。平仓限价锚在止损或止盈上，最多再让 0.5×ATR",
         "leverage": format(RESEARCH_LEVERAGE_CAP, "f"),
         "trader": trader_state,
         "halted": halted,

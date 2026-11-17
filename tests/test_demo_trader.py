@@ -137,10 +137,11 @@ def make_bars(closes: list[str]):
     return out
 
 
-def trader(tmp_path, *, script=None, venue="0", bars=None, state=None, feed=None, session=None) -> DemoTrader:
+def trader(tmp_path, *, script=None, venue="0", bars=None, state=None, feed=None, session=None, params=None) -> DemoTrader:
     engine = make_engine(tmp_path)
     config = DemoTraderConfig(
-        symbol="BTCUSDT", interval="1m", params=T1Params(entry_lookback=5, exit_lookback=3, atr_period=3, warmup_bars=6, version="T"),
+        symbol="BTCUSDT", interval="1m",
+        params=params or T1Params(entry_lookback=5, exit_lookback=3, atr_period=3, warmup_bars=6, version="T", exit_mode="fixed"),
         target_notional=D("1000"), grant_max_notional=D("2000"), poll_seconds=1.0,
         max_order_age_seconds=60, aggression=D("0.001"),
         state_path=str(Path(tmp_path) / "state.json"), log_path=str(Path(tmp_path) / "t.log"),
@@ -258,6 +259,100 @@ def test_trailing_stop_exit_is_honored(tmp_path) -> None:
     )
     t.step()
     assert session.submits, "移动止损/趋势退出必须照常触发平仓"
+
+
+def test_fixed_take_profit_is_not_hidden_by_a_trail(tmp_path) -> None:
+    """固定止损 92、止盈 104、价格 105。即便极值能把移动止损抬过现价，也要按止盈退出。"""
+    session = FakeSession([])
+    state = {
+        "position": {
+            "side": "LONG", "qty": "1", "entry": "100", "stop": "92", "take_profit": "104",
+            "atr": "1", "extreme": "130", "entry_time": "2026-11-01T00:00:00+00:00",
+        },
+        "pending": None,
+    }
+    t = trader(tmp_path, venue="1", session=session, bars=make_bars(["130"] * 8), state=state)
+    t.feed.fetch_mark = lambda symbol: type("M", (), {"mark_price": D("105")})()
+    t.step()
+    assert session.submits, "固定止盈必须触发"
+    assert t.state["position"]["stop"] == "92"
+    assert [item["fact"] for item in t.state["exit_facts"]] == ["TRIGGERED", "SUBMITTED"]
+    assert t.state["exit_facts"][0]["reason"] == "TAKE_PROFIT"
+    assert "client_order_id" not in t.state["exit_facts"][0]
+    assert t.state["exit_facts"][1]["client_order_id"]
+
+
+def test_fixed_short_take_profit_mirrors_the_long_case(tmp_path) -> None:
+    session = FakeSession([])
+    state = {
+        "position": {
+            "side": "SHORT", "qty": "1", "entry": "100", "stop": "108", "take_profit": "96",
+            "atr": "1", "extreme": "70", "entry_time": "2026-11-01T00:00:00+00:00",
+        },
+        "pending": None,
+    }
+    t = trader(tmp_path, venue="-1", session=session, bars=make_bars(["70"] * 8), state=state)
+    t.feed.fetch_mark = lambda symbol: type("M", (), {"mark_price": D("95")})()
+    t.step()
+    assert session.submits
+    assert session.submits[0][1] == "LONG"
+    assert t.state["position"]["stop"] == "108"
+    assert t.state["exit_facts"][0]["reason"] == "TAKE_PROFIT"
+
+
+def test_restart_keeps_the_saved_stop_and_target(tmp_path) -> None:
+    state = {
+        "position": {
+            "side": "LONG", "qty": "1", "entry": "100", "stop": "92", "take_profit": "104",
+            "atr": "1", "extreme": "130", "entry_time": "2026-11-01T00:00:00+00:00",
+        },
+        "pending": None,
+    }
+    session = FakeSession([])
+    restarted = trader(tmp_path, venue="1", session=session, bars=make_bars(["130"] * 8), state=state)
+    restarted.feed.fetch_mark = lambda symbol: type("M", (), {"mark_price": D("105")})()
+    restarted.step()
+    assert restarted.state["exit_facts"][0]["reason"] == "TAKE_PROFIT"
+    assert restarted.state["position"]["stop"] == "92"
+
+
+def test_exit_fill_and_flat_are_later_facts(tmp_path) -> None:
+    session = FakeSession([{"status": "FILLED", "executedQty": "1", "avgPrice": "105"}])
+    state = {
+        "position": {
+            "side": "LONG", "qty": "1", "entry": "100", "stop": "92", "take_profit": "104",
+            "atr": "1", "extreme": "100", "entry_time": "2026-11-01T00:00:00+00:00",
+        },
+        "pending": None,
+    }
+    t = trader(tmp_path, venue="1", session=session, bars=make_bars(["100"] * 8), state=state)
+    t.feed.fetch_mark = lambda symbol: type("M", (), {"mark_price": D("105")})()
+    t.step()
+    assert [item["fact"] for item in t.state["exit_facts"]] == ["TRIGGERED", "SUBMITTED"]
+    t.step()
+    assert [item["fact"] for item in t.state["exit_facts"]] == ["TRIGGERED", "SUBMITTED", "FILLED", "FLAT"]
+    assert t.state["position"] is None
+    assert t.state["exit_facts"][2]["filled_qty"] == "1"
+    assert t.state["exit_facts"][3]["position_qty"] == "0"
+    assert t.state["exit_facts"][0]["evidence_id"] == t.state["exit_facts"][3]["evidence_id"]
+
+
+def test_trail_mode_submits_when_the_trailed_stop_is_hit(tmp_path) -> None:
+    session = FakeSession([])
+    params = T1Params(entry_lookback=5, exit_lookback=3, atr_period=3, warmup_bars=6, version="trail", exit_mode="trail")
+    state = {
+        "position": {
+            "side": "LONG", "qty": "1", "entry": "100", "stop": "50", "take_profit": "400",
+            "atr": "1", "extreme": "130", "entry_time": "2026-11-01T00:00:00+00:00",
+        },
+        "pending": None,
+    }
+    t = trader(tmp_path, venue="1", session=session, bars=make_bars(["130"] * 8), state=state, params=params)
+    t.feed.fetch_mark = lambda symbol: type("M", (), {"mark_price": D("100")})()
+    t.step()
+    assert session.submits
+    assert t.state["exit_facts"][0]["mode"] == "trail"
+    assert t.state["exit_facts"][0]["reason"] == "STOP"
 
 
 def test_channel_touch_and_trail_do_not_close(tmp_path) -> None:
@@ -404,6 +499,7 @@ def test_strategy_params_fully_bound_into_hash() -> None:
     base = t1_params_binding_hash(T1Params())
     assert base != t1_params_binding_hash(T1Params(take_multiple=D("50")))
     assert base != t1_params_binding_hash(T1Params(entry_lookback=21))
+    assert base != t1_params_binding_hash(T1Params(exit_mode="fixed"))
 
 
 def test_flat_quantity_leaves_no_residual_exposure() -> None:

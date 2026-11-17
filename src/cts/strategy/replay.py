@@ -22,11 +22,9 @@ from cts.strategy.t1 import (
     SignalIntent,
     T1Params,
     apply_fill_to_state,
-    evaluate_exit,
+    decide_exit,
     evaluate_signal,
     next_open_fill_price,
-    stop_breached,
-    take_profit_price,
 )
 
 
@@ -109,9 +107,8 @@ def next_mark_exit(
     consumed: set[tuple],
     as_of: datetime,
     params: T1Params,
-) -> tuple[Optional[MarkSample], str]:
+) -> tuple[Optional[MarkSample], str, dict[str, str]]:
     """按事件顺序找第一笔触发退出条件的标记价。同一时间戳内先后不可辨，整组一起判定并保守取止损；价格取组内最差。"""
-    target = take_profit_price(position.side, position.avg_price, position.signal_atr, params)
     visible = [
         mk
         for mk in marks
@@ -125,16 +122,23 @@ def next_mark_exit(
         chunk = list(group)
         for mk in chunk:
             consumed.add(_mark_key(mk))
-        worst = (lambda ms: min(ms, key=lambda m: m.mark_price)) if position.side == Side.LONG else (
-            lambda ms: max(ms, key=lambda m: m.mark_price)
+        decisions = []
+        for mk in chunk:
+            _, trigger = decide_exit(position, None, mark_price=mk.mark_price, params=params)
+            if trigger is not None:
+                decisions.append((mk, trigger))
+        worst = (lambda ms: min(ms, key=lambda item: item[0].mark_price)) if position.side == Side.LONG else (
+            lambda ms: max(ms, key=lambda item: item[0].mark_price)
         )
-        stop_hits = [mk for mk in chunk if stop_breached(position, mk.mark_price)]
+        stop_hits = [item for item in decisions if item[1].reason == "STOP"]
         if stop_hits:
-            return worst(stop_hits), "STOP"
-        tp_hits = [mk for mk in chunk if take_profit_hit(position.side, mk.mark_price, target)]
+            chosen, trigger = worst(stop_hits)
+            return chosen, trigger.reason, trigger.evidence()
+        tp_hits = [item for item in decisions if item[1].reason == "TAKE_PROFIT"]
         if tp_hits:
-            return worst(tp_hits), "TAKE_PROFIT"
-    return None, ""
+            chosen, trigger = worst(tp_hits)
+            return chosen, trigger.reason, trigger.evidence()
+    return None, "", {}
 
 
 def latest_mark(marks: Sequence[MarkSample], as_of: datetime, symbol: str) -> Optional[MarkSample]:
@@ -215,7 +219,7 @@ def replay_t1(
                 hold["released"] = True
                 break
 
-    def book_stop(held: OpenPosition, breached: MarkSample, reason: str = "STOP") -> None:
+    def book_stop(held: OpenPosition, breached: MarkSample, reason: str = "STOP", evidence: Optional[dict] = None) -> None:
         nonlocal exits, last_exit, position, pending
         booked = stamp(executable_time(held.entry_event_time, breached.available_at))
         seen = observe(booked)
@@ -234,7 +238,11 @@ def replay_t1(
             price_source="MARK",
             quote_grade=classify_quote(breached.event_time, breached.available_at, booked),
             price_event_time=breached.event_time,
-            annotations={"exit_reason": reason, "direction": held.side.value},
+            annotations={
+                "exit_reason": reason,
+                "direction": held.side.value,
+                "exit_trigger": (evidence or {}).get("evidence_id", ""),
+            },
         )
         notional = held.qty * breached.mark_price * config.multiplier
         book_exit_costs(notional, booked, seen, f"{symbol}:{booked.isoformat()}:{breached.source_id}")
@@ -355,22 +363,19 @@ def replay_t1(
         sample = latest_mark(marks, bar.available_at, symbol)
         m = sample.mark_price if sample is not None else None
         if position is not None:
-            breached, exit_reason = next_mark_exit(position, marks, consumed_marks, bar.available_at, config.params)
+            breached, exit_reason, exit_evidence = next_mark_exit(position, marks, consumed_marks, bar.available_at, config.params)
             stop_time = executable_time(position.entry_event_time, breached.available_at) if breached is not None else bar.available_at
             book_funding_until(bar.available_at, stop_time)
             if breached is not None:
-                book_stop(position, breached, exit_reason)
+                book_stop(position, breached, exit_reason, exit_evidence)
                 continue
         if position is not None:
             mark_for_stop = m if sample is not None and sample.event_time > position.entry_event_time else None
-            position, decision = evaluate_exit(position, hist, mark_price=mark_for_stop, params=config.params)
-            if decision is not None and decision.reason == "STOP" and sample is not None:
-                book_stop(position, sample, "STOP")
+            position, trigger = decide_exit(position, hist, mark_price=mark_for_stop, params=config.params)
+            if trigger is not None and trigger.reason in ("STOP", "TAKE_PROFIT") and sample is not None:
+                book_stop(position, sample, trigger.reason, trigger.evidence())
                 continue
-            if decision is not None and decision.reason == "TAKE_PROFIT" and sample is not None:
-                book_stop(position, sample, "TAKE_PROFIT")
-                continue
-            if decision is not None and decision.reason == "TREND":
+            if trigger is not None and trigger.reason == "TREND":
                 booked = stamp(executable_time(position.entry_event_time, bar.available_at))
                 seen = observe(booked)
                 exit_price = bar.close
@@ -382,14 +387,18 @@ def replay_t1(
                     multiplier=config.multiplier,
                     event_time=booked,
                     received_at=seen,
-                    external_id=f"exit:{symbol}:{booked.isoformat()}:{decision.reason}",
+                    external_id=f"exit:{symbol}:{booked.isoformat()}:{trigger.reason}",
                     venue=venue,
                     venue_trade_id=f"exit-{fills}-{exits}",
                     reduce_only=True,
                     price_source="CLOSE",
                     quote_grade=classify_quote(bar.event_time, bar.available_at, booked),
                     price_event_time=bar.event_time,
-                    annotations={"exit_reason": "TREND", "direction": position.side.value},
+                    annotations={
+                        "exit_reason": "TREND",
+                        "direction": position.side.value,
+                        "exit_trigger": trigger.evidence_id,
+                    },
                 )
                 notional = position.qty * exit_price * config.multiplier
                 book_exit_costs(notional, booked, seen, f"{symbol}:{booked.isoformat()}:TREND")
@@ -486,7 +495,7 @@ def replay_t1(
                     open_hold(position.entry_event_time)
                     fills += 1
                     pending = None
-                    breached, exit_reason = next_mark_exit(position, marks, consumed_marks, bar.available_at, config.params)
+                    breached, exit_reason, exit_evidence = next_mark_exit(position, marks, consumed_marks, bar.available_at, config.params)
                     stop_time = (
                         executable_time(position.entry_event_time, breached.available_at)
                         if breached is not None
@@ -494,7 +503,7 @@ def replay_t1(
                     )
                     book_funding_until(bar.available_at, stop_time)
                     if breached is not None:
-                        book_stop(position, breached, exit_reason)
+                        book_stop(position, breached, exit_reason, exit_evidence)
                         continue
 
         if position is None and pending is None:

@@ -38,8 +38,13 @@ from cts.risk.engine import RiskEngine
 from cts.risk.models import ParameterBundle, ParameterStatus, ReserveRequest, RuntimeMode
 from cts.risk.parameters import PROPOSED_VALUES, RESEARCH_LEVERAGE_CAP, bundle_hash
 from cts.strategy.t1 import (
+    EXIT_FACT_FILLED,
+    EXIT_FACT_FLAT,
+    EXIT_FACT_SUBMITTED,
+    EXIT_FACT_TRIGGERED,
+    EXIT_MODE_FIXED,
     T1Params,
-    evaluate_exit,
+    decide_exit,
     evaluate_signal,
     initial_stop,
     take_profit_price,
@@ -61,6 +66,7 @@ DEMO_PARAMS = T1Params(
     stop_multiple=D("8"),
     take_multiple=D("4"),
     version="T1-DEMO-15M",
+    exit_mode=EXIT_MODE_FIXED,
 )
 
 
@@ -102,7 +108,7 @@ def demo_research_bundle() -> ParameterBundle:
     values["t1_params_hash"] = t1_params_binding_hash(DEMO_PARAMS)
     values["per_symbol_notional_pct"] = leverage
     values["total_abs_notional_pct"] = leverage
-    version = "risk-v0.3.4-demo-slowstop"
+    version = "risk-v0.3.5-exit-kernel"
     status = ParameterStatus.PROPOSED
     return ParameterBundle(
         version=version,
@@ -624,6 +630,21 @@ class DemoTrader:
             elif prev:
                 remain = D(prev["qty"]) - delta
                 self.state["position"] = None if remain <= 0 else {**prev, "qty": format(remain, "f")}
+                if pending.get("kind") == "EXIT":
+                    self._append_exit_fact(
+                        EXIT_FACT_FILLED,
+                        evidence_id=str(pending.get("exit_evidence_id") or ""),
+                        client_order_id=str(pending.get("coid") or ""),
+                        filled_qty=format(delta, "f"),
+                        cumulative_qty=format(cumulative, "f"),
+                    )
+                    if remain <= 0:
+                        self._append_exit_fact(
+                            EXIT_FACT_FLAT,
+                            evidence_id=str(pending.get("exit_evidence_id") or ""),
+                            client_order_id=str(pending.get("coid") or ""),
+                            position_qty="0",
+                        )
             self.log(f"{pending['coid']} 已成交增量 {delta}（累计 {cumulative}）")
         if status in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
             self.log(f"{pending['coid']} 终态 {status} executedQty={cumulative}")
@@ -741,6 +762,56 @@ class DemoTrader:
         qty = D(position["qty"])
         return qty if position["side"] == "LONG" else -qty
 
+    def _append_exit_fact(self, fact: str, **fields: str) -> None:
+        facts = self.state.setdefault("exit_facts", [])
+        if not isinstance(facts, list):
+            facts = []
+            self.state["exit_facts"] = facts
+        facts.append({"fact": fact, **fields})
+
+    def _act_on_exit(self, position: dict, updated, trigger, ref: D, venue) -> None:
+        """记下触发。提交是下一次事实，成交和归零不在这里发生。"""
+        self.state["last_exit_trigger"] = trigger.evidence()
+        self._append_exit_fact(
+            EXIT_FACT_TRIGGERED,
+            evidence_id=trigger.evidence_id,
+            reason=trigger.reason,
+            mode=trigger.mode,
+            mark=format(trigger.mark_price, "f"),
+            persisted_stop=format(trigger.persisted_stop, "f"),
+            persisted_take_profit=format(trigger.persisted_take_profit, "f"),
+        )
+        if venue is not None and abs(venue) < D(position["qty"]):
+            self.state["halted"] = "position-mismatch"
+            self.log(f"拟平 {position['qty']} 超过交易所实际 {abs(venue)}，熔断")
+            return
+        if trigger.reason == "STOP":
+            anchor = D(position.get("stop") or trigger.compared_stop)
+        elif trigger.reason == "TAKE_PROFIT":
+            anchor = D(position.get("take_profit") or trigger.persisted_take_profit)
+        else:
+            anchor = trigger.trend_level
+        order_side = Side.SHORT if position["side"] == "LONG" else Side.LONG
+        limit = exit_limit_price(order_side, ref, anchor, D(position.get("atr") or "0"), self.config.aggression)
+        placed = self._place(
+            side=order_side,
+            qty=D(position["qty"]),
+            ref_price=ref,
+            tag="EXIT",
+            stop=D(position.get("stop") or trigger.persisted_stop),
+            exit_order=True,
+            limit_price=limit,
+        )
+        if placed is not None:
+            placed["exit_evidence_id"] = trigger.evidence_id
+            self._append_exit_fact(
+                EXIT_FACT_SUBMITTED,
+                evidence_id=trigger.evidence_id,
+                client_order_id=str(placed.get("coid") or ""),
+            )
+        self.state["pending"] = placed
+        _ = updated
+
     def step(self) -> bool:
         self._poll_pending()
         self._reconcile_orders_and_holds()
@@ -791,29 +862,15 @@ class DemoTrader:
             position = self.state.get("position")
             if position and not self.state.get("pending"):
                 mark = self._mark()
-                stop = D(position.get("stop") or "0")
-                target = D(position.get("take_profit") or "0")
-                hit_target = False
-                if mark is not None and target > 0:
-                    hit_target = mark >= target if position["side"] == "LONG" else mark <= target
-                if hit_target:
-                    opposite = Side.SHORT if position["side"] == "LONG" else Side.LONG
-                    limit = exit_limit_price(opposite, mark, target, D(position.get("atr") or "0"), self.config.aggression)
-                    self.state["pending"] = self._place(
-                        side=opposite, qty=D(position["qty"]), ref_price=mark, tag="EXIT", stop=stop,
-                        exit_order=True, limit_price=limit,
-                    )
-                    self.log(f"数据降级：标记价 {mark} 触发止盈 {target} 限价={limit}")
-                elif mark is not None and stop > 0:
-                    hit = mark <= stop if position["side"] == "LONG" else mark >= stop
-                    if hit:
-                        opposite = Side.SHORT if position["side"] == "LONG" else Side.LONG
-                        limit = exit_limit_price(opposite, mark, stop, D(position.get("atr") or "0"), self.config.aggression)
-                        self.state["pending"] = self._place(
-                            side=opposite, qty=D(position["qty"]), ref_price=mark, tag="EXIT", stop=stop,
-                            exit_order=True, limit_price=limit,
-                        )
-                        self.log(f"数据降级：标记价 {mark} 触发止损 {stop} 限价={limit}")
+                updated, trigger = decide_exit(
+                    _as_open_position(position, self.config.symbol),
+                    None,
+                    mark_price=mark,
+                    params=self.config.params,
+                )
+                if trigger is not None:
+                    self._act_on_exit(position, updated, trigger, mark if mark is not None else D("0"), venue)
+                    self.log(f"数据降级：{trigger.reason} 证据={trigger.evidence_id}")
             self._save_state()
             return True
         position = self.state.get("position")
@@ -859,42 +916,16 @@ class DemoTrader:
                     self.log(f"入场信号 {signal.side.value} @band={signal.entry_band} atr={signal.atr}")
         elif position is not None and not self.state.get("pending"):
             open_position = _as_open_position(position, self.config.symbol)
-            stored_stop = D(position.get("stop") or "0")
-            updated, exit_decision = evaluate_exit(open_position, bars, mark_price=mark, params=self.config.params)
-            position["extreme"] = format(updated.extreme, "f")
-            if exit_decision is not None and exit_decision.reason == "TREND":
-                if not position.get("trend_noted"):
-                    self.log(f"通道已碰到 {exit_decision.trend_level}，继续持有到止损或止盈")
-                    position["trend_noted"] = True
-                exit_decision = None
-            elif position.get("trend_noted"):
-                position.pop("trend_noted", None)
-            if exit_decision is not None and exit_decision.reason == "STOP" and mark is not None:
-                hit = mark <= stored_stop if position["side"] == "LONG" else mark >= stored_stop
-                if not hit:
-                    exit_decision = None
-            if exit_decision is not None:
-                if venue is not None and abs(venue) < D(position["qty"]):
-                    self.state["halted"] = "position-mismatch"
-                    self.log(f"拟平 {position['qty']} 超过交易所实际 {abs(venue)}，熔断")
-                    self._save_state()
-                    return True
-                anchor = stored_stop if exit_decision.reason == "STOP" else D(position.get("take_profit") or "0")
-                order_side = Side.SHORT if position["side"] == "LONG" else Side.LONG
+            updated, trigger = decide_exit(open_position, bars, mark_price=mark, params=self.config.params)
+            if self.config.params.exit_mode != EXIT_MODE_FIXED:
+                position["extreme"] = format(updated.extreme, "f")
+                position["stop"] = format(updated.stop, "f")
+            if trigger is not None:
                 ref = mark if mark is not None else bars[-1].close
-                limit = exit_limit_price(order_side, ref, anchor, D(position.get("atr") or "0"), self.config.aggression)
-                self.state["pending"] = self._place(
-                    side=order_side,
-                    qty=D(position["qty"]),
-                    ref_price=ref,
-                    tag="EXIT",
-                    stop=stored_stop,
-                    exit_order=True,
-                    limit_price=limit,
-                )
+                self._act_on_exit(position, updated, trigger, ref, venue)
                 self.log(
-                    f"退出信号 {exit_decision.reason} stop={stored_stop} "
-                    f"目标={position.get('take_profit', '')} 限价={limit}"
+                    f"退出触发 {trigger.reason} 证据={trigger.evidence_id} "
+                    f"止损={position.get('stop', '')} 止盈={position.get('take_profit', '')}"
                 )
         self._save_state()
         return True
@@ -951,6 +982,7 @@ def _as_open_position(position: dict, symbol: str):
         stop=D(position.get("stop") or "0"),
         extreme=D(position.get("extreme") or entry),
         entry_event_time=opened,
+        take_profit=D(position["take_profit"]) if position.get("take_profit") else None,
     )
 
 

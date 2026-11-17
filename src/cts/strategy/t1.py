@@ -14,6 +14,14 @@ from cts.money import D
 from cts.strategy.indicators import atr_sma, window_high, window_low
 
 
+EXIT_MODE_FIXED = "fixed"
+EXIT_MODE_TRAIL = "trail"
+EXIT_FACT_TRIGGERED = "TRIGGERED"
+EXIT_FACT_SUBMITTED = "SUBMITTED"
+EXIT_FACT_FILLED = "FILLED"
+EXIT_FACT_FLAT = "FLAT"
+
+
 @dataclass(frozen=True)
 class T1Params:
     entry_lookback: int = 40
@@ -23,10 +31,11 @@ class T1Params:
     take_multiple: Decimal = Decimal("5")
     warmup_bars: int = 120
     version: str = "T1-E0"
+    exit_mode: str = EXIT_MODE_TRAIL
 
 
 def t1_params_binding_hash(params: "T1Params") -> str:
-    """全字段绑定：任一策略参数（含 take_multiple、stop_multiple、回看期）变化都必须改变哈希。"""
+    """全字段绑定：退出模式和止盈止损倍数一样，变了就必须变哈希。"""
     from cts.checksum import sha256_hex
 
     return sha256_hex({
@@ -37,6 +46,7 @@ def t1_params_binding_hash(params: "T1Params") -> str:
         "stop_multiple": format(params.stop_multiple, "f"),
         "take_multiple": format(params.take_multiple, "f"),
         "warmup_bars": str(params.warmup_bars),
+        "exit_mode": str(getattr(params, "exit_mode", EXIT_MODE_TRAIL)),
     })
 
 
@@ -64,6 +74,7 @@ class OpenPosition:
     extreme: Decimal
     entry_event_time: datetime
     last_exit_event_time: Optional[datetime] = None
+    take_profit: Optional[Decimal] = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +85,40 @@ class ExitDecision:
     trend_level: Decimal
     mark_price: Decimal
     close: Optional[Decimal]
+
+
+@dataclass(frozen=True)
+class ExitTrigger:
+    """只描述触发。下单、成交、账本归零由调用方另记。"""
+
+    reason: str
+    mode: str
+    side: Side
+    mark_price: Decimal
+    persisted_stop: Decimal
+    persisted_take_profit: Decimal
+    compared_stop: Decimal
+    trend_level: Decimal
+    close: Optional[Decimal]
+    degraded: bool
+    trail_computed: bool
+    evidence_id: str
+
+    def evidence(self) -> dict[str, str]:
+        return {
+            "fact": EXIT_FACT_TRIGGERED,
+            "reason": self.reason,
+            "mode": self.mode,
+            "side": self.side.value,
+            "mark": format(self.mark_price, "f"),
+            "persisted_stop": format(self.persisted_stop, "f"),
+            "persisted_take_profit": format(self.persisted_take_profit, "f"),
+            "compared_stop": format(self.compared_stop, "f"),
+            "trend_level": format(self.trend_level, "f"),
+            "degraded": "1" if self.degraded else "0",
+            "trail_computed": "1" if self.trail_computed else "0",
+            "evidence_id": self.evidence_id,
+        }
 
 
 def evaluate_signal(
@@ -167,15 +212,109 @@ def trail_stop(position: OpenPosition, candles: Sequence[Candle], params: T1Para
     return min(position.stop, candidate)
 
 
-def evaluate_exit(
+def _exit_mode(params: T1Params) -> str:
+    mode = str(getattr(params, "exit_mode", EXIT_MODE_TRAIL) or EXIT_MODE_TRAIL)
+    if mode not in (EXIT_MODE_FIXED, EXIT_MODE_TRAIL):
+        raise ValueError(f"未知退出模式 {mode}")
+    return mode
+
+
+def _persisted_target(position: OpenPosition, params: T1Params) -> Decimal:
+    if position.take_profit is not None and position.take_profit > 0:
+        return D(position.take_profit)
+    if position.signal_atr > 0 and position.avg_price > 0:
+        return take_profit_price(position.side, position.avg_price, position.signal_atr, params)
+    return D("0")
+
+
+def _barrier_reason(side: Side, mark: Decimal, stop: Decimal, target: Decimal) -> Optional[str]:
+    """同一标记价上止损优先于止盈。两条边界在价格两侧时，一次报价只会碰到一边。"""
+    if stop > 0 and side == Side.LONG and mark <= stop:
+        return "STOP"
+    if stop > 0 and side == Side.SHORT and mark >= stop:
+        return "STOP"
+    if target > 0 and side == Side.LONG and mark >= target:
+        return "TAKE_PROFIT"
+    if target > 0 and side == Side.SHORT and mark <= target:
+        return "TAKE_PROFIT"
+    return None
+
+
+def _trigger(
+    *,
+    reason: str,
+    mode: str,
     position: OpenPosition,
-    candles: Sequence[Candle],
+    mark: Decimal,
+    persisted_stop: Decimal,
+    persisted_target: Decimal,
+    compared_stop: Decimal,
+    trend_level: Decimal,
+    close: Optional[Decimal],
+    degraded: bool,
+    trail_computed: bool,
+) -> ExitTrigger:
+    payload = {
+        "reason": reason,
+        "mode": mode,
+        "side": position.side.value,
+        "mark": format(mark, "f"),
+        "persisted_stop": format(persisted_stop, "f"),
+        "persisted_take_profit": format(persisted_target, "f"),
+        "compared_stop": format(compared_stop, "f"),
+        "trend_level": format(trend_level, "f"),
+        "degraded": "1" if degraded else "0",
+        "trail_computed": "1" if trail_computed else "0",
+    }
+    return ExitTrigger(
+        reason=reason,
+        mode=mode,
+        side=position.side,
+        mark_price=mark,
+        persisted_stop=persisted_stop,
+        persisted_take_profit=persisted_target,
+        compared_stop=compared_stop,
+        trend_level=trend_level,
+        close=close,
+        degraded=degraded,
+        trail_computed=trail_computed,
+        evidence_id=sha256_hex(payload),
+    )
+
+
+def decide_exit(
+    position: OpenPosition,
+    candles: Optional[Sequence[Candle]],
     *,
     mark_price: Optional[Decimal],
     params: T1Params,
-) -> tuple[OpenPosition, Optional[ExitDecision]]:
-    if not candles or not all(c.is_closed for c in candles):
-        return position, None
+) -> tuple[OpenPosition, Optional[ExitTrigger]]:
+    """唯一退出核。固定模式不计算移动止损；跟踪模式才更新止损并允许通道退出。"""
+    mode = _exit_mode(params)
+    mark = D(mark_price) if mark_price is not None else None
+    persisted_stop = D(position.stop)
+    persisted_target = _persisted_target(position, params)
+    bars_ready = bool(candles) and all(c.is_closed for c in candles or ())
+    if mode == EXIT_MODE_FIXED or not bars_ready:
+        if mark is None:
+            return position, None
+        reason = _barrier_reason(position.side, mark, persisted_stop, persisted_target)
+        if reason is None:
+            return position, None
+        return position, _trigger(
+            reason=reason,
+            mode=mode,
+            position=position,
+            mark=mark,
+            persisted_stop=persisted_stop,
+            persisted_target=persisted_target,
+            compared_stop=persisted_stop,
+            trend_level=persisted_target if reason == "TAKE_PROFIT" else D("0"),
+            close=candles[-1].close if bars_ready else None,
+            degraded=not bars_ready,
+            trail_computed=False,
+        )
+
     current = candles[-1]
     prior = candles[:-1]
     since_entry = [c for c in candles if c.event_time > position.entry_event_time]
@@ -186,29 +325,63 @@ def evaluate_exit(
             extreme = min(position.extreme, min(c.close for c in since_entry))
     else:
         extreme = position.extreme
-    updated = replace(position, extreme=extreme)
-    updated = replace(updated, stop=trail_stop(updated, candles, params))
-
-    mark = D(mark_price) if mark_price is not None else None
-    target = take_profit_price(position.side, position.avg_price, position.signal_atr, params)
-    if mark is not None and position.signal_atr > 0 and position.side == Side.LONG and mark >= target and mark > updated.stop:
-        return updated, ExitDecision("TAKE_PROFIT", updated.side, updated.stop, target, mark, current.close)
-    if mark is not None and position.signal_atr > 0 and position.side == Side.SHORT and mark <= target and mark < updated.stop:
-        return updated, ExitDecision("TAKE_PROFIT", updated.side, updated.stop, target, mark, current.close)
-    if mark is not None and position.side == Side.LONG and mark <= updated.stop:
-        return updated, ExitDecision("STOP", updated.side, updated.stop, Decimal("0"), mark, current.close)
-    if mark is not None and position.side == Side.SHORT and mark >= updated.stop:
-        return updated, ExitDecision("STOP", updated.side, updated.stop, Decimal("0"), mark, current.close)
-
-    if len(prior) >= params.exit_lookback:
+    updated = replace(position, extreme=extreme, stop=trail_stop(replace(position, extreme=extreme), candles, params))
+    if mark is not None and position.signal_atr > 0 and position.side == Side.LONG and mark >= persisted_target and mark > updated.stop:
+        reason = "TAKE_PROFIT"
+    elif mark is not None and position.signal_atr > 0 and position.side == Side.SHORT and mark <= persisted_target and mark < updated.stop:
+        reason = "TAKE_PROFIT"
+    elif mark is not None and position.side == Side.LONG and mark <= updated.stop:
+        reason = "STOP"
+    elif mark is not None and position.side == Side.SHORT and mark >= updated.stop:
+        reason = "STOP"
+    else:
+        reason = None
+    trend_level = persisted_target if reason == "TAKE_PROFIT" else D("0")
+    if reason is None and len(prior) >= params.exit_lookback:
         d20 = window_low(prior[-params.exit_lookback :])
         u20 = window_high(prior[-params.exit_lookback :])
-        recorded_mark = mark if mark is not None else current.close
         if position.side == Side.LONG and current.close < d20:
-            return updated, ExitDecision("TREND", updated.side, updated.stop, d20, recorded_mark, current.close)
-        if position.side == Side.SHORT and current.close > u20:
-            return updated, ExitDecision("TREND", updated.side, updated.stop, u20, recorded_mark, current.close)
-    return updated, None
+            reason = "TREND"
+            trend_level = d20
+        elif position.side == Side.SHORT and current.close > u20:
+            reason = "TREND"
+            trend_level = u20
+    if reason is None:
+        return updated, None
+    recorded_mark = mark if mark is not None else current.close
+    return updated, _trigger(
+        reason=reason,
+        mode=mode,
+        position=position,
+        mark=recorded_mark,
+        persisted_stop=persisted_stop,
+        persisted_target=persisted_target,
+        compared_stop=updated.stop,
+        trend_level=trend_level,
+        close=current.close,
+        degraded=False,
+        trail_computed=True,
+    )
+
+
+def evaluate_exit(
+    position: OpenPosition,
+    candles: Sequence[Candle],
+    *,
+    mark_price: Optional[Decimal],
+    params: T1Params,
+) -> tuple[OpenPosition, Optional[ExitDecision]]:
+    updated, trigger = decide_exit(position, candles, mark_price=mark_price, params=params)
+    if trigger is None:
+        return updated, None
+    return updated, ExitDecision(
+        trigger.reason,
+        trigger.side,
+        trigger.compared_stop,
+        trigger.trend_level,
+        trigger.mark_price,
+        trigger.close,
+    )
 
 
 def apply_fill_to_state(
@@ -220,6 +393,7 @@ def apply_fill_to_state(
     entry_time: Optional[datetime] = None,
 ) -> OpenPosition:
     stop = initial_stop(signal.side, fill_price, signal.atr, params)
+    target = take_profit_price(signal.side, fill_price, signal.atr, params)
     return OpenPosition(
         symbol=signal.symbol,
         side=signal.side,
@@ -229,6 +403,7 @@ def apply_fill_to_state(
         stop=stop,
         extreme=D(fill_price),
         entry_event_time=entry_time or signal.event_time,
+        take_profit=target,
     )
 
 
