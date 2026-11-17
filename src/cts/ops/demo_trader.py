@@ -173,6 +173,77 @@ def directive_session_expiry(directive: OwnerDirective, now: datetime, hours: in
     return min(now + timedelta(hours=hours), directive.expires_at)
 
 
+def directive_active(directive: OwnerDirective, now: datetime) -> bool:
+    """授权只在 [granted_at, expires_at) 生效；尚未生效或已过期都不能建会话。"""
+    return directive.granted_at <= now < directive.expires_at
+
+
+def make_renew(
+    *,
+    risk: RiskEngine,
+    credentials: VenueCredentials,
+    feed: BinanceDataFeed,
+    holder: dict,
+    config: DemoTraderConfig,
+    base_config_cap: D,
+    orders_path: str = "/Users/xinquanwang/8888/var/ledger/orders.db",
+    directive_path: str = OWNER_DIRECTIVE_FILE,
+    account_id: str = "local-ledger",
+) -> Callable[[], None]:
+    """每轮都读授权合同：缩额、收窄范围、改期立即生效；会话谱系内额度只降不升。"""
+
+    def renew() -> None:
+        now = utc_now()
+        try:
+            fresh = OwnerDirective.from_file(directive_path)
+            valid = directive_active(fresh, now)
+        except CtsError:
+            valid = False
+        if not valid:
+            if holder["trader"].state.get("halted") != "directive-expired":
+                holder["trader"].state["halted"] = "directive-expired"
+                holder["trader"].log("所有者交易指示缺失、未生效或过期：停止续期并熔断新单")
+            holder["trader"].session = holder["session"]
+            return
+        grant_now = holder["session"].grant
+        near_expiry = now >= grant_now.expires_at - timedelta(minutes=30)
+        changed = fresh.raw_sha256 != holder.get("directive_sha")
+        if not (near_expiry or changed):
+            holder["trader"].session = holder["session"]
+            return
+        from cts.execution.live import read_demo_wallet
+
+        refreshed = D(read_demo_wallet()["equity"])
+        risk.set_equity(refreshed, reason="币安模拟盘钱包")
+        # 续期不得扩大金额：新额度与当前会话上限再取小，授权中途上调也不追认
+        cap = min(directive_entry_cap(fresh, base_config_cap, refreshed, RESEARCH_LEVERAGE_CAP), grant_now.max_notional)
+        holder["trader"].config = replace(config, grant_max_notional=cap)
+        holder["session"] = LiveSession(
+            LiveGrant(
+                granted_by=f"{fresh.granted_by}(授权合同 {fresh.auth_id})",
+                statement=LIVE_GRANT_STATEMENT,
+                network="TESTNET",
+                account_id=account_id,
+                max_notional=cap,
+                expires_at=directive_session_expiry(fresh, now),
+                symbols=fresh.symbols,
+            ),
+            credentials,
+            open_testnet_transport(),
+            now=now,
+            path=orders_path,
+            risk=risk,
+        )
+        holder["directive_sha"] = fresh.raw_sha256
+        feed.authorization = DataPullAuthorization(
+            granted_by="xinquanwang", expires_at=now + timedelta(hours=12), max_requests=10_000_000
+        )
+        holder["trader"].log(f"授权合同更新生效：单笔上限 {cap}，品种 {list(fresh.symbols)}")
+        holder["trader"].session = holder["session"]
+
+    return renew
+
+
 def exit_limit_price(order_side: Side, mark: D, anchor: D, atr: D, aggression: D) -> D:
     """平仓限价以止损或止盈为锚，最多再让出 0.5 倍 ATR，不跟着收盘价追。"""
     room = (atr if atr > 0 else D("0")) * EXIT_CHASE_ATR
@@ -948,8 +1019,8 @@ def build_default(config: DemoTraderConfig, *, proxy: str = "http://127.0.0.1:17
         if installed != bundle.version:
             risk.install_parameters(bundle)
     directive = OwnerDirective.from_file()
-    if utc_now() >= directive.expires_at:
-        raise CtsError("所有者授权合同已过期", reason_code="LIVE_GRANT_EXPIRED")
+    if not directive_active(directive, utc_now()):
+        raise CtsError("所有者授权合同未在生效期内（尚未生效或已过期）", reason_code="LIVE_GRANT_EXPIRED")
     if config.symbol not in directive.symbols:
         raise CtsError(f"{config.symbol} 不在授权品种范围 {directive.symbols}", reason_code="AUTHORIZATION_SCOPE")
     base_config_cap = config.grant_max_notional
@@ -971,49 +1042,7 @@ def build_default(config: DemoTraderConfig, *, proxy: str = "http://127.0.0.1:17
         path="/Users/xinquanwang/8888/var/ledger/orders.db",
         risk=risk,
     )
-    holder: dict = {"session": session, "feed": feed}
-
-    def renew() -> None:
-        now = utc_now()
-        try:
-            fresh = OwnerDirective.from_file()
-            directive_valid = now < fresh.expires_at
-        except CtsError:
-            directive_valid = False
-        if not directive_valid:
-            if holder["trader"].state.get("halted") != "directive-expired":
-                holder["trader"].state["halted"] = "directive-expired"
-                holder["trader"].log("所有者交易指示缺失或过期：停止续期并熔断新单")
-            holder["trader"].session = holder["session"]
-            return
-        if now >= holder["session"].grant.expires_at - timedelta(minutes=30):
-            from cts.execution.live import read_demo_wallet
-
-            refreshed = D(read_demo_wallet()["equity"])
-            risk.set_equity(refreshed, reason="币安模拟盘钱包")
-            # 续期不得扩大金额：额度仍是授权、原始配置上限、当前钱包三者的最小值
-            cap = directive_entry_cap(fresh, base_config_cap, refreshed, RESEARCH_LEVERAGE_CAP)
-            holder["trader"].config = replace(config, grant_max_notional=cap)
-            holder["session"] = LiveSession(
-                LiveGrant(
-                    granted_by=f"{fresh.granted_by}(授权合同 {fresh.auth_id})",
-                    statement=LIVE_GRANT_STATEMENT,
-                    network="TESTNET",
-                    account_id="local-ledger",
-                    max_notional=cap,
-                    expires_at=directive_session_expiry(fresh, now),
-                    symbols=fresh.symbols,
-                ),
-                credentials,
-                open_testnet_transport(),
-                now=now,
-                path="/Users/xinquanwang/8888/var/ledger/orders.db",
-                risk=risk,
-            )
-            feed.authorization = DataPullAuthorization(
-                granted_by="xinquanwang", expires_at=now + timedelta(hours=12), max_requests=10_000_000
-            )
-        holder["trader"].session = holder["session"]
+    holder: dict = {"session": session, "feed": feed, "directive_sha": directive.raw_sha256}
 
     trader = DemoTrader(
         config,
@@ -1022,7 +1051,15 @@ def build_default(config: DemoTraderConfig, *, proxy: str = "http://127.0.0.1:17
         feed=feed,
         session=session,
         signer=make_signer(credentials, proxy),
-        renew=renew,
+        renew=make_renew(
+            risk=risk,
+            credentials=credentials,
+            feed=feed,
+            holder=holder,
+            config=config,
+            base_config_cap=base_config_cap,
+        ),
+        directive=directive,
     )
     holder["trader"] = trader
     return trader

@@ -562,3 +562,131 @@ def test_true_exit_over_cap_passes_and_out_of_scope_symbol_is_refused(tmp_path) 
     refused = t2._place(side=Side.SHORT, qty=D("1.0"), ref_price=D("100"), tag="EXIT",
                         stop=D("102"), exit_order=True)
     assert refused is None, "品种不在授权范围内连平仓也必须拒绝"
+
+
+# ---------- 复审反例:授权立即生效与暂停态真减仓 ----------
+
+def test_directive_activity_requires_effective_window() -> None:
+    from dataclasses import replace
+    from datetime import timedelta
+    from cts.ops.demo_trader import OwnerDirective, directive_active
+
+    now = datetime(2026, 11, 11, 12, tzinfo=UTC)
+    base = OwnerDirective(
+        granted_by="o", granted_at=now - timedelta(days=1), expires_at=now + timedelta(days=1),
+        network="TESTNET", symbols=("BTCUSDT",), per_order_notional_cap=D("300"),
+        auth_id="a" * 12, raw_sha256="b" * 64,
+    )
+    assert directive_active(base, now)
+    assert not directive_active(replace(base, granted_at=now + timedelta(hours=1)), now), "未来才生效的授权不能用"
+    assert not directive_active(replace(base, expires_at=now - timedelta(seconds=1)), now), "过期授权不能用"
+
+
+def _real_renew_harness(tmp_path, monkeypatch, *, scope="TESTNET demo-fapi.binance.com 仅 BTCUSDT/ETHUSDT，单笔名义<=300 USDT"):
+    import cts.ops.demo_trader as dt
+    from cts.execution.live import (
+        LIVE_GRANT_STATEMENT, LiveGrant, LiveSession, PinnedTransport, VenueCredentials,
+    )
+    from cts.clock import utc_now
+
+    from datetime import timedelta
+
+    def boom(*args, **kwargs):
+        raise AssertionError("离线测试不得发起网络请求")
+
+    from cts.execution.orders import OrderStore
+
+    engine = make_engine(tmp_path)
+    orders_path = str(tmp_path / "orders.db")
+    if not _Path(orders_path).is_file():
+        OrderStore(orders_path).close()
+    path = _directive_file(tmp_path, scope=scope)
+    directive = dt.OwnerDirective.from_file(path)
+    transport = PinnedTransport(boom)
+    session = LiveSession(
+        LiveGrant(
+            granted_by="t", statement=LIVE_GRANT_STATEMENT, network="TESTNET",
+            account_id=engine.account_id, max_notional=D("300"),
+            expires_at=utc_now() + timedelta(hours=11), symbols=("BTCUSDT", "ETHUSDT"),
+        ),
+        VenueCredentials("k", "s"), transport, now=utc_now(),
+        path=orders_path, risk=engine,
+    )
+    feed = FakeFeed(make_bars(["100"] * 8))
+    holder = {"session": session, "feed": feed, "directive_sha": directive.raw_sha256}
+    config = DemoTraderConfig(
+        symbol="BTCUSDT", interval="1m", params=T1Params(entry_lookback=5, exit_lookback=3, atr_period=3, warmup_bars=6, version="T"),
+        target_notional=D("1000"), grant_max_notional=D("2000"), poll_seconds=1.0,
+        max_order_age_seconds=60, aggression=D("0.001"),
+        state_path=str(tmp_path / "state.json"), log_path=str(tmp_path / "t.log"),
+        stop_file=str(tmp_path / "STOP"),
+    )
+    trader = DemoTrader(
+        config, risk=engine, credentials=VenueCredentials("k", "s"), feed=feed, session=session,
+        signer=lambda p, q: (200, "[]"), clock=lambda: 1000.0, sleeper=lambda s: None,
+        renew=dt.make_renew(
+            risk=engine, credentials=VenueCredentials("k", "s"), feed=feed, holder=holder,
+            config=config, base_config_cap=D("2000"), orders_path=orders_path, directive_path=path,
+            account_id=engine.account_id,
+        ),
+        directive=directive,
+    )
+    holder["trader"] = trader
+    monkeypatch.setattr(dt, "open_testnet_transport", lambda: transport)
+    import cts.execution.live as live_mod
+
+    monkeypatch.setattr(live_mod, "read_demo_wallet", lambda: {"equity": "10000"})
+    return trader, holder, path
+
+
+def test_directive_change_takes_effect_immediately_via_real_renew(tmp_path, monkeypatch) -> None:
+    trader, holder, path = _real_renew_harness(tmp_path, monkeypatch)
+    original = holder["session"]
+    trader.renew()
+    assert holder["session"] is original, "授权未变且未到续期窗,会话不动"
+
+    _directive_file(tmp_path, scope="TESTNET demo-fapi.binance.com 仅 BTCUSDT/ETHUSDT，单笔名义<=30 USDT")
+    trader.renew()
+    assert holder["session"].grant.max_notional == D("30"), "缩额必须立即生效"
+
+    _directive_file(tmp_path, scope="TESTNET 仅 ETHUSDT，单笔名义<=30 USDT")
+    trader.renew()
+    assert holder["session"].grant.symbols == ("ETHUSDT",), "收窄品种必须立即生效"
+
+    _directive_file(tmp_path, scope="TESTNET demo-fapi.binance.com 仅 BTCUSDT/ETHUSDT，单笔名义<=400 USDT")
+    trader.renew()
+    assert holder["session"].grant.max_notional == D("30"), "会话谱系内上调授权不追认"
+
+    os_remove = __import__("os").remove
+    os_remove(path)
+    trader.renew()
+    assert trader.state["halted"] == "directive-expired", "撤销必须立即熔断"
+
+
+def test_paused_engine_binds_and_rechecks_exit_but_blocks_entry(tmp_path) -> None:
+    from cts.risk.models import SystemState
+
+    engine = make_engine(tmp_path)
+    entry = engine.reserve([req(Side.LONG, "pz-1", "100", "98")], now=NOW)[0]
+    later = engine.reserve([ReserveRequest(symbol="ETHUSDT", side=Side.LONG, signal_key="pz-2",
+                                           entry_price=D("100"), stop_price=D("98"), multiplier=D("1"),
+                                           lot_size=D("0.001"))], now=NOW)[0]
+    engine.apply_fill(entry.reservation_id, entry.qty, now=NOW)
+    exit_res = engine.reserve(
+        [ReserveRequest(symbol="BTCUSDT", side=Side.SHORT, signal_key="pz-x",
+                        entry_price=D("100"), stop_price=D("102"), multiplier=D("1"),
+                        lot_size=D("0.001"), qty=entry.qty)],
+        now=NOW, exit_purpose=True,
+    )[0]
+    engine.add_blocker("OPERATOR_PAUSE", SystemState.PAUSED, now=NOW)
+    notional = entry.qty * D("100")
+    engine.bind_live_order(exit_res.reservation_id, client_order_id="cid-x", symbol="BTCUSDT",
+                           side=Side.SHORT, qty=entry.qty, notional=notional, price=D("100"),
+                           exit_purpose=True)
+    engine.recheck_live_open(exit_res.reservation_id, client_order_id="cid-x", symbol="BTCUSDT",
+                             side=Side.SHORT, qty=entry.qty, notional=notional, price=D("100"),
+                             exit_purpose=True)
+    with pytest.raises(CtsError):
+        engine.bind_live_order(later.reservation_id, client_order_id="cid-n", symbol="BTCUSDT",
+                               side=Side.LONG, qty=later.qty, notional=later.qty * D("100"),
+                               price=D("100"))
