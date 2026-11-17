@@ -1,0 +1,398 @@
+[
+ {
+  "client_order_id": "cts_demo_ENTRY_73584",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-07T09:00:43.037951+00:00",
+  "venue_avgPrice": "76152.300000",
+  "venue_executedQty": "0.0019",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_135341",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-08T02:09:59.718707+00:00",
+  "venue_avgPrice": "75700.000000",
+  "venue_executedQty": "0.0019",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_168531",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-08T11:23:41.373841+00:00",
+  "venue_avgPrice": "75987.300000",
+  "venue_executedQty": "0.0019",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_219948",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T07:01:45.766398+00:00",
+  "venue_avgPrice": "74285.100000",
+  "venue_executedQty": "0.0019",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_222344",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T07:41:41.053612+00:00",
+  "venue_avgPrice": "74153.400000",
+  "venue_executedQty": "0.1108",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ADD_222375",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T07:42:17.856033+00:00",
+  "venue_avgPrice": null,
+  "venue_executedQty": "0.0000",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_223186",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T07:55:43.397478+00:00",
+  "venue_avgPrice": null,
+  "venue_executedQty": "0.0000",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_223682",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T08:03:58.541727+00:00",
+  "venue_avgPrice": "73814.000000",
+  "venue_executedQty": "0.0759",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ADD_224117",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T08:11:12.773451+00:00",
+  "venue_avgPrice": "73822.500000",
+  "venue_executedQty": "0.0450",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_224180",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T08:12:17.324220+00:00",
+  "venue_avgPrice": "73876.000000",
+  "venue_executedQty": "0.1209",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_224670",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T08:20:26.021841+00:00",
+  "venue_avgPrice": "74065.200000",
+  "venue_executedQty": "0.0366",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_226079",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T08:43:55.455984+00:00",
+  "venue_avgPrice": "74266.600000",
+  "venue_executedQty": "0.0366",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_227305",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T09:04:20.409394+00:00",
+  "venue_avgPrice": "74599.300000",
+  "venue_executedQty": "0.0645",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ADD_227725",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T09:11:21.105974+00:00",
+  "venue_avgPrice": "74543.500000",
+  "venue_executedQty": "0.0501",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_227749",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T09:11:45.146915+00:00",
+  "venue_avgPrice": "74503.000000",
+  "venue_executedQty": "0.1146",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_228380",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T09:22:15.299138+00:00",
+  "venue_avgPrice": "74355.700000",
+  "venue_executedQty": "0.0738",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_230151",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T09:51:46.745416+00:00",
+  "venue_avgPrice": "74305.600000",
+  "venue_executedQty": "0.0738",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_231045",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T10:06:40.736720+00:00",
+  "venue_avgPrice": "74146.000000",
+  "venue_executedQty": "0.0922",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ADD_231214",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T10:09:29.959593+00:00",
+  "venue_avgPrice": "74222.909125",
+  "venue_executedQty": "0.0537",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_231793",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T11:12:24.034023+00:00",
+  "venue_avgPrice": "74148.599109",
+  "venue_executedQty": "0.1459",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_231821",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T11:12:52.805501+00:00",
+  "venue_avgPrice": "74146.600000",
+  "venue_executedQty": "0.1649",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_231867",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T11:29:46.467498+00:00",
+  "venue_avgPrice": "74453.400000",
+  "venue_executedQty": "0.1649",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_232195",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T12:32:42.587440+00:00",
+  "venue_avgPrice": "74840.600000",
+  "venue_executedQty": "0.1022",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_232242",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T12:48:27.970615+00:00",
+  "venue_avgPrice": "74771.500000",
+  "venue_executedQty": "0.1022",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_232310",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T13:05:42.063264+00:00",
+  "venue_avgPrice": "74963.000000",
+  "venue_executedQty": "0.0842",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_232484",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T13:17:52.696174+00:00",
+  "venue_avgPrice": "74762.900000",
+  "venue_executedQty": "0.0842",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_233498",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T14:09:02.466166+00:00",
+  "venue_avgPrice": "74606.200000",
+  "venue_executedQty": "0.0556",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ADD_234241",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T14:20:07.432202+00:00",
+  "venue_avgPrice": "74635.332033",
+  "venue_executedQty": "0.0487",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_235176",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T14:35:39.588606+00:00",
+  "venue_avgPrice": "74584.800000",
+  "venue_executedQty": "0.1043",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_235655",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T14:43:39.295336+00:00",
+  "venue_avgPrice": "74403.100000",
+  "venue_executedQty": "0.0650",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ADD_235686",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T14:44:09.103337+00:00",
+  "venue_avgPrice": "74403.209890",
+  "venue_executedQty": "0.0455",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_235940",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T14:48:24.426362+00:00",
+  "venue_avgPrice": "74674.900000",
+  "venue_executedQty": "0.1105",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_236008",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T14:49:31.015258+00:00",
+  "venue_avgPrice": "74795.300000",
+  "venue_executedQty": "0.0496",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ADD_237070",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T15:07:14.104043+00:00",
+  "venue_avgPrice": "74700.600000",
+  "venue_executedQty": "0.0574",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_237097",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T15:07:42.188413+00:00",
+  "venue_avgPrice": "74672.500000",
+  "venue_executedQty": "0.1070",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_237492",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T15:14:14.664754+00:00",
+  "venue_avgPrice": "74929.300000",
+  "venue_executedQty": "0.0417",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_239411",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T15:46:13.598388+00:00",
+  "venue_avgPrice": "75392.600000",
+  "venue_executedQty": "0.0417",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_239439",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T15:46:43.372191+00:00",
+  "venue_avgPrice": "75434.600000",
+  "venue_executedQty": "0.0653",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ADD_240550",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T16:05:13.538127+00:00",
+  "venue_avgPrice": "75416.883707",
+  "venue_executedQty": "0.0491",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_240577",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T16:05:40.058334+00:00",
+  "venue_avgPrice": "75337.900000",
+  "venue_executedQty": "0.1144",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_240644",
+  "side": "SHORT",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T16:06:46.155939+00:00",
+  "venue_avgPrice": "75204.984848",
+  "venue_executedQty": "0.0330",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_EXIT_242263",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T16:33:46.003713+00:00",
+  "venue_avgPrice": "74999.432424",
+  "venue_executedQty": "0.0330",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ENTRY_243831",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T16:59:54.001597+00:00",
+  "venue_avgPrice": "75021.600000",
+  "venue_executedQty": "0.1473",
+  "note": "原始字段,未做任何换算"
+ },
+ {
+  "client_order_id": "cts_demo_ADD_243897",
+  "side": "LONG",
+  "status": "FILLED",
+  "updated_at": "2026-11-09T17:01:00.243732+00:00",
+  "venue_avgPrice": "75021.600000",
+  "venue_executedQty": "0.0535",
+  "note": "原始字段,未做任何换算"
+ }
+]
