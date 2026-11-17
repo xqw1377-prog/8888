@@ -721,3 +721,77 @@ def test_same_mark_tp_and_stop_resolves_conservatively_to_stop() -> None:
     assert result.exit_reasons == {"STOP": 1}
     exits = [e for e in ledger.events() if e.metadata.get("exit_reason")]
     assert exits[0].metadata["price"] == "135"
+
+
+def test_same_timestamp_marks_are_order_independent() -> None:
+    bars = breakout_series(130)
+    bars.append(candle(132, open_="118.5", high="130", low="118", close="129"))
+    tp_high, stop_low = mark(132, "135"), mark(132, "105")
+    ledger_a, a = _tp_replay(bars, [tp_high, stop_low])
+    ledger_b, b = _tp_replay(bars, [stop_low, tp_high])
+    assert a.exit_reasons == b.exit_reasons == {"STOP": 1}
+    px_a = [e for e in ledger_a.events() if e.metadata.get("exit_reason")][0].metadata["price"]
+    px_b = [e for e in ledger_b.events() if e.metadata.get("exit_reason")][0].metadata["price"]
+    assert px_a == px_b == "105", "同一时间戳双触发必须保守取止损且价格与输入顺序无关"
+
+    both_tp = [mark(132, "135"), mark(132, "133")]
+    ledger_c, c = _tp_replay(bars, both_tp)
+    _, d = _tp_replay(bars, list(reversed(both_tp)))
+    assert c.exit_reasons == d.exit_reasons == {"TAKE_PROFIT": 1}
+    px_c = [e for e in ledger_c.events() if e.metadata.get("exit_reason")][0].metadata["price"]
+    assert px_c == "133", "纯止盈组内取最差价"
+
+
+def test_late_funding_after_margin_release_charges_wallet_not_new_position() -> None:
+    from cts.data.models import FundingSettlement
+
+    bars = breakout_series(130)
+    bars.append(candle(132, open_="118.5", high="130", low="118", close="129"))
+    bars.append(candle(133, open_="121", high="122", low="120", close="121"))
+    bars.append(candle(134, open_="121", high="132", low="121", close="131"))
+    bars.append(candle(135, open_="131", high="132", low="130", close="131"))
+    bars.append(candle(136, open_="131", high="132", low="130", close="131"))
+    marks = [mark(132, "135")]
+    funding = FundingSettlement(
+        venue="SIM", symbol="BTCUSDT",
+        event_time=t_close(131) + timedelta(minutes=30),
+        received_at=t_close(136) + timedelta(seconds=1),
+        available_at=t_close(136) + timedelta(seconds=1),
+        settlement_id="fund-late-1",
+        funding_rate=D("-0.0001"), payment=D("-2"), interval_minutes=D("480"), source_id="f1",
+    )
+    ledger = Ledger("acct-late-funding")
+    ledger.transfer_in(amount=D("10000"), event_time=ORIGIN, received_at=ORIGIN, external_id="dep")
+    result = replay_t1(
+        ledger=ledger, symbol="BTCUSDT", candles=bars, marks=marks,
+        config=ReplayConfig(params=T1Params()), venue="SIM", fundings=[funding],
+    )
+    assert result.exit_reasons == {"TAKE_PROFIT": 1}, "第一笔按止盈离场"
+    assert result.funding_posted == 1
+    fundings = [e for e in ledger.events() if e.event_type == LedgerEventType.FUNDING]
+    assert fundings[0].metadata["from_isolated"] == "False", "释放后的迟到资金费必须扣钱包"
+    pos = ledger.position("BTCUSDT")
+    assert pos.qty > 0, "第二笔持仓在场"
+    assert pos.isolated_margin > 0, "新仓保证金在逐仓"
+    assert ledger.balance(AccountBucket.ISOLATED_MARGIN) == pos.isolated_margin, "迟到资金费不得动用新仓保证金"
+
+
+def test_replay_sentinel_counts_only_this_run() -> None:
+    bars = breakout_series(130)
+    bars.append(candle(132, open_="118.5", high="130", low="118", close="129"))
+    marks = [mark(132, "135")]
+    ledger = Ledger("acct-resume")
+    ledger.transfer_in(amount=D("10000"), event_time=ORIGIN, received_at=ORIGIN, external_id="dep")
+    first = replay_t1(
+        ledger=ledger, symbol="BTCUSDT", candles=bars, marks=marks,
+        config=ReplayConfig(params=T1Params()), venue="SIM",
+    )
+    assert first.exit_reasons == {"TAKE_PROFIT": 1}
+    # 续跑只给新 K 线、无交易：哨兵不得把上一轮的退出计成本次缺失
+    later = [candle(i, open_="121", high="122", low="120", close="121") for i in (135, 136, 137, 138)]
+    second = replay_t1(
+        ledger=ledger, symbol="BTCUSDT", candles=later, marks=[],
+        config=ReplayConfig(params=T1Params()), venue="SIM",
+    )
+    assert second.exit_reasons == {}
+    assert second.fills == 0 and second.exits == 0

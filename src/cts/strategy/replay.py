@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from itertools import groupby
 from decimal import Decimal
 from typing import Optional, Sequence
 
@@ -109,7 +110,7 @@ def next_mark_exit(
     as_of: datetime,
     params: T1Params,
 ) -> tuple[Optional[MarkSample], str]:
-    """按事件顺序找第一笔触发退出条件的标记价：止损与止盈同根不可辨时保守取止损。"""
+    """按事件顺序找第一笔触发退出条件的标记价。同一时间戳内先后不可辨，整组一起判定并保守取止损；价格取组内最差。"""
     target = take_profit_price(position.side, position.avg_price, position.signal_atr, params)
     visible = [
         mk
@@ -119,13 +120,20 @@ def next_mark_exit(
         and mk.available_at <= as_of
         and mk.event_time > position.entry_event_time
     ]
-    visible.sort(key=lambda mk: (mk.event_time, mk.available_at))
-    for mk in visible:
-        consumed.add(_mark_key(mk))
-        if stop_breached(position, mk.mark_price):
-            return mk, "STOP"
-        if take_profit_hit(position.side, mk.mark_price, target):
-            return mk, "TAKE_PROFIT"
+    visible.sort(key=lambda mk: (mk.event_time, mk.available_at, mk.mark_price))
+    for stamp, group in groupby(visible, key=lambda mk: (mk.event_time, mk.available_at)):
+        chunk = list(group)
+        for mk in chunk:
+            consumed.add(_mark_key(mk))
+        worst = (lambda ms: min(ms, key=lambda m: m.mark_price)) if position.side == Side.LONG else (
+            lambda ms: max(ms, key=lambda m: m.mark_price)
+        )
+        stop_hits = [mk for mk in chunk if stop_breached(position, mk.mark_price)]
+        if stop_hits:
+            return worst(stop_hits), "STOP"
+        tp_hits = [mk for mk in chunk if take_profit_hit(position.side, mk.mark_price, target)]
+        if tp_hits:
+            return worst(tp_hits), "TAKE_PROFIT"
     return None, ""
 
 
@@ -168,6 +176,7 @@ def replay_t1(
     consumed_marks: set[tuple] = set()
     posted_funding: set[str] = set()
     prior = ledger.events()
+    prior_ids = {event.event_id for event in prior}
     epoch = datetime(1970, 1, 1, tzinfo=UTC)
     last_event_time = max((event.event_time for event in prior), default=epoch)
     last_received = max((event.received_at for event in prior), default=epoch)
@@ -200,6 +209,11 @@ def replay_t1(
                 external_id=f"margin-release:{symbol}:{tag}",
                 venue=venue,
             )
+        for hold in reversed(holds):
+            if hold["exit"] is not None and not hold.get("released"):
+                # 该持仓的逐仓保证金已不在仓上：之后才到的资金费只能扣钱包，不得动新仓保证金
+                hold["released"] = True
+                break
 
     def book_stop(held: OpenPosition, breached: MarkSample, reason: str = "STOP") -> None:
         nonlocal exits, last_exit, position, pending
@@ -289,11 +303,11 @@ def replay_t1(
             posted_funding.add(item.settlement_id)
             funding_posted += 1
 
-    holds: list[dict[str, datetime | None]] = []
+    holds: list[dict] = []
     decision_as_of = candles[0].event_time if candles else epoch
 
     def open_hold(entry: datetime) -> None:
-        holds.append({"entry": entry, "exit": None})
+        holds.append({"entry": entry, "exit": None, "released": False})
 
     def close_hold(exit_at: datetime) -> None:
         if holds and holds[-1]["exit"] is None:
@@ -329,7 +343,7 @@ def replay_t1(
                     external_id=f"funding:{symbol}:{item.settlement_id}",
                     venue=venue,
                     symbol=symbol,
-                    from_isolated=True,
+                    from_isolated=not hold.get("released", False),
                 )
                 posted_funding.add(item.settlement_id)
                 funding_posted += 1
@@ -497,6 +511,8 @@ def replay_t1(
 
     ledger_exits: dict[str, int] = {}
     for event in ledger.events():
+        if event.event_id in prior_ids:
+            continue
         reason = event.metadata.get("exit_reason")
         if event.event_type == LedgerEventType.FILL and reason:
             ledger_exits[reason] = ledger_exits.get(reason, 0) + 1
