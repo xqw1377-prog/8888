@@ -253,6 +253,7 @@ class LiveSession:
                 qty=D(qty),
                 notional=computed,
                 price=D(price),
+                exit_purpose=reduce_only,
             )
             try:
                 self._persist_intent(
@@ -294,6 +295,7 @@ class LiveSession:
                     qty=D(qty),
                     notional=computed,
                     price=D(price),
+                    exit_purpose=reduce_only,
                 )
                 if not self.orders.claim_dispatch(client_order_id, self.grant.account_id, now):
                     duplicate = True

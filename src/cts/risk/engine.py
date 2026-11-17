@@ -480,6 +480,7 @@ class RiskEngine:
         qty: Decimal,
         notional: Decimal,
         price: Decimal,
+        exit_purpose: bool = False,
     ) -> Reservation:
         """把一笔模拟盘订单占用到预留上。同一预留不能被重复用超，旧权益或旧价格也不能再开。"""
         qty = D(qty)
@@ -494,6 +495,7 @@ class RiskEngine:
                 qty=qty,
                 notional=notional,
                 price=price,
+                exit_purpose=exit_purpose,
             )
             current = conn.execute(
                 "SELECT * FROM live_order_allocations WHERE client_order_id=?",
@@ -564,16 +566,17 @@ class RiskEngine:
         qty: Decimal,
         notional: Decimal,
         price: Decimal,
+        exit_purpose: bool = False,
     ) -> None:
         """发送前再核对暂停、权益和价格。不再次占用额度。"""
         qty = D(qty)
         notional = D(notional)
         price = D(price)
         if self.store._conn.in_transaction:
-            self._recheck_live_open(self.store._conn, reservation_id, client_order_id=client_order_id, symbol=symbol, side=side, qty=qty, notional=notional, price=price)
+            self._recheck_live_open(self.store._conn, reservation_id, client_order_id=client_order_id, symbol=symbol, side=side, qty=qty, notional=notional, price=price, exit_purpose=exit_purpose)
             return
         with self.store.txn() as conn:
-            self._recheck_live_open(conn, reservation_id, client_order_id=client_order_id, symbol=symbol, side=side, qty=qty, notional=notional, price=price)
+            self._recheck_live_open(conn, reservation_id, client_order_id=client_order_id, symbol=symbol, side=side, qty=qty, notional=notional, price=price, exit_purpose=exit_purpose)
 
     def _recheck_live_open(
         self,
@@ -586,6 +589,7 @@ class RiskEngine:
         qty: Decimal,
         notional: Decimal,
         price: Decimal,
+        exit_purpose: bool = False,
     ) -> None:
         self._require_live_reservation(
             conn,
@@ -595,6 +599,7 @@ class RiskEngine:
             qty=qty,
             notional=notional,
             price=price,
+            exit_purpose=exit_purpose,
         )
         current = conn.execute(
             """
@@ -910,12 +915,15 @@ class RiskEngine:
         qty: Decimal,
         notional: Decimal,
         price: Decimal,
+        exit_purpose: bool = False,
     ) -> Reservation:
         view = self._view(conn)
         row = self.store.load_account(conn, self.account_id)
         bundle = self.store.load_bundle(row)
         mode = RuntimeMode(row["mode"])
-        self._admit_new_risk(view, bundle, mode, conn)
+        if not exit_purpose:
+            # 平仓预留不进开仓准入，也不受权益版本失效约束；翻仓与超量仍由下方一致性检查拦截
+            self._admit_new_risk(view, bundle, mode, conn)
         try:
             reservation = self.store.get_reservation(conn, reservation_id)
         except KeyError as exc:
@@ -926,7 +934,7 @@ class RiskEngine:
             raise NewRiskBlockedError("风险批准已失效", reason_code="NEW_RISK_BLOCKED")
         if reservation.symbol != symbol or reservation.side != side:
             raise NewRiskBlockedError("风险批准与订单不一致", reason_code="NEW_RISK_BLOCKED")
-        if view.equity_version != reservation.equity_version:
+        if not exit_purpose and view.equity_version != reservation.equity_version:
             raise StaleDataError("权益已变化，旧预留不能再开仓")
         if reservation.qty <= 0 or price != reservation.notional / reservation.qty:
             raise NewRiskBlockedError("订单价格与风险批准不一致", reason_code="NEW_RISK_BLOCKED")
