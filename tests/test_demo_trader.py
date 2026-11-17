@@ -786,3 +786,42 @@ def test_paused_engine_binds_and_rechecks_exit_but_blocks_entry(tmp_path) -> Non
         engine.bind_live_order(later.reservation_id, client_order_id="cid-n", symbol="BTCUSDT",
                                side=Side.LONG, qty=later.qty, notional=later.qty * D("100"),
                                price=D("100"))
+
+
+def test_run_and_degraded_paths_place_the_same_exit(tmp_path) -> None:
+    """EXIT-KERNEL-R1:同一持仓与标记价下,运行路径与降级路径提交同一退出。"""
+
+    class MarkOnlyFeed(FakeFeed):
+        def __init__(self, price: str) -> None:
+            super().__init__(make_bars(["100"] * 8))
+            self.price = price
+
+        def fetch_candles(self, symbol, interval, limit):
+            raise RuntimeError("K线不可用")
+
+        def fetch_mark(self, symbol):
+            from cts.data.models import MarkSample
+
+            return MarkSample(venue="V", symbol=symbol, event_time=bars_time, received_at=bars_time,
+                              available_at=bars_time, mark_price=D(self.price), index_price=None, source_id="t")
+
+    state = lambda: {"position": {"side": "LONG", "qty": "1.0", "entry": "100", "stop": "92",
+                                  "take_profit": "104", "atr": "1", "extreme": "100", "entry_time": bars_time.isoformat()},
+                     "pending": None}
+
+    run = trader(tmp_path, venue="1.0", state=state())
+    run.feed = FakeFeed(make_bars(["100"] * 8))
+    run.feed.fetch_mark = MarkOnlyFeed("105").fetch_mark  # 标记价 105,止盈 104
+    run.step()
+    assert run.state["pending"] is not None and run.state["pending"]["kind"] == "EXIT"
+    assert run.state["pending"]["side"] == "SHORT" and run.state["pending"]["qty"] == "1.0"
+
+    (tmp_path / "deg").mkdir()
+    degraded = trader(tmp_path / "deg", venue="1.0", state=state())
+    degraded.feed = MarkOnlyFeed("105")
+    degraded.step()
+    assert degraded.state["pending"] is not None and degraded.state["pending"]["kind"] == "EXIT"
+    assert degraded.state["pending"]["side"] == "SHORT" and degraded.state["pending"]["qty"] == "1.0"
+    assert degraded.state["pending"]["qty"] == run.state["pending"]["qty"]
+    log = open(degraded.config.log_path).read()
+    assert "TAKE_PROFIT" in log
