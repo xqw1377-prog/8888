@@ -1,0 +1,26 @@
+{
+ "first_half": {
+  "trades": 32,
+  "win_rate": 0.6875,
+  "net_index_pct": "-0.592448",
+  "net_usdt_cap300": "-0.500984369919638743097091579"
+ },
+ "second_half": {
+  "trades": 31,
+  "win_rate": 0.7741935483870968,
+  "net_index_pct": "14.380544",
+  "net_usdt_cap300": "41.17474014394548123552034386"
+ },
+ "long_only": {
+  "trades": 23,
+  "win_rate": 0.6521739130434783,
+  "net_index_pct": "0.883644",
+  "net_usdt_cap300": "3.453109065141603590206568369"
+ },
+ "short_only": {
+  "trades": 40,
+  "win_rate": 0.775,
+  "net_index_pct": "12.706970",
+  "net_usdt_cap300": "37.22064670888423890221668388"
+ }
+}

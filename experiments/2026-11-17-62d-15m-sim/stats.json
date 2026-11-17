@@ -1,0 +1,24 @@
+{
+ "bars": 6000,
+ "span_days": 62.489583333333336,
+ "trades": 63,
+ "win_rate": 0.7301587301587301,
+ "win_rate_wilson95": [
+  0.6096985641796893,
+  0.8241629831201958
+ ],
+ "net_sum_index_pct": "13.70289832688846497996879880",
+ "mean_net_pct_per_trade": 0.21520505700542775,
+ "mean_net_pct_bootstrap95": [
+  -0.1601995879864515,
+  0.5826315115632014
+ ],
+ "mean_r": 0.08667922950220706,
+ "net_usdt_cap300_total": "40.67375577402584249242325228",
+ "worst_peak_to_trough_cap300_usdt": 46.51706645525882,
+ "exits": {
+  "TAKE_PROFIT": 46,
+  "STOP": 17
+ },
+ "sizing_note": "INDEX=名义1全额复利;CAP300=单笔300 USDT不复利。旧报告 +13.56% 为 INDEX 口径。"
+}
