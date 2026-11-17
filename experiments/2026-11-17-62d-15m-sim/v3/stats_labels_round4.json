@@ -1,0 +1,15 @@
+{
+ "round": 4,
+ "purpose": "区分两条曲线的口径,不得统称'费后权益曲线'",
+ "equity_cap300_mtm_v3.json": {
+   "definition": "逐根盯市:已平仓累计 + 持仓按当根收盘浮动;入场逆向0.05%含于成交价",
+   "excludes": "开放回合的假设平仓双边费用(0.05%×2)",
+   "end_value_usdt": "-7.5370"
+ },
+ "total_incl_open_usdt_cap300": {
+   "definition": "在盯市期末值上对开放回合计提双边费用后的假设全平合计",
+   "end_value_usdt": "-7.8370",
+   "note": "差额 0.30 = 300×0.1% 的费用计提,属声明模型的假设,不是已发生费用"
+ },
+ "closed_usdt_cap300": {"definition": "仅已平仓回合损益", "value_usdt": "2.0339"}
+}

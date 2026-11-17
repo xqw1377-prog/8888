@@ -18,8 +18,9 @@ from pathlib import Path
 
 
 def _usable(o: dict) -> bool:
+    """可用性按数据判定,不按订单状态:CANCELED/EXPIRED 的部分成交同样是真实成交,必须进配对。"""
     try:
-        return o["status"] == "FILLED" and float(o["venue_avgPrice"] or 0) > 0 and float(o["venue_executedQty"] or 0) > 0
+        return float(o["venue_avgPrice"] or 0) > 0 and float(o["venue_executedQty"] or 0) > 0
     except (TypeError, ValueError):
         return False
 
@@ -33,17 +34,20 @@ def fifo(fills: list[dict]) -> dict:
         qty = float(f["venue_executedQty"])
         px = float(f["venue_avgPrice"])
         remaining = qty
+        consumed_any = False
         while remaining > 1e-12 and lots and lots[0]["side"] != side:
             take = min(remaining, lots[0]["qty"])
             realized += (px - lots[0]["px"]) * take * lots[0]["side"]
             lots[0]["qty"] -= take
             remaining -= take
+            consumed_any = True
             if lots[0]["qty"] <= 1e-12:
                 lots.pop(0)
+        if consumed_any and not lots:
+            # 净持仓在本次成交中回归零:旧回合完成。反手余量随后开出新仓,不影响本次计数。
+            rounds += 1
         if remaining > 1e-12:
             lots.append({"qty": remaining, "px": px, "side": side})
-        if not lots:
-            rounds += 1  # 净持仓回归零,一个完整回合结束
     ending_qty = sum(l["qty"] * l["side"] for l in lots)
     return {"realized": realized, "rounds_flat": rounds, "ending_qty": ending_qty, "open_lots": len(lots)}
 
@@ -57,7 +61,16 @@ def selftest() -> None:
     r = fifo(fills)
     assert abs(r["realized"] - 50.0) < 1e-9, r  # 复核反例:真 FIFO +50(平均成本法为 0)
     assert abs(r["ending_qty"] - 1.0) < 1e-9 and r["rounds_flat"] == 0
-    print("selftest OK: 买1@100+买1@200+卖1@150 → 已实现 +50,期末 1@200,回合 0(未回归零)")
+
+    reversal = [
+        {"side": "LONG", "venue_avgPrice": "100", "venue_executedQty": "1"},
+        {"side": "SHORT", "venue_avgPrice": "110", "venue_executedQty": "2"},
+    ]
+    r2 = fifo(reversal)
+    assert abs(r2["realized"] - 10.0) < 1e-9, r2  # 旧多头回合已实现 +10
+    assert abs(r2["ending_qty"] + 1.0) < 1e-9 and r2["rounds_flat"] == 1, r2  # 反手漏计反例:回合必须为 1
+    print("selftest OK: 买1@100+买1@200+卖1@150 → +50,期末 1@200,回合 0;")
+    print("             买1@100+卖2@110 → +10,期末空头 1@110,回合 1(旧回合在反手中完成)")
 
 
 def main(path: str) -> None:
@@ -76,11 +89,13 @@ def main(path: str) -> None:
         else:
             lo -= q
     report = {
-        "method": "true-FIFO lot queue;回合=净持仓回归零",
+        "method": "true-FIFO lot queue;回合=净持仓回归零(含反手中途回归零,反手余量开新仓)",
         "usable_fills": len(usable),
+        "usable_note": "可用性=venue 均价与成交量均>0,与订单状态无关(CANCELED 部分成交计入)",
         "exec_notional_both_sides": round(exec_notional, 2),
-        "fifo_realized": round(result["realized"], 2),
-        "rounds_flat": result["rounds_flat"],
+        "subset_fifo_realized": round(result["realized"], 2),
+        "subset_label": f"剔除 {len(unusable)} 条 FILLED 缺损记录后的子集 FIFO 结果,非账户已核实已实现盈亏",
+        "round_completions": result["rounds_flat"],
         "known_ending_qty": round(result["ending_qty"], 4),
         "ending_qty_bounds_with_unusable": [round(lo, 4), round(hi, 4)],
         "unusable_filled_orders": [
