@@ -865,3 +865,12 @@ def test_code_identity_is_stamped_on_start(tmp_path) -> None:
     assert _re.fullmatch(r"[0-9a-f]{64}", ident["demo_trader_sha256"])
     assert ident["params_version"] == t.config.params.version
     assert ident["exit_mode"] == "fixed"
+
+
+def test_valid_directive_clears_the_expired_halt(tmp_path, monkeypatch) -> None:
+    trader, holder, path = _real_renew_harness(tmp_path, monkeypatch)
+    trader.state["halted"] = "directive-expired"
+    trader.renew()
+    assert trader.state["halted"] is None, "新授权生效后必须解除 directive-expired 熔断"
+    trader.renew()
+    assert trader.state["halted"] is None

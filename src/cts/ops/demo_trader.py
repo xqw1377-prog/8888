@@ -211,6 +211,9 @@ def make_renew(
                 holder["trader"].log("所有者交易指示缺失、未生效或过期：停止续期并熔断新单")
             holder["trader"].session = holder["session"]
             return
+        if holder["trader"].state.get("halted") == "directive-expired":
+            holder["trader"].state["halted"] = None
+            holder["trader"].log("授权合同有效：解除 directive-expired 熔断")
         grant_now = holder["session"].grant
         near_expiry = now >= grant_now.expires_at - timedelta(minutes=30)
         changed = fresh.raw_sha256 != holder.get("directive_sha")

@@ -45,14 +45,16 @@ def _last_heartbeat_age(log_path: str, now: datetime) -> float | None:
     return max(0.0, (now - last).total_seconds())
 
 
-def _last_consecutive_failures(log_path: str) -> int:
-    best = 0
+def _last_failure(log_path: str) -> tuple[int, str] | None:
+    """最后一条迭代异常的 (连续次数, 时间戳)。只看最新一条,历史峰值不算现状。"""
+    last = None
     with open(log_path, errors="replace") as handle:
         for line in handle:
             m = FAILURE_RE.search(line)
             if m:
-                best = max(best, int(m.group("n")))
-    return best
+                ts = line[1 : line.index("]")] if line.startswith("[") else ""
+                last = (int(m.group("n")), ts)
+    return last
 
 
 def check(
@@ -98,10 +100,19 @@ def check(
     if halted:
         problems.append(f"交易器处于熔断状态: {halted}")
 
-    failures = _last_consecutive_failures(log_path)
-    report["max_consecutive_failures"] = failures
-    if failures >= max_consecutive_failures:
-        problems.append(f"连续迭代失败达到 {failures} 次(阈值 {max_consecutive_failures})")
+    last_failure = _last_failure(log_path)
+    if last_failure is not None:
+        n, ts = last_failure
+        report["last_consecutive_failures"] = n
+        try:
+            when = datetime.fromisoformat(ts)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            fresh = (now - when).total_seconds() <= max_log_age
+        except ValueError:
+            fresh = True
+        if n >= max_consecutive_failures and fresh:
+            problems.append(f"连续迭代失败达到 {n} 次(阈值 {max_consecutive_failures})")
 
     position = state.get("position")
     report["position"] = bool(position)
