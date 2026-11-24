@@ -326,6 +326,18 @@ class DemoTrader:
         self._failures = 0
         self.state: dict = {"position": None, "pending": None}
         self._load_state()
+        # 代码身份戳:启动即写入加载源的内容指纹,让"进程在跑哪份代码"可证
+        try:
+            with open(__file__, "rb") as handle:
+                source_hash = hashlib.sha256(handle.read()).hexdigest()
+        except OSError:
+            source_hash = "unreadable"
+        self.state["code_identity"] = {
+            "demo_trader_sha256": source_hash,
+            "params_version": self.config.params.version,
+            "exit_mode": str(getattr(self.config.params, "exit_mode", "")),
+            "stamped_at": utc_now().isoformat(),
+        }
 
     def log(self, text: str) -> None:
         line = f"[{utc_now().isoformat()}] {text}"
@@ -762,6 +774,13 @@ class DemoTrader:
         qty = D(position["qty"])
         return qty if position["side"] == "LONG" else -qty
 
+    def _engine_signed(self) -> D:
+        """第三本账：风险引擎的持仓占用。残留的幽灵仓会让组合预算永远开不出新仓。"""
+        for p in self.risk.occupancy().positions:
+            if p.symbol == self.config.symbol:
+                return D(p.qty) if p.side == Side.LONG else -D(p.qty)
+        return D("0")
+
     def _append_exit_fact(self, fact: str, **fields: str) -> None:
         facts = self.state.setdefault("exit_facts", [])
         if not isinstance(facts, list):
@@ -834,10 +853,11 @@ class DemoTrader:
             # 对账未知但持仓在场：不得开新仓/补仓，但退出管理（含降级止损）必须继续尝试
             self.log(f"仓位核对失败但持仓在场，仅继续退出管理 {reconcile_error}")
         if venue is not None and not self.state.get("pending"):
-            if halted == "position-mismatch":
-                if venue == self._signed_local():
+            engine_signed = self._engine_signed()
+            if halted in ("position-mismatch", "engine-position-mismatch"):
+                if venue == self._signed_local() == engine_signed:
                     self.state["halted"] = None
-                    self.log("仓位核对一致，解除熔断")
+                    self.log("仓位核对一致（交易所/本地/引擎），解除熔断")
                     halted = None
                 else:
                     self._save_state()
@@ -845,6 +865,14 @@ class DemoTrader:
             elif venue != self._signed_local():
                 self.state["halted"] = "position-mismatch"
                 self.log(f"仓位核对不一致 本地={self._signed_local()} 交易所={venue}，熔断：不再挂新单，等待人工核对")
+                self._save_state()
+                return True
+            elif engine_signed != self._signed_local():
+                self.state["halted"] = "engine-position-mismatch"
+                self.log(
+                    f"引擎仓位与本地不一致 本地={self._signed_local()} 引擎={engine_signed}，"
+                    f"熔断：待对账修正（force_flat_position 凭交易所证据清零）"
+                )
                 self._save_state()
                 return True
         if halted == "corrupt-state":

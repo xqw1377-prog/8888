@@ -155,6 +155,15 @@ def trader(tmp_path, *, script=None, venue="0", bars=None, state=None, feed=None
                    clock=lambda: 1000.0, sleeper=lambda s: None)
     if state is not None:
         t.state = state
+        if state.get("position"):
+            pos = state["position"]
+            with engine.store.txn() as conn:
+                conn.execute(
+                    "INSERT INTO positions(account_id, symbol, side, qty, notional, risk_amount, isolated_margin, position_version) "
+                    "VALUES (?,?,?,?,?,?,?,1)",
+                    (engine.account_id, config.symbol, pos["side"], pos["qty"],
+                     format(D(pos["qty"]) * D("100"), "f"), "1", "1"),
+                )
     return t
 
 
@@ -825,3 +834,34 @@ def test_run_and_degraded_paths_place_the_same_exit(tmp_path) -> None:
     assert degraded.state["pending"]["qty"] == run.state["pending"]["qty"]
     log = open(degraded.config.log_path).read()
     assert "TAKE_PROFIT" in log
+
+
+# ---------- 三账核对与代码身份戳 ----------
+
+
+
+def test_engine_position_mismatch_halts_and_force_flat_clears(tmp_path) -> None:
+    t = trader(tmp_path, venue="0")  # 交易所空仓、本地空仓
+    with t.risk.store.txn() as conn:
+        conn.execute(
+            "INSERT INTO positions(account_id, symbol, side, qty, notional, risk_amount, isolated_margin, position_version) "
+            "VALUES (?,?,?,?,?,?,?,1)",
+            (t.risk.account_id, "BTCUSDT", "LONG", "0.2", "12000", "19", "2000"),
+        )
+    t.step()
+    assert t.state["halted"] == "engine-position-mismatch"
+    assert t.session.submits == []
+    t.risk.force_flat_position("BTCUSDT", now=NOW, evidence_id="venue-flat-reconcile-20261124", note="三账核对测试")
+    t.step()
+    assert t.state["halted"] is None
+
+
+def test_code_identity_is_stamped_on_start(tmp_path) -> None:
+    import re as _re
+
+    t = trader(tmp_path)
+    ident = t.state.get("code_identity")
+    assert isinstance(ident, dict)
+    assert _re.fullmatch(r"[0-9a-f]{64}", ident["demo_trader_sha256"])
+    assert ident["params_version"] == t.config.params.version
+    assert ident["exit_mode"] == "fixed"

@@ -13,6 +13,7 @@ from cts.errors import (
     NewRiskBlockedError,
     ParameterAdmissionError,
     RecoveryStaleError,
+    RiskLimitError,
     StaleDataError,
     UnitValidationError,
 )
@@ -365,3 +366,38 @@ def test_opposite_equal_qty_fill_reduces_position(tmp_path) -> None:
     import pytest as _pytest
     with _pytest.raises(_UVE):
         engine.apply_fill(over.reservation_id, long2.qty + D("0.001"), now=NOW)
+
+
+# ---------- P0-A:幽灵仓位阻塞开仓与对账修正通道 ----------
+
+
+def test_phantom_position_blocks_new_risk_until_force_flat(tmp_path) -> None:
+    engine = make_engine(tmp_path, equity="10000")
+    res = engine.reserve([req("BTCUSDT", "p0a-1")], now=NOW)[0]
+    engine.apply_fill(res.reservation_id, res.qty, now=NOW)
+    # 注入"交易所已平、引擎残留"的幽灵仓(2026-11 现场形态):组合预算 40,幽灵风险 60
+    with engine.store.txn() as conn:
+        conn.execute(
+            "UPDATE positions SET qty='0.5', notional='50', risk_amount='60', side='LONG' WHERE account_id=?",
+            (engine.account_id,),
+        )
+    with pytest.raises(RiskLimitError):
+        engine.reserve([req("ETHUSDT", "p0a-2")], now=NOW)
+    engine.force_flat_position("BTCUSDT", now=NOW, evidence_id="venue-flat-positionrisk-zero-20261124", note="P0-A 回归")
+    ok = engine.reserve([req("ETHUSDT", "p0a-3")], now=NOW)
+    assert ok and ok[0].qty > 0
+    pos = [p for p in engine.occupancy().positions if p.symbol == "BTCUSDT"][0]
+    assert pos.qty == 0 and pos.risk_amount == 0 and pos.side is None
+    with engine.store.txn() as conn:
+        traces = conn.execute(
+            "SELECT payload FROM traces WHERE account_id=? AND action='FORCE_FLAT'", (engine.account_id,)
+        ).fetchall()
+    assert traces and "venue-flat-positionrisk-zero-20261124" in traces[0]["payload"]
+
+
+def test_force_flat_requires_evidence_and_target(tmp_path) -> None:
+    engine = make_engine(tmp_path)
+    with pytest.raises(UnitValidationError):
+        engine.force_flat_position("BTCUSDT", now=NOW, evidence_id="short")
+    with pytest.raises(UnitValidationError):
+        engine.force_flat_position("BTCUSDT", now=NOW, evidence_id="venue-flat-evidence-001")

@@ -624,6 +624,46 @@ class RiskEngine:
                 (client_order_id,),
             )
 
+    def force_flat_position(self, symbol: str, *, now: datetime, evidence_id: str, note: str = "") -> None:
+        """对账修正通道：交易所已证明平仓、引擎仓位却残留时，凭证据编号清零并留痕。
+
+        只允许整行清零，不允许借道改方向或改数量；证据编号必填且进 trace，
+        修正前数值原样入档，事后可复核。没有证据的清零一律拒绝。
+        """
+        if not evidence_id or len(str(evidence_id).strip()) < 8:
+            raise UnitValidationError("对账修正必须携带不少于 8 字符的证据编号")
+        with self.store.txn() as conn:
+            positions = self.store.list_positions(conn, self.account_id)
+            target = next((p for p in positions if p.symbol == symbol), None)
+            if target is None or target.qty == 0:
+                raise UnitValidationError(f"{symbol} 没有需要修正的残留仓位")
+            conn.execute(
+                """
+                UPDATE positions
+                SET qty='0', notional='0', risk_amount='0', isolated_margin='0', side=NULL,
+                    position_version=position_version+1
+                WHERE account_id=? AND symbol=?
+                """,
+                (self.account_id, symbol),
+            )
+            self.store._trace(
+                conn,
+                self.account_id,
+                now,
+                "FORCE_FLAT",
+                {
+                    "symbol": symbol,
+                    "evidence_id": str(evidence_id).strip(),
+                    "prior_side": target.side.value if target.side else "",
+                    "prior_qty": format(target.qty, "f"),
+                    "prior_notional": format(target.notional, "f"),
+                    "prior_risk": format(target.risk_amount, "f"),
+                    "prior_isolated": format(target.isolated_margin, "f"),
+                    "note": note,
+                },
+            )
+            self.store._bump_risk(conn, self.account_id)
+
     def release_unbound_reservation(self, reservation_id: str) -> None:
         """没有仍有效的订单占用时，撤掉预留上的未成交额度。请求途中标成未知的预留，在确定撤单或完结后同样释放。"""
         with self.store.txn() as conn:
