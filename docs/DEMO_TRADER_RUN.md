@@ -106,3 +106,15 @@
 **生产修复执行**：备份 `var/seal-20261124-p0a-repair/`（risk.db.bak sha256 `d39a81f1…`）后，凭证据 `venue-flat-positionrisk-20261117to21-no-mismatch-doc1109` 清零残留仓（修复前 LONG 0.2008/风险 19.06 → 修复后归零）；副本验证开仓预留恢复（0.009 BTC / 585 USDT 名义）。修正待独立复审。
 
 **遗留**：P0-B（签名路径 public 200 / signed 0/400 并存）需在线诊断，未授权未做；通道间歇抖动第三周；策略边际验证状态不变（探索性 −7.84，非验证）。交易器保持停止；无有效授权（11-24T04:28Z 到期后未续）。实盘 `HOLD`，冻结点不动，`main` 不合并。
+
+## 2026-11-24(二)P0-B 定案、通道根修、对账闭合与看门狗部署（IMPLEMENTATED / PENDING INDEPENDENT REVIEW）
+
+**P0-B 定案**:签名路径失败(public 200 / signed 0/400 并存)为**通道症状**,非 API 缺陷——通道修复后 positionRisk 即时 200,本地-服务器漂移 −4ms;当日 `positionAmt=0.0000` 亦回溯佐证幽灵仓修复正确。
+
+**通道根修**:mihomo-cts 规则改为 **DIRECT 优先 fallback 组**(`交易通道=[DIRECT,自动选择]`,60s 探测 `demo-fapi ping`,配置封存于 var/seal-20261124-p0b-recon)。直连可用时不再依赖机场订阅;订阅轮换(本周第四次)只影响回落路径。
+
+**钱包对账闭合**:venue income 逐笔(95 笔)——REALIZED −168.2541 / COMMISSION −102.8573 / FUNDING −0.3976,合计 **−271.5091**;权益曲线窗口残差 **−0.0022**。状态 **CLOSED**,详见实验包 reconciliation_1m_era.md 闭合节。
+
+**看门狗部署**:cron 每 5 分钟运行 `cts.ops.watchdog`,日志 var/run/watchdog.log;计划内停止(停止文件存在)报告 ok 并标注 `stopped-by-stop-file`。
+
+范围:本轮在线部分仅只读签名 GET(income/positionRisk/time);未发单、未重启交易器、未调参。交易器保持停止、无有效授权。实盘 HOLD,冻结点不动,`main` 不合并。

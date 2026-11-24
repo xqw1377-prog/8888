@@ -28,14 +28,14 @@ def test_healthy_trader_passes(tmp_path) -> None:
         f"[{NOW.isoformat()}] 心跳 持仓=无 待定单=无\n",
         mtime=NOW - timedelta(seconds=30),
     )
-    report = check(state, log, now=NOW)
+    report = check(state, log, now=NOW, stop_file=str(tmp_path / "NO_STOP"))
     assert report["ok"], report
 
 
 def test_stale_state_and_missing_heartbeat_fail(tmp_path) -> None:
     state = _write(tmp_path / "s.json", json.dumps({"position": None, "halted": None}), mtime=NOW - timedelta(hours=3))
     log = _write(tmp_path / "t.log", f"[{(NOW - timedelta(hours=2)).isoformat()}] 心跳 持仓=无\n")
-    report = check(state, log, now=NOW)
+    report = check(state, log, now=NOW, stop_file=str(tmp_path / "NO_STOP"))
     assert not report["ok"]
     assert any("未更新" in p for p in report["problems"])
     assert any("心跳" in p for p in report["problems"])
@@ -47,7 +47,7 @@ def test_halted_and_failure_storm_fail(tmp_path) -> None:
         tmp_path / "t.log",
         f"[{NOW.isoformat()}] 心跳 持仓=无\n[{NOW.isoformat()}] 迭代异常(12 连续) RiskLimitError\n",
     )
-    report = check(state, log, now=NOW)
+    report = check(state, log, now=NOW, stop_file=str(tmp_path / "NO_STOP"))
     assert not report["ok"]
     assert any("熔断" in p for p in report["problems"])
     assert any("连续迭代失败" in p for p in report["problems"])
@@ -60,6 +60,15 @@ def test_position_without_stop_fails(tmp_path) -> None:
         mtime=NOW - timedelta(seconds=10),
     )
     log = _write(tmp_path / "t.log", f"[{NOW.isoformat()}] 心跳 持仓=LONG 1\n")
-    report = check(state, log, now=NOW)
+    report = check(state, log, now=NOW, stop_file=str(tmp_path / "NO_STOP"))
     assert not report["ok"]
     assert any("止损价缺失" in p for p in report["problems"])
+
+
+def test_stop_file_means_intentional_stop(tmp_path) -> None:
+    state = _write(tmp_path / "s.json", json.dumps({"position": None, "halted": None}), mtime=NOW - timedelta(hours=5))
+    log = _write(tmp_path / "t.log", "")
+    stop = _write(tmp_path / "STOP", "")
+    report = check(state, log, now=NOW, stop_file=stop)
+    assert report["ok"] and report.get("status") == "stopped-by-stop-file"
+    assert report["problems"] == []

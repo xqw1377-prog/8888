@@ -63,10 +63,15 @@ def check(
     max_state_age: float = 120.0,
     max_log_age: float = 1200.0,
     max_consecutive_failures: int = 10,
+    stop_file: str = "/Users/xinquanwang/8888/var/run/DEMO_TRADER_STOP",
 ) -> dict:
     now = now or datetime.now(timezone.utc)
     report: dict = {"checked_at": now.isoformat(), "ok": False, "problems": []}
     problems: list[str] = report["problems"]
+    if os.path.exists(stop_file):
+        report["status"] = "stopped-by-stop-file"
+        report["ok"] = True
+        return report
     try:
         state = json.load(open(state_path))
     except Exception as exc:
