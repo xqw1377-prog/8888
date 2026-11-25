@@ -92,7 +92,7 @@ class DemoTraderConfig:
             interval="15m",
             params=DEMO_PARAMS,
             target_notional=D("150"),
-            grant_max_notional=D("300"),
+            grant_max_notional=D("600"),  # 与 2026-11-25 授权合同同步(所有者指示)
             poll_seconds=20.0,
             max_order_age_seconds=150.0,
             aggression=D("0.002"),
